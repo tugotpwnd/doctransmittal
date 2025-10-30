@@ -1,0 +1,13 @@
+('doctransmittal_sub\\resources',
+ 'doctransmittal_sub\\resources',
+ [],
+ 'DATA',
+ [('doctransmittal_sub\\resources\\bg.jpeg',
+   'doctransmittal_sub\\resources\\bg.jpeg',
+   'DATA'),
+  ('doctransmittal_sub\\resources\\logo.png',
+   'doctransmittal_sub\\resources\\logo.png',
+   'DATA'),
+  ('doctransmittal_sub\\resources\\logo_small.png',
+   'doctransmittal_sub\\resources\\logo_small.png',
+   'DATA')])

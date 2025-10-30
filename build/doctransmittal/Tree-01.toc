@@ -1,0 +1,5 @@
+('DM-Logos',
+ 'DM-Logos',
+ [],
+ 'DATA',
+ [('DM-Logos\\SJ Electric Logo.png', 'DM-Logos\\SJ Electric Logo.png', 'DATA')])
