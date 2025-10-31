@@ -8,13 +8,21 @@ from .paths import app_data_dir
 class SettingsManager:
     DEFAULTS: Dict[str, Any] = {
         "user": {"name": ""},
+        # in SettingsManager.DEFAULTS
         "ui": {
             "theme": "dark",
-            "font_delta": 0,           # global text size offset (pt)
-            "base_point_size": None,   # captured once by UI on first run (stored as int)
-            "base_font_family": "",    # captured once by UI on first run (stored as str)
-            "rows_per_page": 500
+            "font_delta": 0,
+            "base_point_size": None,
+            "base_font_family": "",
+            "rows_per_page": 500,
+
+            # NEW: table layout persistence
+            "tables": {
+                # Register tab column widths (by logical column index)
+                "register": {"widths": {}}
+            }
         },
+
         "register": {
             "sheet_name": "MI Documents",
             "doc_id_col": "B", "doc_type_col": "C",

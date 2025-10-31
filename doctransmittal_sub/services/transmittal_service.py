@@ -25,8 +25,7 @@ except Exception:
 def _base_folder_for_output(db_path: Path) -> Path:
     """
     Put 'Transmittals' one level up from the DB file.
-      DB:  ...\1 Doc Control\.docutrans\register.db
-      OUT: ...\1 Doc Control\Transmittals
+
     If DB is under a dot-folder ('.docutrans'), go up an extra level.
     """
     db_path = Path(db_path).resolve()
@@ -38,20 +37,29 @@ def _base_folder_for_output(db_path: Path) -> Path:
 def _default_out_root(db_path: Path) -> Path:
     return _base_folder_for_output(db_path) / "Transmittals"
 
-def next_transmittal_number(project_code: str, out_root: Path) -> str:
-    out_root.mkdir(parents=True, exist_ok=True)
+def _last_transmittal_number(project_code: str, out_root: Path) -> int:
     pat = re.compile(rf"^{re.escape(project_code)}-TRN-(\d+)$", re.IGNORECASE)
     maxn = 0
     for p in out_root.iterdir():
         if not p.is_dir():
             continue
-        m = pat.match(p.name.strip())
+        m = pat.match(p.name)
         if m:
             try:
                 maxn = max(maxn, int(m.group(1)))
-            except Exception:
-                pass
-    return f"{project_code}-TRN-{maxn+1:03d}"
+            except ValueError:
+                continue
+    return maxn
+
+
+def next_transmittal_number(project_code: str, out_root: Path) -> str:
+    out_root.mkdir(parents=True, exist_ok=True)
+    last_used = _last_transmittal_number(project_code, out_root)
+    # if last transmittal folder is missing (purged), reuse that number
+    candidate = f"{project_code}-TRN-{last_used:03d}"
+    if not (out_root / candidate).exists():
+        return candidate
+    return f"{project_code}-TRN-{last_used + 1:03d}"
 
 # ---------------- core flows ----------------
 
@@ -132,9 +140,15 @@ def rebuild_transmittal_bundle(
                 pass
 
     header = [t for t in list_transmittals(db_path, include_deleted=True) if t["id"] == tid][0]
+
+    # --- Add these two lines ---
+    header["db_path"] = str(db_path)  # let receipt_pdf find DM-Logos via list_logos()
+    header["_pdf_out_path"] = str(receipt_dir)  # optional; helps fallback search
+
     pdf_path = receipt_dir / f"{transmittal_number}.pdf"
     export_transmittal_pdf(pdf_path, header, items)
     return trans_dir
+
 
 # ---------------- edit / delete ----------------
 

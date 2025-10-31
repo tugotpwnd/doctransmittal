@@ -42,11 +42,15 @@ from .widgets.register_model import RegisterTableModel as RM
 from .widgets.register_model import QModelIndex  # type hints only
 from .widgets.register_model import Qt as _Qt  # avoid naming clash
 from .widgets.toast import toast
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+
 
 
 _ALPHA = string.ascii_uppercase
 DB_LAST_KEY = "last.db_path"
 KEEP_VALUE = "— no change —"
+WIDTHS_SETTINGS_KEY = "ui.tables.register.widths"
+
 
 # Regex to extract a displayable token from a revision string (e.g., "Rev A" -> "A")
 _REV_TOKEN_RE = re.compile(r"(?i)(?:rev\s*)?([A-Za-z]+\d*|\d+[A-Za-z]*|[A-Za-z]|\d+)$")
@@ -61,16 +65,34 @@ def _parse_latest_token(raw: Optional[str]) -> str:
 def _col(name: str, default: int) -> int:
     return getattr(RegisterTableModel, name, default)
 
-COL_SELECT      = _col('COL_SELECT', 0)
-COL_DOC_ID      = _col('COL_DOC_ID', 1)
-COL_TYPE        = _col('COL_TYPE', 2)
-COL_FILETYPE    = _col('COL_FILETYPE', 3)
-COL_DESCRIPTION = _col('COL_DESCRIPTION', 4)
-COL_STATUS      = _col('COL_STATUS', 5)
-COL_LATEST_REV  = _col('COL_LATEST_REV', 6)
+COL_SELECT       = _col('COL_SELECT', 0)
+COL_DOC_ID       = _col('COL_DOC_ID', 1)
+COL_TYPE         = _col('COL_TYPE', 2)
+COL_FILETYPE     = _col('COL_FILETYPE', 3)
+COL_DESCRIPTION  = _col('COL_DESCRIPTION', 4)  # NEW
+COL_STATUS       = _col('COL_STATUS', 5)
+COL_LATEST_REV   = _col('COL_LATEST_REV', 6)
+COL_COMMENTS     = _col('COL_COMMENTS', 7)
+
 
 # ---- Delegates ---------------------------------------------------------------
 from PyQt5.QtWidgets import QComboBox, QLineEdit
+
+from PyQt5.QtWidgets import QTextEdit
+
+class MultiLineDelegate(QStyledItemDelegate):
+    def createEditor(self, parent, option, index):
+        te = QTextEdit(parent)
+        te.setWordWrapMode(te.wordWrapMode())  # keep Qt defaults
+        te.setAcceptRichText(False)
+        te.setPlaceholderText("Add comments…")
+        te.setMinimumHeight(80)
+        return te
+    def setEditorData(self, editor, index):
+        editor.setPlainText(str(index.data() or ""))
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.toPlainText(), Qt.EditRole)
+
 
 class ComboDelegate(QStyledItemDelegate):
     def __init__(self, options_provider: Callable[[], List[str]], editable=False, parent=None):
@@ -149,13 +171,24 @@ class RegisterTab(QWidget):
         tools.addStretch(1)
         lay.addLayout(tools)
 
-
         # Table
         self.table = QTableView(self)
         self.model = RegisterTableModel([])
         self.proxy = RegisterFilterProxy(self)
         self.proxy.setSourceModel(self.model)
         self.table.setModel(self.proxy)
+
+        # --- NEW: debounce timer for persisting column widths
+        self._widths_timer = QTimer(self)
+        self._widths_timer.setSingleShot(True)
+        self._widths_timer.timeout.connect(self._save_column_widths)
+
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(QHeaderView.Interactive)
+        hdr.sectionResized.connect(lambda *_: self._widths_timer.start(300))
+        hdr.sectionCountChanged.connect(lambda *_: self._widths_timer.start(300))
+
         # Add this assert temporarily to confirm we have the real class
         assert type(self.model).__name__ == "RegisterTableModel", type(self.model)
         self.table.setSelectionBehavior(self.table.SelectRows)
@@ -163,6 +196,8 @@ class RegisterTab(QWidget):
         self.table.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
         lay.addWidget(self.table, 1)
         self._apply_default_column_widths()  # <-- add this line
+
+
 
 
         # Option providers for delegates
@@ -182,7 +217,19 @@ class RegisterTab(QWidget):
         self.table.setItemDelegateForColumn(COL_STATUS,      ComboDelegate(_opts_statuses,    editable=False, parent=self))
         self.table.setItemDelegateForColumn(COL_DESCRIPTION, ComboDelegate(_opts_descriptions,editable=True,  parent=self))
         self.table.setItemDelegateForColumn(COL_LATEST_REV,  LineDelegate(self))
+        self.table.setItemDelegateForColumn(COL_COMMENTS, MultiLineDelegate(self))  # NEW
         self.table.setEditTriggers(QTableView.DoubleClicked | QTableView.SelectedClicked | QTableView.EditKeyPressed)
+
+        # Make long text wrap and rows auto-size
+        self.table.setWordWrap(True)
+        self.table.setTextElideMode(Qt.ElideNone)  # don’t shorten with "…"
+        vh = self.table.verticalHeader()
+        vh.setSectionResizeMode(QHeaderView.ResizeToContents)  # auto height from contents
+
+        # When the user resizes a column, reflow rows (keeps wrapping accurate)
+        self.table.horizontalHeader().sectionResized.connect(
+            lambda *_: self.table.resizeRowsToContents()
+        )
 
         # Model persistence callbacks if supported
         if hasattr(self.model, 'set_save_callbacks'):
@@ -231,6 +278,7 @@ class RegisterTab(QWidget):
         self.model.modelReset.connect(self._on_model_changed)
         # View-level persistence (only used if model lacks callbacks)
         self.table.model().dataChanged.connect(self._on_cell_edited)
+
 
         # last db
         last_db = self.settings.get(DB_LAST_KEY, "")
@@ -362,26 +410,66 @@ class RegisterTab(QWidget):
 
     # ----------------- Helper for setting default col widths ---------------
     def _apply_default_column_widths(self):
-        # Keep columns user-resizable, but don't auto-fit on load
+        """
+        Load saved widths from settings, apply them.
+        Any columns not found fall back to sensible hard defaults.
+        """
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(QHeaderView.Interactive)
 
-        # Tweak these numbers to taste
-        widths = {
-            COL_SELECT: 28,  # tick column
-            COL_DOC_ID: 140,
-            COL_TYPE: 60,
-            COL_FILETYPE: 80,
-            COL_DESCRIPTION: 540,
-            COL_STATUS: 80,
-            COL_LATEST_REV: 80,
+        # Hard defaults (your existing numbers)
+        defaults = {
+            COL_SELECT: 28,
+            COL_DOC_ID: 200,
+            COL_TYPE: 160,
+            COL_FILETYPE: 160,
+            COL_DESCRIPTION: 800,
+            COL_COMMENTS: 380,  # NEW
+            COL_STATUS: 200,
+            COL_LATEST_REV: 160,
         }
-        for col, w in widths.items():
+
+        # Pull saved widths (dict of str/int -> int)
+        saved = self.settings.get(WIDTHS_SETTINGS_KEY, {}) or {}
+
+        # Apply saved first
+        try:
+            count = header.count()
+        except Exception:
+            count = max(defaults) + 1
+
+        for col in range(count):
+            w = saved.get(str(col))
+            if isinstance(w, int) and w > 0:
+                try:
+                    self.table.setColumnWidth(col, w)
+                except Exception:
+                    pass
+
+        # Fill any missing with defaults
+        for col, w in defaults.items():
             try:
-                self.table.setColumnWidth(col, int(w))
+                if self.table.columnWidth(col) <= 0:
+                    self.table.setColumnWidth(col, int(w))
             except Exception:
                 pass
+
+    def _save_column_widths(self):
+        """Persist current logical column widths to settings.json."""
+        try:
+            header = self.table.horizontalHeader()
+            count = header.count()
+            data = {}
+            for col in range(count):
+                try:
+                    data[str(col)] = int(header.sectionSize(col))
+                except Exception:
+                    pass
+            self.settings.set(WIDTHS_SETTINGS_KEY, data)
+        except Exception:
+            # don't let UI crash on any failure
+            pass
 
     # ----------------- Helpers for ticked rows (model-agnostic) ---------------
     def _model_has(self, name: str) -> bool:
@@ -653,10 +741,27 @@ class RegisterTab(QWidget):
             token = _parse_latest_token(latest_raw)
             # Minimal row object matching what RegisterTableModel.data() expects
             class _Row:
-                __slots__ = ("doc_id","doc_type","file_type","description","status","latest_rev_raw","latest_rev_token")
-                def __init__(self, d,t,f,desc,s,lr_raw,lt):
-                    self.doc_id=d; self.doc_type=t; self.file_type=f; self.description=desc; self.status=s; self.latest_rev_raw=lr_raw; self.latest_rev_token=lt
-            doc_rows.append(_Row(r["doc_id"], r["doc_type"], r["file_type"], r["description"], r["status"], latest_raw, token))
+                __slots__ = ("doc_id", "doc_type", "file_type", "description", "comments", "status", "latest_rev_raw",
+                             "latest_rev_token")
+
+                def __init__(self, d, t, f, desc, comm, s, lr_raw, lt):
+                    self.doc_id = d;
+                    self.doc_type = t;
+                    self.file_type = f
+                    self.description = desc;
+                    self.comments = comm  # <— NEW
+                    self.status = s;
+                    self.latest_rev_raw = lr_raw;
+                    self.latest_rev_token = lt
+
+            doc_rows.append(
+                _Row(
+                    r["doc_id"], r["doc_type"], r["file_type"],
+                    r.get("description", ""), r.get("comments", ""),  # <— NEW
+                    r.get("status", ""),
+                    latest_raw, token
+                )
+            )
 
         # If model has a setter, use it; else reset underlying lists
         if hasattr(self.model, 'set_rows'):

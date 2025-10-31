@@ -60,6 +60,7 @@ DDL = [
         doc_type TEXT,
         file_type TEXT,
         description TEXT,
+        comments TEXT DEFAULT '',
         status TEXT,
         is_active INTEGER NOT NULL DEFAULT 1,
         UNIQUE(project_id, doc_id)
@@ -130,38 +131,36 @@ def init_db(db_path: Path) -> None:
     for ddl in DDL:
         cur.execute(ddl)
 
-    # projects: add client metadata (safe if already present)
+    # projects...
     _ensure_column(con, "projects", "client_reference", "TEXT")
     _ensure_column(con, "projects", "client_contact", "TEXT")
     _ensure_column(con, "projects", "end_user", "TEXT")
     _ensure_column(con, "projects", "client_company", "TEXT")
 
-
-    # Your existing extra columns
+    # documents (existing extras)
     _ensure_column(con, "documents", "sp_url", "TEXT")
     _ensure_column(con, "documents", "local_hint", "TEXT")
 
-    # --- New, non-destructive migrations for history/edit/soft-delete ---
-    # transmittals: track soft-delete + updates
+    # documents (NEW)
+    _ensure_column(con, "documents", "comments", "TEXT DEFAULT ''")   # <— ADD THIS
+
+    # transmittals...
     _ensure_column(con, "transmittals", "updated_on", "TEXT")
     _ensure_column(con, "transmittals", "is_deleted", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(con, "transmittals", "deleted_on", "TEXT")
     _ensure_column(con, "transmittals", "deleted_reason", "TEXT")
 
-    # transmittal_items: store snapshot fields
+    # transmittal_items...
     _ensure_column(con, "transmittal_items", "file_type", "TEXT")
     _ensure_column(con, "transmittal_items", "description", "TEXT")
     _ensure_column(con, "transmittal_items", "status", "TEXT")
-    _ensure_column(con, "transmittal_items", "row_snapshot", "TEXT")  # JSON
+    _ensure_column(con, "transmittal_items", "row_snapshot", "TEXT")
 
-    # helpful indexes
     _ensure_index(con, "idx_t_created", "CREATE INDEX idx_t_created ON transmittals(created_on);")
     _ensure_index(con, "idx_t_deleted", "CREATE INDEX idx_t_deleted ON transmittals(is_deleted);")
     _ensure_index(con, "idx_ti_doc", "CREATE INDEX idx_ti_doc ON transmittal_items(doc_id);")
     _ensure_index(con, "ux_ti_trans_doc",
                   "CREATE UNIQUE INDEX ux_ti_trans_doc ON transmittal_items(transmittal_id, doc_id);")
-
-
 
     con.commit(); con.close()
 
@@ -295,15 +294,18 @@ def list_documents_with_latest(db_path: Path, project_id: int, state: str = "act
     elif state == "deleted":
         where += " AND d.is_active=0"
     rows = con.execute(f"""
-        SELECT d.doc_id, d.doc_type, d.file_type, d.description, d.status,
+        SELECT d.doc_id, d.doc_type, d.file_type, d.description,
+               COALESCE(d.comments, '') AS comments,               -- NEW
+               d.status,
                (SELECT r.rev FROM revisions r WHERE r.document_id=d.id ORDER BY r.id DESC LIMIT 1) AS latest_rev
         FROM documents d
         WHERE {where}
         ORDER BY d.doc_id COLLATE NOCASE
     """, (project_id,)).fetchall()
     con.close()
-    cols = ["doc_id","doc_type","file_type","description","status","latest_rev"]
+    cols = ["doc_id","doc_type","file_type","description","comments","status","latest_rev"]  # NEW order
     return [dict(zip(cols, r)) for r in rows]
+
 
 def list_statuses_for_project(db_path: Path, project_id: int) -> List[str]:
     con = _connect(db_path)
@@ -540,7 +542,7 @@ def get_doc_submission_history(db_path: Path, project_id: int, doc_id: str) -> L
 # ------------------------------ Update helpers (existing) ------------------------------
 
 def update_document_fields(db_path: Path, project_id: int, doc_id: str, fields: Dict[str, Any]) -> None:
-    allowed = {"doc_type", "file_type", "description", "status", "is_active"}
+    allowed = {"doc_type", "file_type", "description", "comments", "status", "is_active"}  # added comments
     kv = {k: v for k, v in fields.items() if k in allowed}
     if not kv: return
     sets = ", ".join(f"{k}=?" for k in kv.keys())
@@ -552,7 +554,7 @@ def update_document_fields(db_path: Path, project_id: int, doc_id: str, fields: 
     _retry_write(_do)
 
 def bulk_update_documents_fields(db_path: Path, project_id: int, doc_ids: List[str], fields: Dict[str, Any]) -> int:
-    allowed = {"doc_type", "file_type", "description", "status", "is_active"}
+    allowed = {"doc_type", "file_type", "description", "comments", "status", "is_active"}  # added comments
     kv = {k: v for k, v in fields.items() if k in allowed}
     if not kv or not doc_ids: return 0
     sets = ", ".join(f"{k}=?" for k in kv.keys())
@@ -588,7 +590,8 @@ def list_documents_basic(db_path: Path, project_id: int):
     con = _connect(db_path)
     cur = con.cursor()
     rows = cur.execute("""
-        SELECT doc_id, doc_type, file_type, description, status, COALESCE(sp_url,''), COALESCE(local_hint,'')
+        SELECT doc_id, doc_type, file_type, description, COALESCE(comments,''), status,
+               COALESCE(sp_url,''), COALESCE(local_hint,'')
           FROM documents
          WHERE project_id=?
          ORDER BY doc_id
@@ -596,8 +599,10 @@ def list_documents_basic(db_path: Path, project_id: int):
     con.close()
     return [{
         "doc_id": r[0], "doc_type": r[1], "file_type": r[2],
-        "description": r[3], "status": r[4], "sp_url": r[5], "local_hint": r[6]
+        "description": r[3], "comments": r[4], "status": r[5],
+        "sp_url": r[6], "local_hint": r[7]
     } for r in rows]
+
 
 def get_document_pk(db_path: Path, project_id: int, doc_id: str) -> Optional[int]:
     con = _connect(db_path)

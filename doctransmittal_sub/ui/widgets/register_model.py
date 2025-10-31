@@ -1,25 +1,32 @@
 # doctransmittal_sub/ui/widgets/register_model.py
 from __future__ import annotations
-from typing import List, Set, Callable, Optional, Dict
+from typing import List, Callable, Optional, Dict
 from PyQt5.QtCore import Qt, QAbstractTableModel, QModelIndex
-from ...models.document import DocumentRow
+
+# Try to keep your existing row type; fall back to a simple object with attributes
+try:
+    from ...models.document import DocumentRow
+except Exception:
+    class DocumentRow:  # type: ignore
+        def __init__(self, **kw): self.__dict__.update(kw)
 
 class RegisterTableModel(QAbstractTableModel):
-    COL_SELECT      = 0
-    COL_DOC_ID      = 1
-    COL_TYPE        = 2
-    COL_FILETYPE    = 3
-    COL_DESCRIPTION = 4
-    COL_STATUS      = 5
-    COL_LATEST_REV  = 6
+    COL_SELECT       = 0
+    COL_DOC_ID       = 1
+    COL_TYPE         = 2
+    COL_FILETYPE     = 3
+    COL_DESCRIPTION  = 4
+    COL_COMMENTS     = 5   # <— NEW
+    COL_STATUS       = 6
+    COL_LATEST_REV   = 7
 
-    COLS = ["✓", "Doc ID", "Type", "File Type", "Description", "Status", "Latest Rev"]
+    COLS = ["✓", "Doc ID", "Type", "File Type", "Description", "Comments", "Status", "Latest Rev"]
 
     def __init__(self, rows: List[DocumentRow] | None = None, parent=None):
         super().__init__(parent)
         self._rows: List[DocumentRow] = rows or []
         self._selected: List[bool] = [False] * len(self._rows)
-        # Callbacks wired by the tab to persist edits
+        # persistence callbacks provided by the tab
         self._save_fields_cb: Optional[Callable[[str, Dict[str, str]], None]] = None
         self._add_revision_cb: Optional[Callable[[str, str], int]] = None
 
@@ -45,13 +52,15 @@ class RegisterTableModel(QAbstractTableModel):
         row = self._rows[r]
 
         if role in (Qt.DisplayRole, Qt.EditRole):
-            if c == self.COL_DOC_ID:      return row.doc_id
-            if c == self.COL_TYPE:        return row.doc_type or ""
-            if c == self.COL_FILETYPE:    return row.file_type or ""
-            if c == self.COL_DESCRIPTION: return row.description or ""
-            if c == self.COL_STATUS:      return row.status or ""
-            if c == self.COL_LATEST_REV:  return (row.latest_rev_token or row.latest_rev_raw or "")
-            if c == self.COL_SELECT:      return None
+            if c == self.COL_DOC_ID:       return getattr(row, "doc_id", "")
+            if c == self.COL_TYPE:         return getattr(row, "doc_type", "") or ""
+            if c == self.COL_FILETYPE:     return getattr(row, "file_type", "") or ""
+            if c == self.COL_DESCRIPTION:  return getattr(row, "description", "") or ""
+            if c == self.COL_COMMENTS:     return getattr(row, "comments", "") or ""    # NEW
+            if c == self.COL_STATUS:       return getattr(row, "status", "") or ""
+            if c == self.COL_LATEST_REV:   return (getattr(row, "latest_rev_token", "") or
+                                                   getattr(row, "latest_rev_raw", "") or "")
+            if c == self.COL_SELECT:       return None
 
         if role == Qt.CheckStateRole and c == self.COL_SELECT:
             return Qt.Checked if self._selected[r] else Qt.Unchecked
@@ -65,15 +74,14 @@ class RegisterTableModel(QAbstractTableModel):
         if c == self.COL_SELECT:
             return base | Qt.ItemIsUserCheckable
         if c == self.COL_DOC_ID:
-            return base  # locked
-        if c in (self.COL_TYPE, self.COL_FILETYPE, self.COL_DESCRIPTION, self.COL_STATUS, self.COL_LATEST_REV):
+            return base  # read-only
+        if c in (self.COL_TYPE, self.COL_FILETYPE, self.COL_DESCRIPTION, self.COL_COMMENTS, self.COL_STATUS, self.COL_LATEST_REV):
             return base | Qt.ItemIsEditable
         return base
 
     # ---- editing ----
     def setData(self, index: QModelIndex, value, role=Qt.EditRole):
         if not index.isValid(): return False
-
         r, c = index.row(), index.column()
         row = self._rows[r]
 
@@ -86,7 +94,7 @@ class RegisterTableModel(QAbstractTableModel):
         if role != Qt.EditRole:
             return False
 
-        did = row.doc_id
+        did = getattr(row, "doc_id", "")
 
         def _emit():
             self.dataChanged.emit(index, index, [Qt.DisplayRole, Qt.EditRole])
@@ -94,16 +102,23 @@ class RegisterTableModel(QAbstractTableModel):
         try:
             if c == self.COL_DESCRIPTION:
                 new_desc = ("" if value is None else str(value)).strip()
-                if new_desc == (row.description or ""): return True
+                if new_desc == (getattr(row, "description", "") or ""): return True
                 row.description = new_desc
                 if self._save_fields_cb:
                     self._save_fields_cb(did, {"description": new_desc})
                 _emit(); return True
 
+            if c == self.COL_COMMENTS:  # NEW
+                new_txt = ("" if value is None else str(value)).strip()
+                if new_txt == (getattr(row, "comments", "") or ""): return True
+                row.comments = new_txt
+                if self._save_fields_cb:
+                    self._save_fields_cb(did, {"comments": new_txt})
+                _emit(); return True
+
             if c == self.COL_TYPE:
-                # allow "DWG — Drawing" items; take code to the left of the em dash
                 new_type = ("" if value is None else str(value)).split("—", 1)[0].strip().upper()
-                if new_type == (row.doc_type or ""): return True
+                if new_type == (getattr(row, "doc_type", "") or ""): return True
                 row.doc_type = new_type
                 if self._save_fields_cb:
                     self._save_fields_cb(did, {"doc_type": new_type})
@@ -111,7 +126,7 @@ class RegisterTableModel(QAbstractTableModel):
 
             if c == self.COL_FILETYPE:
                 new_ft = ("" if value is None else str(value)).strip().upper()
-                if new_ft == (row.file_type or ""): return True
+                if new_ft == (getattr(row, "file_type", "") or ""): return True
                 row.file_type = new_ft
                 if self._save_fields_cb:
                     self._save_fields_cb(did, {"file_type": new_ft})
@@ -119,7 +134,7 @@ class RegisterTableModel(QAbstractTableModel):
 
             if c == self.COL_STATUS:
                 new_status = ("" if value is None else str(value)).strip()
-                if new_status == (row.status or ""): return True
+                if new_status == (getattr(row, "status", "") or ""): return True
                 row.status = new_status
                 if self._save_fields_cb:
                     self._save_fields_cb(did, {"status": new_status})
@@ -128,16 +143,13 @@ class RegisterTableModel(QAbstractTableModel):
             if c == self.COL_LATEST_REV:
                 new_rev = ("" if value is None else str(value)).strip()
                 if not new_rev: return True
-                # persist to revisions table (latest is derived by SELECT)
                 if self._add_revision_cb:
                     self._add_revision_cb(did, new_rev)
-                # reflect immediately in the UI
                 row.latest_rev_token = new_rev
                 row.latest_rev_raw = new_rev
                 _emit(); return True
 
         except Exception:
-            # keep UI alive even if persistence throws
             return False
 
         return False
@@ -153,18 +165,7 @@ class RegisterTableModel(QAbstractTableModel):
         return [r for r, s in zip(self._rows, self._selected) if s]
 
     def selected_doc_ids(self) -> List[str]:
-        return [r.doc_id for r, s in zip(self._rows, self._selected) if s]
+        return [getattr(r, 'doc_id', '') for r, s in zip(self._rows, self._selected) if s]
 
     def all_doc_ids(self) -> List[str]:
-        return [r.doc_id for r in self._rows]
-
-    def set_selected_doc_ids(self, doc_ids: Set[str]) -> None:
-        s = set(doc_ids or set())
-        self._selected = [(row.doc_id in s) for row in self._rows]
-        if self.rowCount() > 0:
-            tl = self.index(0, self.COL_SELECT)
-            br = self.index(self.rowCount() - 1, self.COL_SELECT)
-            self.dataChanged.emit(tl, br, [Qt.CheckStateRole])
-
-    def clear_all_selection(self) -> None:
-        self.set_selected_doc_ids(set())
+        return [getattr(r, 'doc_id', '') for r in self._rows]
