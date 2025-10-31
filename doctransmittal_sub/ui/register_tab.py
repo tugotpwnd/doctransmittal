@@ -42,11 +42,15 @@ from .widgets.register_model import RegisterTableModel as RM
 from .widgets.register_model import QModelIndex  # type hints only
 from .widgets.register_model import Qt as _Qt  # avoid naming clash
 from .widgets.toast import toast
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+
 
 
 _ALPHA = string.ascii_uppercase
 DB_LAST_KEY = "last.db_path"
 KEEP_VALUE = "— no change —"
+WIDTHS_SETTINGS_KEY = "ui.tables.register.widths"
+
 
 # Regex to extract a displayable token from a revision string (e.g., "Rev A" -> "A")
 _REV_TOKEN_RE = re.compile(r"(?i)(?:rev\s*)?([A-Za-z]+\d*|\d+[A-Za-z]*|[A-Za-z]|\d+)$")
@@ -61,16 +65,34 @@ def _parse_latest_token(raw: Optional[str]) -> str:
 def _col(name: str, default: int) -> int:
     return getattr(RegisterTableModel, name, default)
 
-COL_SELECT      = _col('COL_SELECT', 0)
-COL_DOC_ID      = _col('COL_DOC_ID', 1)
-COL_TYPE        = _col('COL_TYPE', 2)
-COL_FILETYPE    = _col('COL_FILETYPE', 3)
-COL_DESCRIPTION = _col('COL_DESCRIPTION', 4)
-COL_STATUS      = _col('COL_STATUS', 5)
-COL_LATEST_REV  = _col('COL_LATEST_REV', 6)
+COL_SELECT       = _col('COL_SELECT', 0)
+COL_DOC_ID       = _col('COL_DOC_ID', 1)
+COL_TYPE         = _col('COL_TYPE', 2)
+COL_FILETYPE     = _col('COL_FILETYPE', 3)
+COL_DESCRIPTION  = _col('COL_DESCRIPTION', 4)  # NEW
+COL_STATUS       = _col('COL_STATUS', 5)
+COL_LATEST_REV   = _col('COL_LATEST_REV', 6)
+COL_COMMENTS     = _col('COL_COMMENTS', 7)
+
 
 # ---- Delegates ---------------------------------------------------------------
 from PyQt5.QtWidgets import QComboBox, QLineEdit
+
+from PyQt5.QtWidgets import QTextEdit
+
+class MultiLineDelegate(QStyledItemDelegate):
+    def createEditor(self, parent, option, index):
+        te = QTextEdit(parent)
+        te.setWordWrapMode(te.wordWrapMode())  # keep Qt defaults
+        te.setAcceptRichText(False)
+        te.setPlaceholderText("Add comments…")
+        te.setMinimumHeight(80)
+        return te
+    def setEditorData(self, editor, index):
+        editor.setPlainText(str(index.data() or ""))
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.toPlainText(), Qt.EditRole)
+
 
 class ComboDelegate(QStyledItemDelegate):
     def __init__(self, options_provider: Callable[[], List[str]], editable=False, parent=None):
@@ -149,13 +171,24 @@ class RegisterTab(QWidget):
         tools.addStretch(1)
         lay.addLayout(tools)
 
-
         # Table
         self.table = QTableView(self)
         self.model = RegisterTableModel([])
         self.proxy = RegisterFilterProxy(self)
         self.proxy.setSourceModel(self.model)
         self.table.setModel(self.proxy)
+
+        # --- NEW: debounce timer for persisting column widths
+        self._widths_timer = QTimer(self)
+        self._widths_timer.setSingleShot(True)
+        self._widths_timer.timeout.connect(self._save_column_widths)
+
+        hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
+        hdr.setSectionResizeMode(QHeaderView.Interactive)
+        hdr.sectionResized.connect(lambda *_: self._widths_timer.start(300))
+        hdr.sectionCountChanged.connect(lambda *_: self._widths_timer.start(300))
+
         # Add this assert temporarily to confirm we have the real class
         assert type(self.model).__name__ == "RegisterTableModel", type(self.model)
         self.table.setSelectionBehavior(self.table.SelectRows)
@@ -163,6 +196,8 @@ class RegisterTab(QWidget):
         self.table.selectionModel().selectionChanged.connect(self._on_view_selection_changed)
         lay.addWidget(self.table, 1)
         self._apply_default_column_widths()  # <-- add this line
+
+
 
 
         # Option providers for delegates
@@ -182,7 +217,19 @@ class RegisterTab(QWidget):
         self.table.setItemDelegateForColumn(COL_STATUS,      ComboDelegate(_opts_statuses,    editable=False, parent=self))
         self.table.setItemDelegateForColumn(COL_DESCRIPTION, ComboDelegate(_opts_descriptions,editable=True,  parent=self))
         self.table.setItemDelegateForColumn(COL_LATEST_REV,  LineDelegate(self))
+        self.table.setItemDelegateForColumn(COL_COMMENTS, MultiLineDelegate(self))  # NEW
         self.table.setEditTriggers(QTableView.DoubleClicked | QTableView.SelectedClicked | QTableView.EditKeyPressed)
+
+        # Make long text wrap and rows auto-size
+        self.table.setWordWrap(True)
+        self.table.setTextElideMode(Qt.ElideNone)  # don’t shorten with "…"
+        vh = self.table.verticalHeader()
+        vh.setSectionResizeMode(QHeaderView.ResizeToContents)  # auto height from contents
+
+        # When the user resizes a column, reflow rows (keeps wrapping accurate)
+        self.table.horizontalHeader().sectionResized.connect(
+            lambda *_: self.table.resizeRowsToContents()
+        )
 
         # Model persistence callbacks if supported
         if hasattr(self.model, 'set_save_callbacks'):
@@ -231,6 +278,7 @@ class RegisterTab(QWidget):
         self.model.modelReset.connect(self._on_model_changed)
         # View-level persistence (only used if model lacks callbacks)
         self.table.model().dataChanged.connect(self._on_cell_edited)
+
 
         # last db
         last_db = self.settings.get(DB_LAST_KEY, "")
@@ -362,26 +410,66 @@ class RegisterTab(QWidget):
 
     # ----------------- Helper for setting default col widths ---------------
     def _apply_default_column_widths(self):
-        # Keep columns user-resizable, but don't auto-fit on load
+        """
+        Load saved widths from settings, apply them.
+        Any columns not found fall back to sensible hard defaults.
+        """
         header = self.table.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(QHeaderView.Interactive)
 
-        # Tweak these numbers to taste
-        widths = {
-            COL_SELECT: 28,  # tick column
-            COL_DOC_ID: 140,
-            COL_TYPE: 60,
-            COL_FILETYPE: 80,
-            COL_DESCRIPTION: 540,
-            COL_STATUS: 80,
-            COL_LATEST_REV: 80,
+        # Hard defaults (your existing numbers)
+        defaults = {
+            COL_SELECT: 28,
+            COL_DOC_ID: 200,
+            COL_TYPE: 160,
+            COL_FILETYPE: 160,
+            COL_DESCRIPTION: 800,
+            COL_COMMENTS: 380,  # NEW
+            COL_STATUS: 200,
+            COL_LATEST_REV: 160,
         }
-        for col, w in widths.items():
+
+        # Pull saved widths (dict of str/int -> int)
+        saved = self.settings.get(WIDTHS_SETTINGS_KEY, {}) or {}
+
+        # Apply saved first
+        try:
+            count = header.count()
+        except Exception:
+            count = max(defaults) + 1
+
+        for col in range(count):
+            w = saved.get(str(col))
+            if isinstance(w, int) and w > 0:
+                try:
+                    self.table.setColumnWidth(col, w)
+                except Exception:
+                    pass
+
+        # Fill any missing with defaults
+        for col, w in defaults.items():
             try:
-                self.table.setColumnWidth(col, int(w))
+                if self.table.columnWidth(col) <= 0:
+                    self.table.setColumnWidth(col, int(w))
             except Exception:
                 pass
+
+    def _save_column_widths(self):
+        """Persist current logical column widths to settings.json."""
+        try:
+            header = self.table.horizontalHeader()
+            count = header.count()
+            data = {}
+            for col in range(count):
+                try:
+                    data[str(col)] = int(header.sectionSize(col))
+                except Exception:
+                    pass
+            self.settings.set(WIDTHS_SETTINGS_KEY, data)
+        except Exception:
+            # don't let UI crash on any failure
+            pass
 
     # ----------------- Helpers for ticked rows (model-agnostic) ---------------
     def _model_has(self, name: str) -> bool:
@@ -609,6 +697,20 @@ class RegisterTab(QWidget):
         if not p.exists():
             QMessageBox.warning(self, "Not found", "Please select a valid project database (.db)."); return
         self.settings.set(DB_LAST_KEY, str(p))
+        # NEW: snapshot BEFORE we touch schema (so we capture the incoming state)
+        try:
+            from ..services.db import create_db_backup
+        except Exception:
+            create_db_backup = None
+        if create_db_backup:
+            try:
+                snap = create_db_backup(p, history_dir_name="DB History", keep=50)
+                if snap:
+                    print(f"[backup] DB snapshot -> {snap}")
+            except Exception as e:
+                print(f"[backup] snapshot failed: {e}")
+
+        # proceed with normal init / schema ensure
         init_db(p)
         proj = get_project(p)
         if not proj:
@@ -653,10 +755,27 @@ class RegisterTab(QWidget):
             token = _parse_latest_token(latest_raw)
             # Minimal row object matching what RegisterTableModel.data() expects
             class _Row:
-                __slots__ = ("doc_id","doc_type","file_type","description","status","latest_rev_raw","latest_rev_token")
-                def __init__(self, d,t,f,desc,s,lr_raw,lt):
-                    self.doc_id=d; self.doc_type=t; self.file_type=f; self.description=desc; self.status=s; self.latest_rev_raw=lr_raw; self.latest_rev_token=lt
-            doc_rows.append(_Row(r["doc_id"], r["doc_type"], r["file_type"], r["description"], r["status"], latest_raw, token))
+                __slots__ = ("doc_id", "doc_type", "file_type", "description", "comments", "status", "latest_rev_raw",
+                             "latest_rev_token")
+
+                def __init__(self, d, t, f, desc, comm, s, lr_raw, lt):
+                    self.doc_id = d;
+                    self.doc_type = t;
+                    self.file_type = f
+                    self.description = desc;
+                    self.comments = comm  # <— NEW
+                    self.status = s;
+                    self.latest_rev_raw = lr_raw;
+                    self.latest_rev_token = lt
+
+            doc_rows.append(
+                _Row(
+                    r["doc_id"], r["doc_type"], r["file_type"],
+                    r.get("description", ""), r.get("comments", ""),  # <— NEW
+                    r.get("status", ""),
+                    latest_raw, token
+                )
+            )
 
         # If model has a setter, use it; else reset underlying lists
         if hasattr(self.model, 'set_rows'):
@@ -797,21 +916,33 @@ class RegisterTab(QWidget):
         self.on_proceed(items, self.db_path)
 
     # ----------------- Revisions ---------------------------------------------
-    def _compute_next(self, curr: str) -> str:
-        # Use a stored mode index (default 0=Alpha) when the combo doesn't exist
-        mode_idx = getattr(self, "_rev_mode_idx", 0)
-        if getattr(self, "cb_rev_mode", None) is not None:
-            try:
-                mode_idx = int(self.cb_rev_mode.currentIndex())
-            except Exception:
-                pass
+    def _compute_prev(self, curr: str) -> str:
+        raw = (curr or "").strip()
+        has_alpha = any(ch.isalpha() for ch in raw)
+        has_digit = any(ch.isdigit() for ch in raw)
 
-        if mode_idx == 0:
-            return _alpha_next(curr)
-        elif mode_idx == 1:
-            return _alphanum_next(curr)
-        else:
-            return _numeric_next(curr)
+        # Use UI choice if present; otherwise a sentinel to allow inference
+        mode_idx = None
+        try:
+            if getattr(self, "cb_rev_mode", None) is not None:
+                mode_idx = int(self.cb_rev_mode.currentIndex())
+            else:
+                mode_idx = int(getattr(self, "_rev_mode_idx", 0))
+        except Exception:
+            mode_idx = None
+
+        # Inference: if purely numeric/alpha, prefer that family
+        if has_digit and not has_alpha:
+            return _numeric_prev(raw)
+        if has_alpha and not has_digit:
+            return _alpha_prev(raw)
+
+        # Mixed (alphanumeric) or empty: honour selected mode, default to alphanum
+        if mode_idx == 0:  # Alpha
+            return _alpha_prev(raw)
+        if mode_idx == 2:  # Numeric
+            return _numeric_prev(raw)
+        return _alphanum_prev(raw)
 
     def _rev_set_selected(self):
         if not (self.db_path and self.project_id is not None):
@@ -845,22 +976,96 @@ class RegisterTab(QWidget):
 
     def _rev_increment_selected(self):
         if not (self.db_path and self.project_id is not None):
-            QMessageBox.information(self, "Project", "Open a project database first."); return
+            QMessageBox.information(self, "Project", "Open a project database first.")
+            return
+
         sel_rows = self.table.selectionModel().selectedRows(COL_DOC_ID)
         if not sel_rows:
-            QMessageBox.information(self, "Select rows", "Single-click to highlight one or more rows, then try again."); return
+            QMessageBox.information(self, "Select rows", "Single-click to highlight one or more rows, then try again.")
+            return
+
         rows = getattr(self.model, '_rows', [])
         doc_ids = []
         for vix in sel_rows:
             srow = self.proxy.mapToSource(vix).row()
             if 0 <= srow < len(rows):
                 doc_ids.append(rows[srow].doc_id)
-        # build curr token map
-        curr_map = {getattr(r,'doc_id',''): (getattr(r,'latest_rev_token','') or '') for r in rows}
+
+        # ensure latest_rev_token reflects any inline edits before we compute next
+        self._reload_rows()
+        rows = getattr(self.model, '_rows', [])
+
+        # build curr token map (fallback to raw display if token missing)
+        curr_map = {}
+        for r in rows:
+            did = getattr(r, 'doc_id', '')
+            tok = getattr(r, 'latest_rev_token', '') or _parse_latest_token(str(getattr(r, 'latest_rev_raw', '') or ''))
+            curr_map[did] = tok
+
+        # debug: see the seeds we will increment from
+        try:
+            print("[rev-increment] seed:", {d: curr_map.get(d, '') for d in doc_ids})
+        except Exception:
+            pass
+
         updates = {did: self._compute_next(curr_map.get(did, "")) for did in doc_ids}
+
         touched = 0
         for did, rev in updates.items():
             touched += add_revision_by_docid(self.db_path, self.project_id, did, rev)
+
+        prev = set(doc_ids)
+        self._reload_rows()
+        sel_model = self.table.selectionModel()
+        sel_model.clearSelection()
+        rows = getattr(self.model, '_rows', [])
+        for r, row in enumerate(rows):
+            if row.doc_id in prev:
+                vix = self.proxy.mapFromSource(self.model.index(r, COL_DOC_ID))
+                sel_model.select(vix, sel_model.Select | sel_model.Rows)
+
+        QMessageBox.information(self, "Revisions", f"Applied {touched} revision increment(s).")
+
+    def _rev_decrement_selected(self):
+        if not (self.db_path and self.project_id is not None):
+            QMessageBox.information(self, "Project", "Open a project database first.")
+            return
+
+        sel_rows = self.table.selectionModel().selectedRows(COL_DOC_ID)
+        if not sel_rows:
+            QMessageBox.information(self, "Select rows", "Single-click to highlight one or more rows, then try again.")
+            return
+
+        rows = getattr(self.model, '_rows', [])
+        doc_ids = []
+        for vix in sel_rows:
+            srow = self.proxy.mapToSource(vix).row()
+            if 0 <= srow < len(rows):
+                doc_ids.append(rows[srow].doc_id)
+
+        # ensure latest_rev_token reflects any inline edits before we compute prev
+        self._reload_rows()
+        rows = getattr(self.model, '_rows', [])
+
+        # build curr token map (fallback to raw display if token missing)
+        curr_map = {}
+        for r in rows:
+            did = getattr(r, 'doc_id', '')
+            tok = getattr(r, 'latest_rev_token', '') or _parse_latest_token(str(getattr(r, 'latest_rev_raw', '') or ''))
+            curr_map[did] = tok
+
+        # debug
+        try:
+            print("[rev-decrement] seed:", {d: curr_map.get(d, '') for d in doc_ids})
+        except Exception:
+            pass
+
+        updates = {did: self._compute_prev(curr_map.get(did, "")) for did in doc_ids}
+
+        touched = 0
+        for did, rev in updates.items():
+            touched += add_revision_by_docid(self.db_path, self.project_id, did, rev)
+
         prev = set(doc_ids)
         self._reload_rows()
         sel_model = self.table.selectionModel(); sel_model.clearSelection()
@@ -869,7 +1074,9 @@ class RegisterTab(QWidget):
             if row.doc_id in prev:
                 vix = self.proxy.mapFromSource(self.model.index(r, COL_DOC_ID))
                 sel_model.select(vix, sel_model.Select | sel_model.Rows)
-        QMessageBox.information(self, "Revisions", f"Applied {touched} revision increment(s).")
+
+        QMessageBox.information(self, "Revisions", f"Applied {touched} revision decrement(s).")
+
 
     # ----------------- Areas / Batch import ----------------------------------
     def _reload_areas(self):
@@ -1020,10 +1227,14 @@ class RegisterTab(QWidget):
         try:
             if topLeft != bottomRight:
                 return
-            if Qt.EditRole not in roles and Qt.DisplayRole not in roles:
+
+            # Qt often sends an empty roles list; treat that as "something changed"
+            if roles and (Qt.EditRole not in roles and Qt.DisplayRole not in roles):
                 return
+
             src_idx = self.proxy.mapToSource(topLeft)
-            r = src_idx.row(); c = src_idx.column()
+            r = src_idx.row();
+            c = src_idx.column()
             rows = getattr(self.model, '_rows', [])
             if not (0 <= r < len(rows)):
                 return
@@ -1031,18 +1242,35 @@ class RegisterTab(QWidget):
             did = getattr(row, 'doc_id', '')
             if not did:
                 return
+
+            # --- debug header ----------------------------------------------------
+            try:
+                print(f"[RegisterTab] dataChanged r={r} c={c} roles={list(roles) if roles else []} did={did}")
+            except Exception:
+                pass
+
             if c == COL_DESCRIPTION:
-                update_document_fields(self.db_path, self.project_id, did, {"description": getattr(row,'description','')})
+                update_document_fields(self.db_path, self.project_id, did,
+                                       {"description": getattr(row, 'description', '')})
             elif c == COL_TYPE:
-                update_document_fields(self.db_path, self.project_id, did, {"doc_type": getattr(row,'doc_type','')})
+                update_document_fields(self.db_path, self.project_id, did, {"doc_type": getattr(row, 'doc_type', '')})
             elif c == COL_FILETYPE:
-                update_document_fields(self.db_path, self.project_id, did, {"file_type": getattr(row,'file_type','')})
+                update_document_fields(self.db_path, self.project_id, did, {"file_type": getattr(row, 'file_type', '')})
             elif c == COL_STATUS:
-                update_document_fields(self.db_path, self.project_id, did, {"status": getattr(row,'status','')})
+                update_document_fields(self.db_path, self.project_id, did, {"status": getattr(row, 'status', '')})
             elif c == COL_LATEST_REV:
-                val = str(topLeft.data() or "").strip()
-                if val:
-                    add_revision_by_docid(self.db_path, self.project_id, did, val)
+                raw = str(topLeft.data() or "")
+                token = _parse_latest_token(raw)
+                try:
+                    print(f"[RegisterTab] LatestRev edit: raw='{raw}' -> token='{token}' for {did}")
+                except Exception:
+                    pass
+                if token:
+                    inserted = add_revision_by_docid(self.db_path, self.project_id, did, token)
+                    try:
+                        print(f"[RegisterTab] add_revision_by_docid -> {inserted} (1=changed, 0=no-op)")
+                    except Exception:
+                        pass
         except Exception:
             # keep UI responsive on any failure
             pass
@@ -1099,7 +1327,6 @@ def _numeric_next(tok: str) -> str:
     except Exception:
         return '1'
 
-
 def _alphanum_next(tok: str) -> str:
     raw = (tok or '').upper()
     num = ''.join([c for c in raw if c.isdigit()])
@@ -1114,3 +1341,63 @@ def _alphanum_next(tok: str) -> str:
     if len(letters) < len(nxt) and letters == 'Z':
         return f"{int(num)+1}A"
     return f"{num}{nxt}"
+
+def _alpha_prev(tok: str) -> str:
+    """A -> A (clamp), B -> A, AA -> Z, AB -> AA, etc."""
+    s = ''.join([c for c in (tok or '').upper() if c.isalpha()])
+    if not s:
+        return 'A'
+    # decode base-26 (A=1 .. Z=26)
+    n = 0
+    for ch in s:
+        n = n * 26 + (_ALPHA.index(ch) + 1)
+    if n <= 1:
+        return 'A'
+    n -= 1
+    out = []
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        out.append(_ALPHA[rem])
+    return ''.join(reversed(out))
+
+
+def _numeric_prev(tok: str) -> str:
+    """1 -> 0, 0 -> 0 (clamp)."""
+    digits = ''.join([c for c in str(tok or '') if c.isdigit()])
+    if not digits:
+        return '0'
+    try:
+        v = int(digits)
+        return str(max(0, v - 1))
+    except Exception:
+        return '0'
+
+
+def _alphanum_prev(tok: str) -> str:
+    """
+    Mirrors _alphanum_next:
+    3B -> 3A
+    3A -> 2Z (if num>1), else clamp to 1A
+    """
+    raw = (tok or '').upper()
+    num = ''.join([c for c in raw if c.isdigit()])
+    letters = ''.join([c for c in raw if c.isalpha()])
+    if not num and not letters:
+        return '1A'  # clamp baseline
+
+    if num and not letters:
+        return _numeric_prev(num)
+    if letters and not num:
+        return _alpha_prev(letters)
+
+    # both present
+    try:
+        n = int(num)
+    except Exception:
+        n = 1
+
+    if letters == 'A':
+        if n > 1:
+            return f"{n-1}Z"
+        return '1A'  # clamp baseline
+    return f"{n}{_alpha_prev(letters)}"

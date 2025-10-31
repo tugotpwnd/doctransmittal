@@ -52,7 +52,7 @@ class AddTemplateMiniDialog(QDialog):
     def __init__(self, parent=None, init: Optional[Dict] = None):
         super().__init__(parent)
         self.setWindowTitle("Template")
-        self.resize(600, 230)
+        self.resize(1600, 400)
         self.doc_id = ""
         self.description = ""
         self.revision = ""
@@ -151,7 +151,7 @@ class TemplatesDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Templates")
-        self.resize(980, 520)
+        self.resize(1600, 800)
 
         self.current_json: Path = templates_json_path()
         self.org = DEFAULT_ORG

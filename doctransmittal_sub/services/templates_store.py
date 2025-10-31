@@ -18,9 +18,11 @@ def templates_json_path() -> Path:
 # Categories (routing)
 # ---------------------------------------------------------------------------
 CATEGORIES = [
-    ("document", "Report/Document/Register"),
+    ("document", "Report/Document"),
     ("schedule", "Schedule"),
     ("drawing",  "Drawing"),
+    ("rfi", "RFI"),
+    ("calculation", "Calculation"),
 ]
 CATEGORY_KEYS = {k for k, _ in CATEGORIES}
 CATEGORY_LABELS = {k: v for k, v in CATEGORIES}

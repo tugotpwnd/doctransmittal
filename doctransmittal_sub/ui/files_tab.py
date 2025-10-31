@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QGroupBox,
     QListWidget, QListWidgetItem, QTreeView, QFileSystemModel,
     QPushButton, QLabel, QMessageBox, QFileDialog,
-    QStyledItemDelegate, QStyleOptionViewItem
+    QStyledItemDelegate, QStyleOptionViewItem, QLineEdit
 )
 
 # --- Autofind helpers ---
@@ -156,7 +156,13 @@ class FilesTab(QWidget):
         self.btn_back = QPushButton("◀ Back", self)
         self.btn_back.clicked.connect(lambda: self.backRequested.emit())
         nav.addWidget(self.btn_back)
+
         nav.addStretch(1)
+        nav.addWidget(QLabel("Submission date:", self))
+        self.le_date = QLineEdit(self)
+        self.le_date.setPlaceholderText("DD/MM/YYYY or DD/MM/YYYY HH:MM")
+        self.le_date.setFixedWidth(180)
+        nav.addWidget(self.le_date)
 
         self.btn_proceed = QPushButton("Proceed: Build Transmittal ▶", self)
         self.btn_proceed.setToolTip("Copies mapped files and generates a receipt PDF.")
@@ -167,7 +173,8 @@ class FilesTab(QWidget):
 
     # ===== Public API =====
     def set_flow_context(self, *, db_path: Path, items: List[dict],
-                         file_mapping: Dict[str, str], user: str, title: str, client: str):
+                         file_mapping: Dict[str, str], user: str, title: str, client: str,
+                         created_on: str = ""):
         self.db_path = Path(db_path) if db_path else None
         self.items = list(items or [])
         self.doc_ids = [(it.get("doc_id") or "").strip() for it in self.items if it.get("doc_id")]
@@ -183,17 +190,32 @@ class FilesTab(QWidget):
         self._refresh_doc_list()
         self._refresh_map_list()
 
+        # Prefill date (if ISO in payload, show as DD/MM/YYYY or DD/MM/YYYY HH:MM)
+        try:
+            disp = (created_on or "").strip()
+            if len(disp) >= 10 and disp[4:5] == "-" and disp[7:8] == "-":
+                from datetime import datetime as _dt
+                fmt_in = "%Y-%m-%d %H:%M" if ":" in disp else "%Y-%m-%d"
+                dt = _dt.strptime(disp, fmt_in)
+                disp = dt.strftime("%d/%m/%Y %H:%M") if ":" in disp else dt.strftime("%d/%m/%Y")
+            if not disp:
+                from datetime import date as _d
+                disp = _d.today().strftime("%d/%m/%Y")
+            if hasattr(self, "le_date"):
+                self.le_date.setText(disp)
+        except Exception:
+            pass
+
     def set_flow_context_edit(self, payload: dict):
         """
         Start Files tab in EDIT mode from History tab.
         payload keys:
-          - db_path, items, file_mapping, user, title, client
+          - db_path, items, file_mapping, user, title, client, created_on
           - transmittal_number (required)
         """
         self._edit_mode = True
         self._edit_transmittal_number = (payload.get("transmittal_number") or "").strip() or None
 
-        # Reuse your existing setter to populate lists/mapping
         self.set_flow_context(
             db_path=payload.get("db_path"),
             items=payload.get("items") or [],
@@ -201,14 +223,13 @@ class FilesTab(QWidget):
             user=payload.get("user", ""),
             title=payload.get("title", ""),
             client=payload.get("client", ""),
+            created_on=(payload.get("created_on") or ""),
         )
 
-        # (Optional) make the CTA label clearer in edit mode
         try:
             self.btn_proceed.setText("Update Transmittal ▶")
         except Exception:
             pass
-
 
     def get_mapping(self) -> Dict[str, str]:
         return dict(self.mapping)
@@ -522,6 +543,7 @@ class FilesTab(QWidget):
                 title=self.title or "",
                 client=self.client or "",
                 items=snap,
+                created_on_str=(self.le_date.text().strip() if hasattr(self, "le_date") else None),
             )
         except Exception as e:
             QMessageBox.critical(self, "Transmittal", f"Failed to create transmittal:\n{e}")

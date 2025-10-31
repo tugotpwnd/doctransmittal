@@ -1,8 +1,12 @@
 from __future__ import annotations
+
+import warnings
 from pathlib import Path
 from typing import List
+
+import pandas as pd
 from PyQt5.QtWidgets import QMainWindow, QTabWidget, QAction, QMessageBox, QInputDialog, QDockWidget, QSizePolicy, \
-    QApplication, QActionGroup
+    QApplication, QActionGroup, QFileDialog
 from PyQt5.QtCore import Qt
 from doctransmittal_sub.core.settings import SettingsManager
 from doctransmittal_sub.core.excepthook import install_excepthook
@@ -23,7 +27,9 @@ from PyQt5.QtGui import QPixmap, QIcon
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import QApplication, QAction
 
-
+from ..services.db import get_project, list_documents_with_latest
+from ..services.receipt_pdf import export_progress_report_pdf
+from datetime import datetime, date
 
 # --- UI assets helper (works in dev + PyInstaller) --------------------------
 from pathlib import Path
@@ -118,7 +124,7 @@ class MainWindow(QMainWindow):
         }}
         QTabWidget::tab-bar {{ alignment: left; }}
         QTabBar::tab {{
-            min-width: 128px; padding: 10px 24px 10px 26px; margin: 2px 6px;
+            min-width: 200px; padding: 10px 24px 10px 26px; margin: 2px 6px;
             border-radius: 12px; font-size: {tab_pt}pt; font-weight: 800;
             color: {tab_txt}; background: {tab_bg};
         }}
@@ -270,7 +276,7 @@ class MainWindow(QMainWindow):
     def __init__(self, settings: SettingsManager, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.setWindowTitle("DocumentTransmittal"); self.resize(1400, 900)
+        self.setWindowTitle("DocumentTransmittal"); self.resize(1920, 1920)
 
         # --- Central with stacked background ----------------------------------------
         # --- Central content (no background image) ---
@@ -359,6 +365,7 @@ class MainWindow(QMainWindow):
         # Bulk edit / revisions
         self.sidebar.bulkApplyRequested.connect(self.register_tab.apply_bulk_to_selected)
         self.sidebar.revisionIncrementRequested.connect(self.register_tab._rev_increment_selected)
+        self.sidebar.revisionDecrementRequested.connect(self.register_tab._rev_decrement_selected)  # NEW
         self.sidebar.revisionSetRequested.connect(self.register_tab._rev_set_selected)
 
         # SINGLE batch import hook
@@ -368,11 +375,24 @@ class MainWindow(QMainWindow):
         self.register_tab.rowOptionsReady.connect(self.sidebar.set_apply_option_lists)
         self.register_tab._refresh_option_widgets()
 
+        # Progress report
+        self.sidebar.printProgressRequested.connect(self._print_progress_report)
+        # Register report
+        self.sidebar.printRegisterRequested.connect(self._on_print_register)
+        # Migrate Excel
+        self.sidebar.migrateExcelRequested.connect(self._on_migrate_excel_clicked)
+
         install_excepthook()
 
         # Sidebar → Project Settings
         self.sidebar.projectSettingsRequested.connect(self._open_project_settings)
         self.sidebar.templatesRequested.connect(self._open_templates_viewer)
+        # Auto-refresh progress donut when the register table changes
+        try:
+            self.register_tab.model.dataChanged.connect(lambda *a, **k: self.sidebar.refresh_progress())
+            self.register_tab.model.modelReset.connect(lambda *a, **k: self.sidebar.refresh_progress())
+        except Exception:
+            pass
 
         # Window icon + theme
         try:
@@ -398,6 +418,266 @@ class MainWindow(QMainWindow):
         # Apply global theme last
         self._init_appearance_defaults()
         self._apply_theme()
+
+    from PyQt5.QtWidgets import QFileDialog
+    import warnings
+    import pandas as pd
+
+    def _on_migrate_excel_clicked(self):
+        # 1) DB source of truth comes from Register tab
+        db_path = getattr(self.register_tab, "db_path", None)
+        project_id = getattr(self.register_tab, "project_id", None)
+        if not (db_path and project_id):
+            QMessageBox.information(self, "Project", "Open a project database first (Database tab).")
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Excel Register",
+            "",
+            "Excel Files (*.xlsx *.xls *.xlsm)"
+        )
+        if not path:
+            return
+
+        print(f"[migrate] Opening workbook: {path}")
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+            xf = pd.ExcelFile(path, engine="openpyxl")
+            sheet = "MI Documents" if "MI Documents" in xf.sheet_names else xf.sheet_names[0]
+            # Read without headers first so we can detect the header row robustly
+            df0 = pd.read_excel(xf, sheet_name=sheet, header=None, dtype=object)
+
+        print(f"[migrate] Sheet picked: {sheet}")
+        print(f"[migrate] Raw sheet shape: rows={df0.shape[0]}, cols={df0.shape[1]}")
+
+        # ---- Detect header row ----
+        header_row = None
+        keys = ["rev", "document no.", "document no", "doc id", "document id",
+                "document type", "doc type", "type", "file type", "description", "status"]
+        scan_upto = min(40, len(df0))  # look near the top only
+        for i in range(scan_upto):
+            cells = [str(v).strip().lower() for v in df0.iloc[i].tolist()]
+            # count how many key tokens appear in this row (as substrings)
+            hits = sum(any(k in cell for cell in cells) for k in keys)
+            if hits >= 3 and any("document" in cell for cell in cells):
+                header_row = i
+                break
+
+        # Fallback (your template usually has header at row 9 / 1-based = 9)
+        if header_row is None:
+            header_row = 8  # 0-based index -> Excel row 9
+        print(f"[migrate] Header row auto-detected: {header_row + 1} (1-based)")
+
+        # Re-read using the detected header row
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl")
+            df = pd.read_excel(xf, sheet_name=sheet, header=header_row, dtype=object)
+
+        # Drop noise columns (Unnamed, numeric “revision number” columns, etc.)
+        keep_cols = []
+        for c in df.columns:
+            s = str(c).strip()
+            sl = s.lower()
+            if sl.startswith("unnamed"):
+                continue
+            # drop purely numeric headers like "1", "1.1" (revision number columns)
+            if sl.replace(".", "", 1).isdigit():
+                continue
+            # drop any column whose header says "revision number"
+            if "revision number" in sl:
+                continue
+            keep_cols.append(c)
+        df = df.loc[:, keep_cols]
+
+        print("[migrate] Cleaned headers:", [str(c) for c in df.columns.tolist()])
+
+        # Build a normalized header map
+        norm = {str(c).strip().lower(): c for c in df.columns}
+
+        def pick(*aliases):
+            # exact match or startswith fallback
+            for a in aliases:
+                a = a.strip().lower()
+                if a in norm: return norm[a]
+            for a in aliases:
+                a = a.strip().lower()
+                for k, raw in norm.items():
+                    if k.startswith(a): return raw
+            return None
+
+        col_doc_id = pick("document no.", "document no", "doc id", "document id", "document number")
+        col_type = pick("document type", "doc type", "type")
+        col_filetype = pick("file type")
+        col_desc = pick("description")
+        col_status = pick("status")
+        col_latest = pick("latest rev", "rev")
+
+        print("[migrate] Resolved columns ->",
+              dict(doc_id=col_doc_id, doc_type=col_type, file_type=col_filetype,
+                   description=col_desc, status=col_status, latest_rev=col_latest))
+
+        # Preview a few rows for sanity
+        try:
+            prev_cols = [c for c in [col_latest, col_doc_id, col_type, col_filetype, col_desc, col_status] if c]
+            print("[migrate] Preview:")
+            print(df[prev_cols].head(5).to_string(index=False))
+        except Exception:
+            print("[migrate] Preview skipped")
+
+        # Build candidate rows
+        rows = []
+        for _, r in df.iterrows():
+            did = "" if col_doc_id is None else r.get(col_doc_id, "")
+            did = "" if pd.isna(did) else str(did).strip()
+            if not did:
+                continue
+            rows.append({
+                "doc_id": did,
+                "doc_type": "" if col_type is None else (
+                    "" if pd.isna(r.get(col_type)) else str(r.get(col_type)).strip()),
+                "file_type": "" if col_filetype is None else (
+                    "" if pd.isna(r.get(col_filetype)) else str(r.get(col_filetype)).strip()),
+                "description": "" if col_desc is None else (
+                    "" if pd.isna(r.get(col_desc)) else str(r.get(col_desc)).strip()),
+                "status": "" if col_status is None else (
+                    "" if pd.isna(r.get(col_status)) else str(r.get(col_status)).strip()),
+                "latest_rev": "" if col_latest is None else (
+                    "" if pd.isna(r.get(col_latest)) else str(r.get(col_latest)).strip()),
+            })
+
+        print(f"[migrate] Candidate rows parsed: {len(rows)}")
+        if not rows:
+            QMessageBox.information(self, "Import",
+                                    "No valid rows found (couldn’t see a 'Document No.'/Doc ID column).")
+            return
+
+        # Skip dupes and insert
+        from ..services.db import upsert_document, add_revision_by_docid, _connect
+        con = _connect(db_path)
+        existing = {(r[0] or "").strip().upper() for r in con.execute(
+            "SELECT doc_id FROM documents WHERE project_id=?", (project_id,)
+        )}
+        con.close()
+        print(f"[migrate] Existing doc_ids in DB: {len(existing)}")
+
+        inserted = skipped = 0
+        for doc in rows:
+            key = doc["doc_id"].strip().upper()
+            if not key or key in existing:
+                skipped += 1
+                continue
+            upsert_document(db_path, project_id, doc)
+            if doc.get("latest_rev"):
+                try:
+                    add_revision_by_docid(db_path, project_id, doc["doc_id"], doc["latest_rev"])
+                except Exception as e:
+                    print(f"[migrate] add_revision_by_docid failed for {doc['doc_id']}: {e}")
+            inserted += 1
+
+        print(f"[migrate] Done. Inserted={inserted}, Skipped={skipped}")
+        self.register_tab._reload_rows()
+        QMessageBox.information(self, "Migration complete",
+                                f"Imported {inserted} new document(s).\nSkipped {skipped}.")
+
+
+    def _on_print_register(self):
+        try:
+            from doctransmittal_sub.services.db import get_project
+        except Exception:
+            from ..services.db import get_project
+
+        if not getattr(self.register_tab, "db_path", None):
+            QMessageBox.information(self, "Project", "Open a project database first.")
+            return
+
+        db_path = Path(self.register_tab.db_path)
+        proj = get_project(db_path) or {}
+        pid = int(proj.get("id", 0))
+        if not pid:
+            QMessageBox.information(self, "Project", "Project metadata not set in DB.")
+            return
+
+        # === SAME PATHING AS PROGRESS REPORT ===
+        base = db_path.parent
+        if base.name.startswith("."):
+            base = base.parent  # keep reports beside the visible project dir
+        out_dir = base / "Reports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        fname = f"{proj.get('project_code', 'PROJECT')}-Register-{date.today().isoformat()}.pdf"
+        out_pdf = out_dir / fname
+        # =======================================
+
+        header = {
+            "header_title": "DOCUMENT REGISTER",
+            "db_path": str(db_path),  # lets receipt_pdf gather client logos
+            "_pdf_out_path": str(out_pdf),  # also helps logo fallback near output
+        }
+
+        from ..services.receipt_pdf import export_register_report_pdf
+        pdf_path = export_register_report_pdf(out_pdf, header, db_path=db_path, project_id=pid)
+
+        QMessageBox.information(self, "Register PDF", f"Saved:\n{pdf_path}")
+        try:
+            import webbrowser
+            webbrowser.open_new(str(pdf_path))
+        except Exception:
+            pass
+
+    # add this method on MainWindow
+    def _print_progress_report(self):
+        try:
+            db_s, root_s = self.register_tab.current_paths()
+        except Exception:
+            db_s, root_s = "", ""
+        if not db_s:
+            QMessageBox.information(self, "Progress Report", "Open a project database first (Database tab).")
+            return
+
+        dbp = Path(db_s)
+        proj = get_project(dbp)
+        if not proj:
+            QMessageBox.information(self, "Progress Report", "Project metadata not found in this DB.")
+            return
+
+        # Fetch documents (active) for chart + table
+        docs = list_documents_with_latest(dbp, proj["id"], state="active")
+
+        # Header/meta for PDF (client logos are auto-discovered same as receipts)
+        header = {
+            "header_title": "PROGRESS TRACKER",
+            "project_code": proj.get("project_code", ""),
+            "title": proj.get("project_name", ""),
+            "client": proj.get("client_company", ""),
+            "end_user": proj.get("end_user", ""),
+            "created_by": self.settings.get("user.name", ""),
+            "created_on": datetime.now().strftime("%Y-%m-%d"),
+            "register_path": str(dbp),
+            "db_path": str(dbp),  # for logo discovery
+        }
+
+        # Save next to the DB in a clear folder
+        out_dir = dbp.parent / "Progress Reports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
+        job = proj.get("project_code") or "PROJECT"
+        out_pdf = out_dir / f"{job}_Progress_{stamp}.pdf"
+
+        try:
+            export_progress_report_pdf(out_pdf, header, docs)
+        except Exception as e:
+            QMessageBox.warning(self, "Progress Report", f"Failed to build PDF:\n{e}")
+            return
+
+        QMessageBox.information(self, "Progress Report", f"Saved:\n{out_pdf}")
+
+        try:
+            import webbrowser
+            webbrowser.open_new(str(out_pdf))
+        except Exception:
+            pass
+
 
     def _open_appearance_dialog(self):
         # Lazy import to avoid circulars if any

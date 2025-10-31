@@ -1,6 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
 from typing import List, Dict, Optional
 import shutil, re
 
@@ -22,11 +22,24 @@ except Exception:
 
 # ---------------- helpers ----------------
 
+# NEW: accept DD/MM/YYYY, DD/MM/YYYY HH:MM, ISO date/datetime
+def _normalize_created_on(s: Optional[str]) -> str:
+    s = (s or "").strip()
+    if not s:
+        return date.today().isoformat()
+    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%Y-%m-%d %H:%M") if "%H:%M" in fmt else dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return date.today().isoformat()
+
+
 def _base_folder_for_output(db_path: Path) -> Path:
     """
     Put 'Transmittals' one level up from the DB file.
-      DB:  ...\1 Doc Control\.docutrans\register.db
-      OUT: ...\1 Doc Control\Transmittals
+
     If DB is under a dot-folder ('.docutrans'), go up an extra level.
     """
     db_path = Path(db_path).resolve()
@@ -38,20 +51,29 @@ def _base_folder_for_output(db_path: Path) -> Path:
 def _default_out_root(db_path: Path) -> Path:
     return _base_folder_for_output(db_path) / "Transmittals"
 
-def next_transmittal_number(project_code: str, out_root: Path) -> str:
-    out_root.mkdir(parents=True, exist_ok=True)
+def _last_transmittal_number(project_code: str, out_root: Path) -> int:
     pat = re.compile(rf"^{re.escape(project_code)}-TRN-(\d+)$", re.IGNORECASE)
     maxn = 0
     for p in out_root.iterdir():
         if not p.is_dir():
             continue
-        m = pat.match(p.name.strip())
+        m = pat.match(p.name)
         if m:
             try:
                 maxn = max(maxn, int(m.group(1)))
-            except Exception:
-                pass
-    return f"{project_code}-TRN-{maxn+1:03d}"
+            except ValueError:
+                continue
+    return maxn
+
+
+def next_transmittal_number(project_code: str, out_root: Path) -> str:
+    out_root.mkdir(parents=True, exist_ok=True)
+    last_used = _last_transmittal_number(project_code, out_root)
+    # if last transmittal folder is missing (purged), reuse that number
+    candidate = f"{project_code}-TRN-{last_used:03d}"
+    if not (out_root / candidate).exists():
+        return candidate
+    return f"{project_code}-TRN-{last_used + 1:03d}"
 
 # ---------------- core flows ----------------
 
@@ -62,6 +84,7 @@ def create_transmittal(
     title: str,
     client: str,
     items: List[Dict[str, str]],
+    created_on_str: Optional[str] = None,
 ) -> Path:
     """
     items = [{doc_id, revision, file_path, (optional snapshot fields)}]
@@ -82,7 +105,7 @@ def create_transmittal(
         "title": title.strip(),
         "client": client.strip(),
         "created_by": user_name.strip(),
-        "created_on": date.today().isoformat(),
+        "created_on": _normalize_created_on(created_on_str),
     }
     insert_transmittal(db_path, header, items)
     return rebuild_transmittal_bundle(db_path, number, out_root)
@@ -132,9 +155,15 @@ def rebuild_transmittal_bundle(
                 pass
 
     header = [t for t in list_transmittals(db_path, include_deleted=True) if t["id"] == tid][0]
+
+    # --- Add these two lines ---
+    header["db_path"] = str(db_path)  # let receipt_pdf find DM-Logos via list_logos()
+    header["_pdf_out_path"] = str(receipt_dir)  # optional; helps fallback search
+
     pdf_path = receipt_dir / f"{transmittal_number}.pdf"
     export_transmittal_pdf(pdf_path, header, items)
     return trans_dir
+
 
 # ---------------- edit / delete ----------------
 
@@ -168,12 +197,14 @@ def edit_transmittal_update_header(
     *,
     title: Optional[str] = None,
     client: Optional[str] = None,
+    created_on_str: Optional[str] = None,
     out_root: Optional[Path] = None,
 ) -> Path:
     tid = find_transmittal_id_by_number(db_path, transmittal_number)
     if tid is None:
         raise RuntimeError("Transmittal not found.")
-    update_transmittal_header(db_path, tid, title=title, client=client)
+    created_on = _normalize_created_on(created_on_str) if created_on_str is not None else None
+    update_transmittal_header(db_path, tid, title=title, client=client, created_on=created_on)
     return rebuild_transmittal_bundle(db_path, transmittal_number, out_root)
 
 def soft_delete_transmittal_bundle(
@@ -186,6 +217,8 @@ def soft_delete_transmittal_bundle(
         return False
     ok = soft_delete_transmittal(db_path, tid, reason=reason)
     return ok
+
+
 
 def purge_transmittal_bundle(
     db_path: Path,

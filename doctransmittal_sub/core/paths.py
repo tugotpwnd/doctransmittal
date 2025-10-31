@@ -29,36 +29,80 @@ def project_state_dir(project_root: Path) -> Path:
 
 
 # --- SharePoint / OneDrive helpers ------------------------------------------
-def company_library_root(org: str = "Maxwell Industries Pty Ltd",
-                         library: str = "Maxwell - Documents") -> Path:
+# doctransmittal_sub/core/paths.py
+from pathlib import Path
+import os
+from typing import Optional
+
+DEFAULT_ORG = "Maxwell Industries Pty Ltd"
+
+def company_library_root(org: Optional[str] = None, library: Optional[str] = None) -> Path:
     """
-    Try to find the local sync root for the org+library on this machine.
-    We check a few common layouts used by OneDrive/SharePoint.
+    Returns the local OneDrive 'company library' root, e.g.
+    C:\\Users\\<you>\\Maxwell Industries Pty Ltd\\<Library-Name>\\
+
+    Backward-compatible signature: (org=None, library=None)
+    - If 'library' is given, prefer that folder.
+    - Otherwise, auto-detect by known names and by the presence of '0. MIMS'.
+    - Env overrides:
+        DOCTRANS_LIBRARY_ROOT -> absolute path to use directly
+        DOCTRANS_ORG          -> override the org folder name
     """
-    home = Path.home()
+    # 0) Hard override
+    override = os.environ.get("DOCTRANS_LIBRARY_ROOT")
+    if override:
+        p = Path(override)
+        if p.exists():
+            return p
+
+    org_name = org or os.environ.get("DOCTRANS_ORG", DEFAULT_ORG)
+    base = Path.home() / org_name
+
+    # If caller supplied a library folder name, try it first
+    if library:
+        preferred = base / library
+        if (preferred / "0. MIMS").exists() or preferred.exists():
+            return preferred
+
+    # Known variants we’ve seen in the wild
     candidates = [
-        home / org / library,                          # C:\Users\you\Maxwell Industries Pty Ltd\Maxwell - Documents
-        home / f"OneDrive - {org}" / library,         # C:\Users\you\OneDrive - Maxwell Industries Pty Ltd\Maxwell - Documents
-        home / f"SharePoint" / library,               # fallback-ish
+        "Maxwell - Documents",
+        "Maxwell Industries - Documents",
+        "Maxwell Documents",
+        "Documents",
     ]
-    # Also check OneDriveCommercial env var if present
-    odv = os.environ.get("OneDriveCommercial", "")
-    if odv:
-        candidates.append(Path(odv) / library)
 
-    for c in candidates:
-        if c.exists():
-            return c
+    # Prefer candidates that have the anchor folder
+    for name in candidates:
+        root = base / name
+        if (root / "0. MIMS").exists():
+            return root
 
-    # last resort: return the first candidate (even if not exists) so caller can still join rel paths
-    return candidates[0]
+    # Otherwise, first existing candidate
+    for name in candidates:
+        root = base / name
+        if root.exists():
+            return root
+
+    # Wildcard scan for any "*Documents*" that has '0. MIMS'
+    try:
+        for d in base.iterdir():
+            if d.is_dir() and "documents" in d.name.lower():
+                if (d / "0. MIMS").exists():
+                    return d
+    except Exception:
+        pass
+
+    # Last-resort: return the first conventional path (may not exist yet)
+    return base / candidates[0]
 
 
-def resolve_company_library_path(rel: str,
-                                 org: str = "Maxwell Industries Pty Ltd",
-                                 library: str = "Maxwell - Documents") -> Path:
+def resolve_company_library_path(relpath: Path | str,
+                                 org: Optional[str] = None,
+                                 library: Optional[str] = None) -> Path:
     """
-    Convert a stored relative path (non-user-specific) into this user's absolute path.
+    Join a relative path (typically starting at '0. MIMS/...') to the detected
+    company library root.
     """
-    root = company_library_root(org, library)
-    return (root / Path(rel)).resolve()
+    root = company_library_root(org=org, library=library)
+    return (root / Path(relpath)).resolve()

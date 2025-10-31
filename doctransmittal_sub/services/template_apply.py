@@ -24,7 +24,14 @@ WORD_ENABLE_XML_PASS = True         # replace inside shapes/text boxes via XML
 WORD_DEBUG = False                  # verbose docx debug
 
 # ================== Utilities / logging ======================================
-_CAT_TO_WORD = {"document": "Documents", "schedule": "Schedules", "drawing": "Drawings"}
+_CAT_TO_WORD = {
+    "document":     "Documents",
+    "schedule":     "Schedules",
+    "drawing":      "Drawings",
+    "rfi":          "RFI",
+    "calculation":  "Model & Calc",
+}
+
 
 def _dbg(msg: str) -> None:
     try:
@@ -37,27 +44,48 @@ def _wdbg(msg: str) -> None:
         _dbg(f"[word] {msg}")
 
 def _find_or_create_category_dir(register_path: Path, category: str) -> Path:
-    base_dir = Path(register_path).parent
-    want = (_CAT_TO_WORD.get((category or "").lower(), "Documents")).lower()
+    """
+    Given the path to the project DB (which lives under “…/1 Doc Control/…”),
+    return the destination folder (e.g., “…/6 Documents”) for the given category.
+
+    Rules:
+      • Go to the folder ABOVE “Doc Control”.
+      • Match target folders by name only (ignore any leading number and spaces).
+      • If the folder does not exist, create it under the project root.
+    """
+    rp = Path(register_path).resolve()
 
     def norm(name: str) -> str:
+        # strip leading digits + whitespace, compare case-insensitively
         return re.sub(r"^\s*\d+\s*", "", name).strip().lower()
 
-    for p in base_dir.iterdir():
-        if p.is_dir() and norm(p.name) == want:
-            return p
+    # Find “…/1 Doc Control/” up the tree, then step up to the project root
+    cur = rp.parent
+    base_dir = None
+    for _ in range(4):  # climb a few levels just in case (handles “…/1 Doc Control/.docutrans/DB.db” too)
+        if norm(cur.name) in {"doc control", "doccontrol"}:
+            base_dir = cur.parent
+            break
+        cur = cur.parent
+    if base_dir is None:
+        # Fallback: assume DB is directly under “…/1 Doc Control/DB.db”
+        base_dir = rp.parent.parent
 
-    out = base_dir / _CAT_TO_WORD.get((category or "").lower(), "Documents")
+    want = _CAT_TO_WORD.get((category or "").lower(), "Documents")
+    want_norm = norm(want)
+
+    # Look for an existing sibling like “3 Drawings”, “4 Schedules”, “5 Model & Calc”, etc.
+    try:
+        for p in base_dir.iterdir():
+            if p.is_dir() and norm(p.name) == want_norm:
+                return p
+    except Exception:
+        pass
+
+    # Create if not found
+    out = base_dir / want
     out.mkdir(parents=True, exist_ok=True)
     return out
-
-def _unique_path(dirpath: Path, stem: str, ext: str) -> Path:
-    cand = dirpath / f"{stem}{ext}"
-    n = 1
-    while cand.exists():
-        cand = dirpath / f"{stem} ({n}){ext}"
-        n += 1
-    return cand
 
 # ================== Excel: xlwings (preferred) ===============================
 def _apply_excel_with_xlwings(dest_path: Path, doc_id: str, project: Dict[str, str], logos: List[Path]) -> None:
@@ -553,3 +581,40 @@ def apply_template_for_new_doc(register_path: Path, payload: Dict[str, str]) -> 
     # Fallback
     _dbg(f"fallback copy-only for unknown kind/ext: {src.suffix}")
     return dest_path
+
+
+# --- replace your _unique_path with this version ---
+from pathlib import Path
+
+def _unique_path(dest_dir: Path, stem_or_name: str, ext: str = "") -> Path:
+    """
+    Return a unique file path in dest_dir.
+    - If stem_or_name already has a suffix and ext is empty, keep that suffix.
+    - If ext is provided, use it (with a leading dot if missing).
+    - If the target exists, append ' (2)', ' (3)', ... before the suffix.
+    """
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    base = (stem_or_name or "").strip() or "New Document"
+    base = Path(base).name  # basename only
+
+    # Decide suffix
+    name_suffix = Path(base).suffix
+    suffix = (ext or name_suffix or "")
+    if suffix and not suffix.startswith("."):
+        suffix = "." + suffix
+
+    # Decide stem
+    stem = Path(base).stem if suffix else base
+
+    candidate = dest_dir / f"{stem}{suffix}"
+    if not candidate.exists():
+        return candidate
+
+    i = 2
+    while True:
+        cand = dest_dir / f"{stem} ({i}){suffix}"
+        if not cand.exists():
+            return cand
+        i += 1

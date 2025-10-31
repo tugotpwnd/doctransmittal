@@ -7,7 +7,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QGroupBox,
     QTableWidget, QTableWidgetItem, QPushButton, QMessageBox, QLabel,
-    QComboBox
+    QComboBox, QLineEdit
 )
 
 # ---- DB / services (robust imports) -----------------------------------------
@@ -27,6 +27,7 @@ try:
         rebuild_transmittal_bundle,
         edit_transmittal_add_items,
         edit_transmittal_remove_items,
+        edit_transmittal_update_header,
         soft_delete_transmittal_bundle,
         purge_transmittal_bundle,
     )
@@ -35,6 +36,7 @@ except Exception:
         rebuild_transmittal_bundle,
         edit_transmittal_add_items,
         edit_transmittal_remove_items,
+        edit_transmittal_update_header,
         soft_delete_transmittal_bundle,
         purge_transmittal_bundle,
     )
@@ -69,12 +71,23 @@ class HistoryTab(QWidget):
         self.cb_trans.currentIndexChanged.connect(self._on_transmittal_changed)
         self.btn_reload = QPushButton("Reload", self); self.btn_reload.clicked.connect(self.refresh)
         self.lbl_sel = QLabel("No transmittal selected", self)
+
         top.addWidget(QLabel("Transmittal:", self))
         top.addWidget(self.cb_trans, 1)
         top.addWidget(self.btn_reload)
         top.addWidget(self.lbl_sel, 1, alignment=Qt.AlignRight)
-        root.addLayout(top)
 
+        # Date edit + Save Header
+        top.addWidget(QLabel("Submission date:", self))
+        self.le_date = QLineEdit(self)
+        self.le_date.setPlaceholderText("DD/MM/YYYY or DD/MM/YYYY HH:MM")
+        self.le_date.setFixedWidth(200)
+        top.addWidget(self.le_date)
+        self.btn_save_hdr = QPushButton("Save Header", self)
+        self.btn_save_hdr.clicked.connect(self._save_header_edits)
+        top.addWidget(self.btn_save_hdr)
+
+        root.addLayout(top)
         # --- Split panes ---
         split = QSplitter(self); split.setOrientation(Qt.Horizontal)
         root.addWidget(split, 1)
@@ -166,12 +179,27 @@ class HistoryTab(QWidget):
             self._current_header = None
             self.lbl_sel.setText("No transmittal selected")
             self._items_right, self._items_left = [], []
+            if hasattr(self, "le_date"):
+                self.le_date.setText("")
             self._render_tables()
             return
 
         self._current_header = self.cb_trans.itemData(idx)
         number = (self._current_header or {}).get("number", "—")
         self.lbl_sel.setText(f"Transmittal: {number}")
+
+        # Prefill date
+        try:
+            co = (self._current_header or {}).get("created_on", "") or ""
+            if len(co) >= 10 and co[4:5] == "-" and co[7:8] == "-":
+                from datetime import datetime as _dt
+                fmt_in = "%Y-%m-%d %H:%M" if ":" in co else "%Y-%m-%d"
+                dt = _dt.strptime(co, fmt_in)
+                co = dt.strftime("%d/%m/%Y %H:%M") if ":" in co else dt.strftime("%d/%m/%Y")
+            if hasattr(self, "le_date"):
+                self.le_date.setText(co)
+        except Exception:
+            pass
 
         # RIGHT: snapshot from DB
         try:
@@ -309,8 +337,27 @@ class HistoryTab(QWidget):
             "user": (self._current_header or {}).get("created_by", ""),
             "title": (self._current_header or {}).get("title", ""),
             "client": (self._current_header or {}).get("client", ""),
+            "created_on": (self._current_header or {}).get("created_on", ""),
         }
         self.remapRequested.emit(payload)
+        self.remapRequested.emit(payload)
+
+
+    # -------- Save  -------------------------------------------------
+    def _save_header_edits(self):
+        if not (self.db_path and self._current_header):
+            return
+        number = (self._current_header or {}).get("number", "")
+        if not number:
+            return
+        try:
+            # Save date only (extend to title/client later if you want)
+            co_text = (self.le_date.text().strip() if hasattr(self, "le_date") else "")
+            edit_transmittal_update_header(self.db_path, number, created_on_str=co_text)
+            self.refresh()
+            QMessageBox.information(self, "Saved", "Submission date updated.")
+        except Exception as e:
+            QMessageBox.warning(self, "Update failed", str(e))
 
     # -------- Delete / Purge -------------------------------------------------
     def _soft_delete_current(self):
