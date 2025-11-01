@@ -414,8 +414,7 @@ def export_transmittal_pdf(out_pdf: Path, header: Dict[str, Any], items: List[Di
     proj_title = (header.get("title") or header.get("project_title") or "").strip()
     client = (header.get("client") or "").strip()
     end_user = (header.get("end_user") or "").strip()
-    date_raw = (header.get("created_on") or header.get("date") or "").strip()
-    date_str = _fmt_date_ddmmyyyy(date_raw)
+    date_str = (header.get("created_on") or header.get("date") or "").strip()
     purpose = (header.get("purpose") or header.get("status") or "").strip()
 
     side_w = (doc.width / 2) - 8*mm
@@ -759,23 +758,15 @@ def export_register_report_pdf(
         prev   = last_two[1] if len(last_two) >= 2 else None
 
         latest_sub_rev  = (latest.get("revision") or "—") if latest else "—"
+        latest_sub_date = (latest.get("created_on") or "—") if latest else "—"
         prev_sub_rev    = (prev.get("revision") or "—") if prev else "—"
-        latest_sub_date = _fmt_date_ddmmyyyy(latest.get("created_on") if latest else None)
-        prev_sub_date = _fmt_date_ddmmyyyy(prev.get("created_on") if prev else None)
+        prev_sub_date   = (prev.get("created_on") or "—") if prev else "—"
 
-        # --- ensure left-aligned description paragraphs ---
-        from reportlab.lib.styles import ParagraphStyle
-
-        P_LEFT = ParagraphStyle(
-            "BodyLeft",
-            parent=styles["BodyText"],
-            alignment=0,  # 0 = TA_LEFT
-            fontName="Helvetica",
-            fontSize=9,
-            leading=11,
-        )
-
-        desc_para = Paragraph(desc if desc else "&nbsp;", P_LEFT)
+        P = styles["BodyText"]
+        P.fontName = "Helvetica"
+        P.fontSize = 9
+        P.leading = 11
+        desc_para = Paragraph(desc if desc else "&nbsp;", P)
 
         body_rows.append([
             did,
@@ -819,15 +810,3 @@ def export_register_report_pdf(
     doc.build(flow)
     return out_pdf
 
-
-def _fmt_date_ddmmyyyy(s: str) -> str:
-    s = (s or "").strip()
-    if not s or s == "—":
-        return "—"
-    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y", "%d-%m-%Y"):
-        try:
-            d = datetime.strptime(s, fmt)
-            return d.strftime("%d-%m-%Y")
-        except Exception:
-            pass
-    return s  # leave as-is if unparseable

@@ -141,7 +141,6 @@ class SidebarWidget(QWidget):
 
     bulkApplyRequested = pyqtSignal(str, str, str)              # type, file type, status
     revisionIncrementRequested = pyqtSignal()
-    revisionDecrementRequested = pyqtSignal()   # NEW
     revisionSetRequested = pyqtSignal()
     importBatchRequested = pyqtSignal()
     projectSettingsRequested = pyqtSignal()
@@ -293,16 +292,15 @@ class SidebarWidget(QWidget):
         act_imp_batch = QAction("Import Revisions/Descriptions…", menu); menu.addAction(act_imp_batch)
         menu.addSeparator()
         act_rev_inc = QAction("Revision: increment (selected)", menu)
-        act_rev_dec = QAction("Revision: decrement (selected)", menu)   # NEW
         act_rev_set = QAction("Revision: set…", menu)
-        menu.addAction(act_rev_inc); menu.addAction(act_rev_dec); menu.addAction(act_rev_set)  # UPDATED
+        menu.addAction(act_rev_inc); menu.addAction(act_rev_set)
         menu.addSeparator()
         act_migrate_excel = QAction("Migrate Excel Register…", menu)
         menu.addAction(act_migrate_excel)
         act_migrate_excel.triggered.connect(self.migrateExcelRequested.emit)
+
         act_imp_batch.triggered.connect(self.importBatchRequested.emit)
         act_rev_inc.triggered.connect(self.revisionIncrementRequested.emit)
-        act_rev_dec.triggered.connect(self.revisionDecrementRequested.emit)   # NEW
         act_rev_set.triggered.connect(self.revisionSetRequested.emit)
 
         more.setMenu(menu)

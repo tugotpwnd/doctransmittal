@@ -365,7 +365,6 @@ class MainWindow(QMainWindow):
         # Bulk edit / revisions
         self.sidebar.bulkApplyRequested.connect(self.register_tab.apply_bulk_to_selected)
         self.sidebar.revisionIncrementRequested.connect(self.register_tab._rev_increment_selected)
-        self.sidebar.revisionDecrementRequested.connect(self.register_tab._rev_decrement_selected)  # NEW
         self.sidebar.revisionSetRequested.connect(self.register_tab._rev_set_selected)
 
         # SINGLE batch import hook
@@ -671,13 +670,6 @@ class MainWindow(QMainWindow):
             return
 
         QMessageBox.information(self, "Progress Report", f"Saved:\n{out_pdf}")
-
-        try:
-            import webbrowser
-            webbrowser.open_new(str(out_pdf))
-        except Exception:
-            pass
-
 
     def _open_appearance_dialog(self):
         # Lazy import to avoid circulars if any
