@@ -35,7 +35,7 @@ from ..services.db import (
     get_row_options, set_row_options,               # NEW
     list_presets, get_preset_doc_ids, save_preset,  # NEW
     rename_preset as db_rename_preset, delete_preset as db_delete_preset,
-    get_doc_submission_history# NEW
+    get_doc_submission_history, rename_document_id,# NEW
 )
 from .widgets.register_model import RegisterTableModel  # for column constants
 from .widgets.register_model import RegisterTableModel as RM
@@ -54,6 +54,87 @@ WIDTHS_SETTINGS_KEY = "ui.tables.register.widths"
 
 # Regex to extract a displayable token from a revision string (e.g., "Rev A" -> "A")
 _REV_TOKEN_RE = re.compile(r"(?i)(?:rev\s*)?([A-Za-z]+\d*|\d+[A-Za-z]*|[A-Za-z]|\d+)$")
+
+# --- Revision helpers (alpha / numeric / alphanumeric) -----------------------
+def _alpha_next(tok: str) -> str:
+    s = (tok or "").strip().upper()
+    if not s or not s.isalpha():
+        s = _parse_latest_token(s)
+        s = (s or "A").upper() if s.isalpha() else "A"
+    n = 0
+    for ch in s:
+        n = n * 26 + (ord(ch) - 64)   # A=1..Z=26
+    n += 1
+    out = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+def _alpha_prev(tok: str) -> str:
+    s = (tok or "").strip().upper()
+    if not s or not s.isalpha():
+        s = _parse_latest_token(s).upper()
+        if not s.isalpha():
+            return ""
+    n = 0
+    for ch in s:
+        n = n * 26 + (ord(ch) - 64)
+    if n <= 1:
+        return "A"                     # clamp at A
+    n -= 1
+    out = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        out = chr(65 + r) + out
+    return out
+
+def _numeric_next(tok: str) -> str:
+    try:
+        return str(int(str(tok).strip()) + 1)
+    except Exception:
+        return "1"
+
+def _numeric_prev(tok: str) -> str:
+    try:
+        v = int(str(tok).strip())
+        return str(max(0, v - 1))
+    except Exception:
+        return "0"
+
+def _alphanum_next(tok: str) -> str:
+    s = (tok or "").strip().upper()
+    import re as _re
+    m = _re.match(r"^(\d+)([A-Z]+)$", s)
+    if m:
+        num, let = m.groups()
+        nxt = _alpha_next(let)
+        if len(nxt) > len(let):        # e.g. 1Z -> 2A
+            return f"{int(num)+1}A"
+        return f"{num}{nxt}"
+    m = _re.match(r"^([A-Z]+)(\d+)$", s)
+    if m:
+        let, num = m.groups()
+        return f"{let}{int(num)+1}"
+    # fallback: if mixed but weird, bump alpha part
+    return _alpha_next(s)
+
+def _alphanum_prev(tok: str) -> str:
+    s = (tok or "").strip().upper()
+    import re as _re
+    m = _re.match(r"^(\d+)([A-Z]+)$", s)
+    if m:
+        num, let = m.groups()
+        if let != "A":
+            return f"{num}{_alpha_prev(let)}"
+        return f"{max(0,int(num)-1)}Z" if int(num) > 0 else "A"
+    m = _re.match(r"^([A-Z]+)(\d+)$", s)
+    if m:
+        let, num = m.groups()
+        return f"{let}{max(0,int(num)-1)}"
+    # fallback
+    return _alpha_prev(s)
+
 
 def _parse_latest_token(raw: Optional[str]) -> str:
     if not raw:
@@ -236,10 +317,15 @@ class RegisterTab(QWidget):
             try:
                 self.model.set_save_callbacks(
                     save_fields=lambda doc_id, fields: update_document_fields(self.db_path, self.project_id, doc_id, fields),
-                    add_revision=lambda doc_id, rev: add_revision_by_docid(self.db_path, self.project_id, doc_id, rev)
+                    add_revision=lambda doc_id, rev: add_revision_by_docid(self.db_path, self.project_id, doc_id, rev),
+                    rename_doc_id=lambda old, new: rename_document_id(self.db_path, self.project_id, old, new)
+
                 )
             except Exception:
                 pass
+
+        # --- after self.model is constructed and callbacks wired ---
+        self.model.renameRejected.connect(self._on_docid_rename_rejected)
 
         # Footer
         bottom = QHBoxLayout()
@@ -288,6 +374,12 @@ class RegisterTab(QWidget):
         # Areas cache
         self._areas_cache: List[tuple[str, str]] = []
         self._reload_areas()
+
+    def _on_docid_rename_rejected(self, message: str) -> None:
+        # Optional: ensure the table keeps focus on the editing cell
+        view = self.table  # or whatever your QTableView is named
+        # Show a blocking warning; you can swap to a non-blocking tooltip if you prefer
+        QMessageBox.warning(self, "Cannot Rename Document", message)
 
     def _restore_selected(self):
         if not (self.db_path and self.project_id is not None):
@@ -916,6 +1008,32 @@ class RegisterTab(QWidget):
         self.on_proceed(items, self.db_path)
 
     # ----------------- Revisions ---------------------------------------------
+
+    def _compute_next(self, curr: str) -> str:
+        raw = (curr or "").strip()
+        has_alpha = any(ch.isalpha() for ch in raw)
+        has_digit = any(ch.isdigit() for ch in raw)
+
+        # Use UI mode if present; else fall back to stored idx (0=Alpha,1=Alphanum,2=Numeric)
+        try:
+            mode_idx = (self.cb_rev_mode.currentIndex()
+                        if getattr(self, "cb_rev_mode", None) is not None
+                        else int(getattr(self, "_rev_mode_idx", 0)))
+        except Exception:
+            mode_idx = 0
+
+        if has_digit and not has_alpha:
+            return _numeric_next(raw)
+        if has_alpha and not has_digit:
+            return _alpha_next(raw)
+
+        # Mixed token → respect mode selection
+        if mode_idx == 0:
+            return _alpha_next(raw)
+        if mode_idx == 2:
+            return _numeric_next(raw)
+        return _alphanum_next(raw)
+
     def _compute_prev(self, curr: str) -> str:
         raw = (curr or "").strip()
         has_alpha = any(ch.isalpha() for ch in raw)
@@ -1043,18 +1161,16 @@ class RegisterTab(QWidget):
             if 0 <= srow < len(rows):
                 doc_ids.append(rows[srow].doc_id)
 
-        # ensure latest_rev_token reflects any inline edits before we compute prev
+        # ensure tokens reflect any inline edits
         self._reload_rows()
         rows = getattr(self.model, '_rows', [])
 
-        # build curr token map (fallback to raw display if token missing)
         curr_map = {}
         for r in rows:
             did = getattr(r, 'doc_id', '')
             tok = getattr(r, 'latest_rev_token', '') or _parse_latest_token(str(getattr(r, 'latest_rev_raw', '') or ''))
             curr_map[did] = tok
 
-        # debug
         try:
             print("[rev-decrement] seed:", {d: curr_map.get(d, '') for d in doc_ids})
         except Exception:
@@ -1068,7 +1184,8 @@ class RegisterTab(QWidget):
 
         prev = set(doc_ids)
         self._reload_rows()
-        sel_model = self.table.selectionModel(); sel_model.clearSelection()
+        sel_model = self.table.selectionModel();
+        sel_model.clearSelection()
         rows = getattr(self.model, '_rows', [])
         for r, row in enumerate(rows):
             if row.doc_id in prev:
@@ -1076,7 +1193,6 @@ class RegisterTab(QWidget):
                 sel_model.select(vix, sel_model.Select | sel_model.Rows)
 
         QMessageBox.information(self, "Revisions", f"Applied {touched} revision decrement(s).")
-
 
     # ----------------- Areas / Batch import ----------------------------------
     def _reload_areas(self):
@@ -1106,13 +1222,12 @@ class RegisterTab(QWidget):
 
     def _add_document(self):
         if not (self.db_path and self.project_id):
-            QMessageBox.information(self, "Project", "Open a project database first.");
+            QMessageBox.information(self, "Project", "Open a project database first.")
             return
 
-        # >>> NEW: pull fresh lists/areas from the DB so the dialog sees new options
+        # Keep these so dialog picks up fresh options
         self._reload_row_options()
         self._reload_areas()
-        # <<<
 
         existing = [getattr(r, 'doc_id', '') for r in getattr(self.model, '_rows', [])]
         dlg = AddDocumentDialog(
@@ -1122,33 +1237,73 @@ class RegisterTab(QWidget):
             areas=self._areas_cache,
             parent=self
         )
-        if dlg.exec_() != dlg.Accepted or not dlg.payload:
+
+        if dlg.exec_() != dlg.Accepted:
             return
-        from ..services.db import upsert_document
-        upsert_document(self.db_path, self.project_id, dlg.payload)
+
+        # --- Single add ---
+        if getattr(dlg, "payload", None):
+            from .services.db import upsert_document
+            upsert_document(self.db_path, self.project_id, dlg.payload)
+
+            # Optional: apply template only for single add
+            try:
+                if dlg.payload.get("use_template"):
+                    print("[RegisterTab] attempting template apply with payload:", dlg.payload, flush=True)
+                    from .services.template_apply import apply_template_for_new_doc
+                    created = apply_template_for_new_doc(Path(self.db_path), dlg.payload)
+                    print("[RegisterTab] template apply result:", created, flush=True)
+            except Exception as e:
+                print("[RegisterTab] template apply ERROR:", e, flush=True)
+
+            self._reload_rows()
+            self._set_ticked_ids({dlg.payload["doc_id"]})
+            self._recount()
+            self.proxy.invalidateFilter()
+            try:
+                from .widgets.toast import toast
+                toast(self, f"Added 1 document.")
+            except Exception:
+                QMessageBox.information(self, "Add Document", "Added 1 document.")
+            return
+
+        # --- Batch add ---
+        payloads = getattr(dlg, "payloads", None) or []
+        if not payloads:
+            return
 
         from ..services.db import upsert_document
-        upsert_document(self.db_path, self.project_id, dlg.payload)
-
-        # If a template is selected, copy it now and fill metadata (Excel)
-        try:
-            if dlg.payload.get("use_template"):
-                print("[RegisterTab] attempting template apply with payload:", dlg.payload, flush=True)
-                from ..services.template_apply import apply_template_for_new_doc
-                created = apply_template_for_new_doc(Path(self.db_path), dlg.payload)
-                print("[RegisterTab] template apply result:", created, flush=True)
-                # Optional popup:
-                # if created:
-                #     QMessageBox.information(self, "Template", f"Created:\n{created}")
-        except Exception as e:
-            print("[RegisterTab] template apply ERROR:", e, flush=True)
-            # Don’t block document creation if copying fails — user can retry
-            pass
+        added_ids = []
+        for doc in payloads:
+            try:
+                upsert_document(self.db_path, self.project_id, doc)
+                added_ids.append(doc["doc_id"])
+            except Exception as e:
+                print(f"[RegisterTab] batch upsert failed for {doc.get('doc_id')}: {e}", flush=True)
 
         self._reload_rows()
-        self._set_ticked_ids({dlg.payload["doc_id"]})
+
+        # Re-select the newly added rows
+        try:
+            sel_model = self.table.selectionModel()
+            sel_model.clearSelection()
+            rows = getattr(self.model, '_rows', [])
+            added = set(added_ids)
+            for r, row in enumerate(rows):
+                if getattr(row, 'doc_id', '') in added:
+                    vix = self.proxy.mapFromSource(self.model.index(r, COL_DOC_ID))
+                    sel_model.select(vix, sel_model.Select | sel_model.Rows)
+        except Exception as e:
+            print("[RegisterTab] selection after batch failed:", e, flush=True)
+
         self._recount()
         self.proxy.invalidateFilter()
+
+        try:
+            from .widgets.toast import toast
+            toast(self, f"Added {len(added_ids)} document(s).")
+        except Exception:
+            QMessageBox.information(self, "Add Documents", f"Added {len(added_ids)} document(s).")
 
     def _import_batch_updates(self):
         if not (self.db_path and self.project_id):

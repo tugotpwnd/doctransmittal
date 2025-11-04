@@ -365,6 +365,8 @@ class MainWindow(QMainWindow):
         # Bulk edit / revisions
         self.sidebar.bulkApplyRequested.connect(self.register_tab.apply_bulk_to_selected)
         self.sidebar.revisionIncrementRequested.connect(self.register_tab._rev_increment_selected)
+        self.sidebar.revisionDecrementRequested.connect(self.register_tab._rev_decrement_selected)
+
         self.sidebar.revisionSetRequested.connect(self.register_tab._rev_set_selected)
 
         # SINGLE batch import hook

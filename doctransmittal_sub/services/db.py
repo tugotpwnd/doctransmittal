@@ -143,6 +143,7 @@ def init_db(db_path: Path) -> None:
 
     # documents (NEW)
     _ensure_column(con, "documents", "comments", "TEXT DEFAULT ''")   # <— ADD THIS
+    _ensure_column(con, "documents", "updated_on", "TEXT")  # <— NEW: needed by rename_document_id()
 
     # transmittals...
     _ensure_column(con, "transmittals", "updated_on", "TEXT")
@@ -852,3 +853,62 @@ def create_db_backup(db_path: Path, *, history_dir_name: str = "DB History", kee
     except Exception:
         # Never fail the app just because a backup failed
         return Path()
+
+
+def rename_document_id(db_path: Path, project_id: int, old_id: str, new_id: str) -> bool:
+    """
+    Rename a document's ID within a project.
+    - Case-insensitive uniqueness enforced: (project_id, doc_id COLLATE NOCASE) must be unique.
+    - Cascades to any table that has BOTH columns: project_id, doc_id.
+    Returns True on success; raises ValueError on any validation failure or conflict.
+    """
+    def _connect(p: Path) -> sqlite3.Connection:
+        return sqlite3.connect(str(p))
+
+    old = (old_id or "").strip()
+    new = (new_id or "").strip()
+    if not new:
+        raise ValueError("Document ID cannot be empty.")
+
+    # Optional: normalize your house style (UPPER, collapse spaces, etc.)
+    new = " ".join(new.split()).upper()
+
+    con = _connect(db_path)
+    try:
+        # 1) ensure a case-insensitive unique index on documents
+        con.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_pid_docid_nocase
+            ON documents(project_id, doc_id COLLATE NOCASE)
+        """)
+
+        # 2) reject if target already exists (case-insensitive)
+        hit = con.execute(
+            "SELECT 1 FROM documents WHERE project_id=? AND UPPER(doc_id)=UPPER(?)",
+            (int(project_id), new)
+        ).fetchone()
+        if hit:
+            raise ValueError(f"Document ID '{new}' already exists in this project.")
+
+        # 3) update main table
+        cur = con.execute(
+            "UPDATE documents SET doc_id=?, updated_on=datetime('now') "
+            "WHERE project_id=? AND UPPER(doc_id)=UPPER(?)",
+            (new, int(project_id), old.upper())
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"Original document '{old}' not found.")
+
+        # 4) cascade to any table that stores (project_id, doc_id)
+        tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        for t in tables:
+            cols = [r[1] for r in con.execute(f"PRAGMA table_info({t})").fetchall()]
+            if "project_id" in cols and "doc_id" in cols:
+                con.execute(
+                    f"UPDATE {t} SET doc_id=? WHERE project_id=? AND UPPER(doc_id)=UPPER(?)",
+                    (new, int(project_id), old.upper())
+                )
+
+        con.commit()
+        return True
+    finally:
+        con.close()
