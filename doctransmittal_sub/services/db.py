@@ -124,6 +124,28 @@ DDL = [
         file_path TEXT
     );''',
 
+    # --- RFIs (new) ---
+    '''CREATE TABLE IF NOT EXISTS rfis (
+        id INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        number TEXT NOT NULL,                        -- DOCUMENT NO.
+        discipline TEXT,
+        issued_to TEXT,
+        issued_to_company TEXT,
+        issued_from TEXT,
+        issued_date TEXT,                            -- ISO text (YYYY-MM-DD or full datetime)
+        respond_by TEXT,
+        subject TEXT,
+        response_from TEXT,
+        response_company TEXT,
+        response_date TEXT,
+        response_status TEXT,
+        comments TEXT,
+        is_deleted INTEGER NOT NULL DEFAULT 0,
+        created_on TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_on TEXT
+    );''',
+
 ]
 
 def init_db(db_path: Path) -> None:
@@ -163,7 +185,145 @@ def init_db(db_path: Path) -> None:
     _ensure_index(con, "ux_ti_trans_doc",
                   "CREATE UNIQUE INDEX ux_ti_trans_doc ON transmittal_items(transmittal_id, doc_id);")
 
+    # --- inside init_db(...) after existing _ensure_column calls for rfis ---
+    # rfis – add rich-text & plain-text fields for Background / Information Requested
+    _ensure_column(con, "rfis", "background_html", "TEXT")
+    _ensure_column(con, "rfis", "request_html", "TEXT")
+    _ensure_column(con, "rfis", "background_text", "TEXT")
+    _ensure_column(con, "rfis", "request_text", "TEXT")
+
+    # rfis…
+    _ensure_index(con, "ux_rfis_unique", "CREATE UNIQUE INDEX IF NOT EXISTS ux_rfis_unique ON rfis(project_id, number);")
+    _ensure_index(con, "idx_rfis_project", "CREATE INDEX IF NOT EXISTS idx_rfis_project ON rfis(project_id);")
+
+
     con.commit(); con.close()
+
+def list_rfis(db_path: Path, project_id: int) -> List[Dict[str, Any]]:
+    """
+    Return all RFIs for a given project, including content fields.
+    """
+    con = _connect(db_path)
+    try:
+        # Ensure backward compatibility (adds content columns if missing)
+        cur = con.cursor()
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(rfis)")}
+        for col in ("background_html","request_html","background_text","request_text"):
+            if col not in cols:
+                cur.execute(f"ALTER TABLE rfis ADD COLUMN {col} TEXT DEFAULT ''")
+        con.commit()
+
+        rows = cur.execute("""
+            SELECT
+                number, discipline, issued_to, issued_to_company, issued_from,
+                issued_date, respond_by, subject,
+                response_from, response_company, response_date, response_status,
+                COALESCE(comments,''),
+                COALESCE(background_html,''), COALESCE(request_html,''),
+                COALESCE(background_text,''), COALESCE(request_text,'')
+            FROM rfis
+            WHERE project_id=? AND is_deleted=0
+            ORDER BY number COLLATE NOCASE
+        """, (int(project_id),)).fetchall()
+
+        cols = [
+            "number","discipline","issued_to","issued_to_company","issued_from",
+            "issued_date","respond_by","subject",
+            "response_from","response_company","response_date","response_status",
+            "comments",
+            "background_html","request_html","background_text","request_text"
+        ]
+        return [dict(zip(cols, r)) for r in rows]
+    finally:
+        con.close()
+
+
+def create_rfi(db_path: Path, project_id: int, rfi: Dict[str, Any]) -> bool:
+    """
+    Create a new RFI entry.
+    Ensures all current content fields are supported.
+    Returns True if inserted, False if duplicate or failed.
+    """
+    number = (rfi.get("number") or "").strip()
+    if not number:
+        return False
+
+    def _do():
+        con = _connect(db_path)
+        cur = con.cursor()
+        try:
+            # --- Ensure DB schema has content fields ---
+            cols = {r[1] for r in cur.execute("PRAGMA table_info(rfis)")}
+            for col in ("background_html","request_html","background_text","request_text"):
+                if col not in cols:
+                    cur.execute(f"ALTER TABLE rfis ADD COLUMN {col} TEXT DEFAULT ''")
+            con.commit()
+
+            cur.execute("""
+                INSERT INTO rfis (
+                    project_id, number,
+                    discipline, issued_to, issued_to_company, issued_from,
+                    issued_date, respond_by, subject,
+                    response_from, response_company, response_date,
+                    response_status, comments,
+                    background_html, request_html, background_text, request_text
+                )
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                int(project_id), number,
+                rfi.get("discipline",""), rfi.get("issued_to",""), rfi.get("issued_to_company",""),
+                rfi.get("issued_from",""), rfi.get("issued_date",""), rfi.get("respond_by",""),
+                rfi.get("subject",""), rfi.get("response_from",""), rfi.get("response_company",""),
+                rfi.get("response_date",""), rfi.get("response_status",""), rfi.get("comments",""),
+                rfi.get("background_html",""), rfi.get("request_html",""),
+                rfi.get("background_text",""), rfi.get("request_text","")
+            ))
+            con.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+        except Exception as e:
+            print(f"[create_rfi] Error: {e}")
+            return False
+        finally:
+            con.close()
+
+    return _retry_write(_do)
+
+def update_rfi_fields(db_path: Path, project_id: int, number: str, fields: Dict[str, Any]) -> bool:
+    number = (number or "").strip()
+    if not (number and fields):
+        return False
+    allowed = {"discipline","issued_to","issued_to_company","issued_from",
+               "issued_date","respond_by","subject",
+               "response_from","response_company","response_date","response_status","comments",
+               "background_html","request_html","background_text","request_text"}
+    kv = {k: fields[k] for k in fields.keys() & allowed}
+    if not kv:
+        return False
+    sets = ", ".join(f"{k}=?" for k in kv.keys())
+    vals = list(kv.values()) + [int(project_id), number]
+    def _do():
+        con = _connect(db_path); cur = con.cursor()
+        cur.execute(f"UPDATE rfis SET {sets}, updated_on=datetime('now') WHERE project_id=? AND number=?", vals)
+        changed = cur.rowcount > 0
+        con.commit(); con.close()
+        return changed
+    return _retry_write(_do)
+
+# --- add near your DB init code ---
+def _ensure_rfi_content_columns(db_path):
+    con = _connect(db_path)
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(rfis)")}
+        needed = {"background_html","background_text","request_html","request_text"}
+        missing = needed - cols
+        for c in sorted(missing):
+            con.execute(f"ALTER TABLE rfis ADD COLUMN {c} TEXT DEFAULT ''")
+        con.commit()
+    finally:
+        con.close()
+
 
 # ------------------------------ Project API (existing) ------------------------------
 
@@ -912,3 +1072,71 @@ def rename_document_id(db_path: Path, project_id: int, old_id: str, new_id: str)
         return True
     finally:
         con.close()
+
+
+def list_rfis(db_path: Path, project_id: int) -> List[Dict[str, Any]]:
+    con = _connect(db_path)
+    rows = con.execute("""
+        SELECT number, discipline, issued_to, issued_to_company, issued_from,
+               issued_date, respond_by, subject,
+               response_from, response_company, response_date, response_status, COALESCE(comments,'')
+          FROM rfis
+         WHERE project_id=? AND is_deleted=0
+         ORDER BY number COLLATE NOCASE
+    """, (int(project_id),)).fetchall()
+    con.close()
+    cols = ["number","discipline","issued_to","issued_to_company","issued_from",
+            "issued_date","respond_by","subject",
+            "response_from","response_company","response_date","response_status","comments"]
+    return [dict(zip(cols, r)) for r in rows]
+
+def create_rfi(db_path: Path, project_id: int, rfi: Dict[str, Any]) -> bool:
+    """
+    rfi must include at least {"number": "..."}; other keys optional.
+    Returns True on insert; False if duplicate exists.
+    """
+    number = (rfi.get("number") or "").strip()
+    if not number:
+        return False
+    def _do():
+        con = _connect(db_path); cur = con.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO rfis(project_id, number, discipline, issued_to, issued_to_company, issued_from,
+                                 issued_date, respond_by, subject,
+                                 response_from, response_company, response_date, response_status, comments)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                int(project_id), number,
+                rfi.get("discipline",""), rfi.get("issued_to",""), rfi.get("issued_to_company",""),
+                rfi.get("issued_from",""), rfi.get("issued_date",""), rfi.get("respond_by",""),
+                rfi.get("subject",""), rfi.get("response_from",""), rfi.get("response_company",""),
+                rfi.get("response_date",""), rfi.get("response_status",""), rfi.get("comments","")
+            ))
+            con.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+        finally:
+            con.close()
+    return _retry_write(_do)
+
+def update_rfi_fields(db_path: Path, project_id: int, number: str, fields: Dict[str, Any]) -> bool:
+    number = (number or "").strip()
+    if not (number and fields):
+        return False
+    allowed = {"discipline","issued_to","issued_to_company","issued_from",
+               "issued_date","respond_by","subject",
+               "response_from","response_company","response_date","response_status","comments"}
+    kv = {k: fields[k] for k in fields.keys() & allowed}
+    if not kv:
+        return False
+    sets = ", ".join(f"{k}=?" for k in kv.keys())
+    vals = list(kv.values()) + [int(project_id), number]
+    def _do():
+        con = _connect(db_path); cur = con.cursor()
+        cur.execute(f"UPDATE rfis SET {sets}, updated_on=datetime('now') WHERE project_id=? AND number=?", vals)
+        changed = cur.rowcount > 0
+        con.commit(); con.close()
+        return changed
+    return _retry_write(_do)

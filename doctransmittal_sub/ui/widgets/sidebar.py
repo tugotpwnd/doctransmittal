@@ -163,15 +163,6 @@ class SidebarWidget(QWidget):
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(10)
 
-        # User box
-        gb_user = QGroupBox("User", self)  # parent it to the sidebar
-        vb_u = QVBoxLayout(gb_user)
-        self.lbl_user = QLabel("—", gb_user)
-        vb_u.addWidget(self.lbl_user)
-
-        # ADD THIS LINE so the group stays alive:
-        root.addWidget(gb_user)
-
         # Filters (kept expanded)
         gb_filters = QGroupBox("Quick Filters")
         vb = QVBoxLayout(gb_filters)
@@ -383,9 +374,6 @@ class SidebarWidget(QWidget):
     def set_project_info(self, job_no: str, project_name: str):
         self.lbl_job.setText(f"Job No: {job_no or '—'}")
         self.lbl_proj.setText(f"Name: {project_name or '—'}")
-
-    def set_user_name(self, name: str):
-        self.lbl_user.setText(name or "—")
 
     def set_selected_count(self, n: int):
         self._selected_count = max(0, int(n))

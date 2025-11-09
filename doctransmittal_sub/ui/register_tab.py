@@ -232,14 +232,31 @@ class RegisterTab(QWidget):
 
         lay = QVBoxLayout(self)
 
-        # Row 1: DB chooser
+        # --- OLD (comment out) ---
+        # top = QHBoxLayout()
+        # self.le_db = QLineEdit(self)
+        # self.le_db.setPlaceholderText("Select Project Database (*.db)")
+        # btn_browse = QPushButton("Open…", self); btn_browse.clicked.connect(self._browse_db)
+        # btn_new = QPushButton("New…", self); btn_new.clicked.connect(self._new_db)
+        # top.addWidget(QLabel("Database:")); top.addWidget(self.le_db, 1); top.addWidget(btn_browse); top.addWidget(btn_new)
+        # lay.addLayout(top)
+
+        # --- NEW: same controls, wrapped so MainWindow can hide the entire row ---
         top = QHBoxLayout()
         self.le_db = QLineEdit(self)
         self.le_db.setPlaceholderText("Select Project Database (*.db)")
-        btn_browse = QPushButton("Open…", self); btn_browse.clicked.connect(self._browse_db)
-        btn_new = QPushButton("New…", self); btn_new.clicked.connect(self._new_db)
-        top.addWidget(QLabel("Database:")); top.addWidget(self.le_db, 1); top.addWidget(btn_browse); top.addWidget(btn_new)
-        lay.addLayout(top)
+        btn_browse = QPushButton("Open…", self);
+        btn_browse.clicked.connect(self._browse_db)
+        btn_new = QPushButton("New…", self);
+        btn_new.clicked.connect(self._new_db)
+        top.addWidget(QLabel("Database:"));
+        top.addWidget(self.le_db, 1);
+        top.addWidget(btn_browse);
+        top.addWidget(btn_new)
+        self.db_row = QWidget(self);
+        self.db_row.setLayout(top)
+        lay.addWidget(self.db_row)
+
         self.le_db.returnPressed.connect(self._load_db)
         self.le_db.editingFinished.connect(self._maybe_load_on_edit)
 
@@ -374,6 +391,16 @@ class RegisterTab(QWidget):
         # Areas cache
         self._areas_cache: List[tuple[str, str]] = []
         self._reload_areas()
+
+    def hide_db_controls(self, hide: bool = True) -> None:
+        try:
+            self.db_row.setVisible(not hide)
+        except Exception:
+            pass
+
+    def load_db_from_path(self, path: str) -> None:
+        self.le_db.setText(str(path or "").strip())
+        self._load_db()
 
     def _on_docid_rename_rejected(self, message: str) -> None:
         # Optional: ensure the table keeps focus on the editing cell

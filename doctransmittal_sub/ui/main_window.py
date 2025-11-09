@@ -30,6 +30,10 @@ from PyQt5.QtWidgets import QApplication, QAction
 from ..services.db import get_project, list_documents_with_latest
 from ..services.receipt_pdf import export_progress_report_pdf
 from datetime import datetime, date
+from .rfi_tab import RfiTab
+from .widgets.rfi_sidebar import RfiSidebarWidget
+from PyQt5.QtWidgets import QLineEdit, QPushButton, QLabel, QHBoxLayout  # if not already imported
+
 
 # --- UI assets helper (works in dev + PyInstaller) --------------------------
 from pathlib import Path
@@ -104,7 +108,7 @@ class MainWindow(QMainWindow):
             btn_bg_hover = "#20304c"
             btn_bg_press = "#2b3e64"
 
-        # derive sizes once from target_pt
+        # sizes
         tab_pt = target_pt + 3
         brand_title_pt = target_pt + 2
 
@@ -115,126 +119,306 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # --- stylesheet ---
         self.setStyleSheet(f"""
-        QWidget#CentralWrap {{ background: {root_bg}; }}
-        QWidget#CentralWrap QLabel, QWidget#CentralWrap QCheckBox {{ color: {text}; }}
+        QWidget#CentralWrap {{
+            background: {root_bg};
+        }}
+        QWidget#CentralWrap QLabel,
+        QWidget#CentralWrap QCheckBox {{
+            color: {text};
+        }}
 
         QTabWidget::pane {{
-            background: {panel}; border: 1px solid {border}; border-radius: 12px; padding-top: 6px;
+            background: {panel};
+            border: 1px solid {border};
+            border-radius: 12px;
+            padding-top: 6px;
         }}
-        QTabWidget::tab-bar {{ alignment: left; }}
-        QTabBar::tab {{
-            min-width: 200px; padding: 10px 24px 10px 26px; margin: 2px 6px;
-            border-radius: 12px; font-size: {tab_pt}pt; font-weight: 800;
-            color: {tab_txt}; background: {tab_bg};
-        }}
-        QTabBar::tab:hover    {{ background: {tab_bg_hover}; }}
-        QTabBar::tab:selected {{ background: {tab_bg_sel}; color: {'#000' if theme == 'light' else '#fff'}; }}
 
-        QAbstractScrollArea {{ background: transparent; }}
-        QAbstractScrollArea::viewport {{ background: transparent; }}
+        QTabWidget::tab-bar {{
+            alignment: left;
+        }}
+
+        /* === SUB-HEADERS (Register / Transmittal / Files / History) === */
+        QTabBar#SubTabBar::tab {{
+            min-width: 140px;
+            min-height: 34px;            /* compact; still no clipping */
+            padding: 7px 18px;
+            margin: 3px 4px;
+            border-radius: 10px;
+            font-size: {tab_pt}pt;
+            font-weight: 700;
+            line-height: 1.35em;
+            color: {tab_txt};
+            background: {tab_bg};
+            border: 1px solid transparent;
+        }}
+        QTabBar#SubTabBar::tab:hover {{
+            background: {tab_bg_hover};
+        }}
+        QTabBar#SubTabBar::tab:selected {{
+            background: {tab_bg_sel};
+            color: {'#000' if theme == 'light' else '#fff'};
+            border: 1px solid {accent};
+        }}
+
+        /* === MAIN HEADERS (Document Register / RFI) === */
+        QTabWidget#MainTabs::pane {{
+            border: none;
+            background: {root_bg};
+            margin-top: 4px;
+        }}
+        QTabBar#MainTabBar::tab {{
+            min-width: 260px;
+            min-height: 60px;            /* clearly taller */
+            padding: 16px 36px;
+            margin: 8px 10px;
+            border-radius: 16px;
+            font-size: {tab_pt + 5}pt;   /* larger than sub */
+            font-weight: 900;
+            line-height: 1.55em;
+            color: {tab_txt};
+            background: {tab_bg};
+            border: 1px solid {border};
+        }}
+        QTabBar#MainTabBar::tab:hover {{
+            background: {tab_bg_hover};
+        }}
+        QTabBar#MainTabBar::tab:selected {{
+            background: {tab_bg_sel};
+            color: {'#000' if theme == 'light' else '#fff'};
+            border: 1px solid {accent};
+        }}
+        QTabWidget#MainTabs::tab-bar {{
+            border-bottom: 2px solid {border};
+            padding-bottom: 2px;
+        }}
+
+        QAbstractScrollArea {{
+            background: transparent;
+        }}
+        QAbstractScrollArea::viewport {{
+            background: transparent;
+        }}
 
         QTableView {{
-            background: transparent; gridline-color:{border}; selection-background-color: {sel_bg};
-            border:1px solid {border}; border-radius:10px; color:{text};
+            background: transparent;
+            gridline-color:{border};
+            selection-background-color: {sel_bg};
+            alternate-background-color: {tree_alt};   /* ✅ fixes bright white alt rows */
+            border:1px solid {border};
+            border-radius:10px;
+            color:{text};
         }}
         QHeaderView::section {{
-            background:{head_bg}; color:{subtext}; padding:7px 8px; border:0; border-right:1px solid {border}; font-weight:600;
+            background: {head_bg};
+            color: {subtext};
+            padding: 7px 8px;
+            border: 0;
+            border-right: 1px solid {border};
+            font-weight: 600;
         }}
 
         QWidget#CentralWrap QGroupBox {{
-            color: {text}; border: 1px solid {border}; border-radius: 12px; margin-top: 14px; padding-top: 8px; background: {pane_bg};
+            color: {text};
+            border: 1px solid {border};
+            border-radius: 12px;
+            margin-top: 14px;
+            padding-top: 8px;
+            background: {pane_bg};
         }}
         QWidget#CentralWrap QGroupBox::title {{
-            subcontrol-origin: margin; left: 12px; padding: 0 6px; font-weight: 700; color: {text};
+            subcontrol-origin: margin;
+            left: 12px;
+            padding: 0 6px;
+            font-weight: 700;
+            color: {text};
         }}
 
-        QWidget#CentralWrap QTreeView, QWidget#CentralWrap QTreeWidget {{
-            background: transparent; color: {text}; alternate-background-color: {tree_alt};
-            border: 1px solid {border}; border-radius: 10px;
+        QWidget#CentralWrap QTreeView,
+        QWidget#CentralWrap QTreeWidget {{
+            background: transparent;
+            color: {text};
+            alternate-background-color: {tree_alt};
+            border: 1px solid {border};
+            border-radius: 10px;
         }}
-        QWidget#CentralWrap QTreeView::item:selected, QWidget#CentralWrap QTreeWidget::item:selected {{
-            background: {sel_bg}; color: {'#000' if theme == 'light' else '#fff'};
+        QWidget#CentralWrap QTreeView::item:selected,
+        QWidget#CentralWrap QTreeWidget::item:selected {{
+            background: {sel_bg};
+            color: {'#000' if theme == 'light' else '#fff'};
         }}
 
         QLineEdit, QComboBox, QSpinBox, QTextEdit {{
-            background:{list_bg}; color:{text}; border:1px solid {border}; border-radius:10px; padding:7px 9px;
+            background: {list_bg};
+            color: {text};
+            border: 1px solid {border};
+            border-radius: 10px;
+            padding: 7px 9px;
             selection-background-color: {sel_bg};
         }}
-        QLineEdit::placeholder, QTextEdit[acceptRichText="false"]::placeholder {{ color: {subtext}; }}
+        QLineEdit::placeholder,
+        QTextEdit[acceptRichText="false"]::placeholder {{
+            color: {subtext};
+        }}
 
         QPushButton {{
-            background:{btn_bg}; color:{text}; border:1px solid {border}; border-radius:12px; padding:8px 12px; font-weight:600;
+            background: {btn_bg};
+            color: {text};
+            border: 1px solid {border};
+            border-radius: 12px;
+            padding: 8px 12px;
+            font-weight: 600;
         }}
-        QPushButton:hover  {{ background:{btn_bg_hover}; }}
-        QPushButton:pressed{{ background:{btn_bg_press}; }}
-        QPushButton#Primary {{ background:{accent}; color:white; border:none; }}
+        QPushButton:hover  {{ background: {btn_bg_hover}; }}
+        QPushButton:pressed{{ background: {btn_bg_press}; }}
+        QPushButton#Primary {{
+            background: {accent};
+            color: white;
+            border: none;
+        }}
 
-        QToolTip {{ background:{panel}; color:{text}; border:1px solid {border}; padding:6px; border-radius:6px; }}
+        QToolTip {{
+            background: {panel};
+            color: {text};
+            border: 1px solid {border};
+            padding: 6px;
+            border-radius: 6px;
+        }}
 
         QDialog {{
-            background: {panel}; border: 1px solid {border}; border-radius: 12px;
+            background: {panel};
+            border: 1px solid {border};
+            border-radius: 12px;
         }}
         QDialog QLabel          {{ color: {text}; }}
         QDialog QLabel:disabled {{ color: {subtext}; }}
         QDialog QGroupBox {{
-            color:{text}; border:1px solid {border}; border-radius:10px; margin-top:12px; padding-top:6px; background: {pane_bg};
+            color: {text};
+            border: 1px solid {border};
+            border-radius: 10px;
+            margin-top: 12px;
+            padding-top: 6px;
+            background: {pane_bg};
         }}
-        QDialog QLineEdit, QDialog QComboBox, QDialog QTextEdit, QDialog QSpinBox {{
-            background:{list_bg}; color:{text}; border:1px solid {border}; border-radius:10px; padding:7px 9px;
+        QDialog QLineEdit,
+        QDialog QComboBox,
+        QDialog QTextEdit,
+        QDialog QSpinBox {{
+            background: {list_bg};
+            color: {text};
+            border: 1px solid {border};
+            border-radius: 10px;
+            padding: 7px 9px;
         }}
         QDialog QLineEdit::placeholder {{ color: {subtext}; }}
 
         QComboBox QAbstractItemView {{
-            background:{list_bg}; color:{text}; border:1px solid {border};
-            selection-background-color:{tab_bg_hover}; outline: 0;
+            background: {list_bg};
+            color: {text};
+            border: 1px solid {border};
+            selection-background-color: {tab_bg_hover};
+            outline: 0;
         }}
 
-        QMessageBox {{ background: {panel}; border: 1px solid {border}; border-radius: 12px; }}
+        QMessageBox {{
+            background: {panel};
+            border: 1px solid {border};
+            border-radius: 12px;
+        }}
         QMessageBox QLabel      {{ color: {text}; }}
         QMessageBox QPushButton {{ min-width: 84px; }}
 
         QDockWidget#LeftDock::title {{
-            text-align:left; padding:8px 10px; background: {root_bg}; color: {subtext}; border-bottom: 1px solid {border};
+            text-align: left;
+            padding: 8px 10px;
+            background: {root_bg};
+            color: {subtext};
+            border-bottom: 1px solid {border};
         }}
 
         #Sidebar {{
-            background: {panel}; border-right: 1px solid {border}; padding: 10px;
+            background: {panel};
+            border-right: 1px solid {border};
+            padding: 10px;
         }}
         #Sidebar QWidget {{ background: transparent; }}
         #Sidebar QLabel, #Sidebar QCheckBox, #Sidebar QToolButton {{ color: {text}; }}
         #Sidebar QLineEdit, #Sidebar QComboBox, #Sidebar QSpinBox, #Sidebar QTextEdit {{
-            background: {list_bg}; color: {text}; border: 1px solid {border}; border-radius: 10px; padding: 7px 9px;
+            background: {list_bg};
+            color: {text};
+            border: 1px solid {border};
+            border-radius: 10px;
+            padding: 7px 9px;
         }}
         #Sidebar QLineEdit::placeholder {{ color: {subtext}; }}
         #Sidebar QComboBox QAbstractItemView {{
-            background: {list_bg}; color: {text}; border: 1px solid {border}; selection-background-color: {sel_bg}; outline: 0;
+            background: {list_bg};
+            color: {text};
+            border: 1px solid {border};
+            selection-background-color: {sel_bg};
+            outline: 0;
         }}
         #Sidebar QListWidget {{
-            background: {list_bg}; color: {text}; border: 1px solid {border}; border-radius: 10px;
+            background: {list_bg};
+            color: {text};
+            border: 1px solid {border};
+            border-radius: 10px;
         }}
         #Sidebar QGroupBox {{
-            color: {text}; border: 1px solid {border}; border-radius: 12px; margin-top: 12px; padding-top: 8px; background: {pane_bg};
+            color: {text};
+            border: 1px solid {border};
+            border-radius: 12px;
+            margin-top: 12px;
+            padding-top: 8px;
+            background: {pane_bg};
         }}
         #Sidebar QGroupBox::title {{
-            subcontrol-origin: margin; left: 12px; padding: 0 6px; font-weight: 700; color: {text};
+            subcontrol-origin: margin;
+            left: 12px;
+            padding: 0 6px;
+            font-weight: 700;
+            color: {text};
         }}
         #Sidebar QPushButton {{
-            background: {btn_bg}; color: {text}; border: 1px solid {border}; border-radius: 12px; padding: 8px 12px; font-weight: 600;
+            background: {btn_bg};
+            color: {text};
+            border: 1px solid {border};
+            border-radius: 12px;
+            padding: 8px 12px;
+            font-weight: 600;
         }}
         #Sidebar QPushButton:hover  {{ background: {btn_bg_hover}; }}
         #Sidebar QPushButton:pressed{{ background: {btn_bg_press}; }}
 
         /* Light 'More ▾' menu for readability */
         QMenu#BulkMoreMenu {{
-            background: #ffffff; color: #111111; border: 1px solid {border}; border-radius: 8px; padding: 6px 4px;
+            background: #ffffff;
+            color: #111111;
+            border: 1px solid {border};
+            border-radius: 8px;
+            padding: 6px 4px;
         }}
-        QMenu#BulkMoreMenu::separator {{ height: 1px; background: #e0e6f0; margin: 6px 10px; }}
+        QMenu#BulkMoreMenu::separator {{
+            height: 1px;
+            background: #e0e6f0;
+            margin: 6px 10px;
+        }}
         QMenu#BulkMoreMenu::item {{
-            background: transparent; color: #111111; padding: 8px 12px; border-radius: 6px;
+            background: transparent;
+            color: #111111;
+            padding: 8px 12px;
+            border-radius: 6px;
         }}
-        QMenu#BulkMoreMenu::item:selected {{ background: #e7f0ff; color: #000000; }}
-        QMenu#BulkMoreMenu::item:disabled {{ color: #9aa3b2; background: transparent; }}
+        QMenu#BulkMoreMenu::item:selected {{
+            background: #e7f0ff;
+            color: #000000;
+        }}
+        QMenu#BulkMoreMenu::item:disabled {{
+            color: #9aa3b2;
+            background: transparent;
+        }}
         """)
 
     def _build_brand_bar(self):
@@ -273,6 +457,24 @@ class MainWindow(QMainWindow):
 
         return bar
 
+    def _build_global_db_bar(self):
+        bar = QWidget(self)
+        bar.setObjectName("DbBar")
+        lay = QHBoxLayout(bar);
+        lay.setContentsMargins(0, 0, 0, 0);
+        lay.setSpacing(8)
+        self.le_db_global = QLineEdit(self)
+        self.le_db_global.setPlaceholderText("Select Project Database (*.db)")
+        btn_open = QPushButton("Open…", self);
+        btn_open.clicked.connect(self._open_db_dialog)
+        btn_new = QPushButton("New…", self);
+        btn_new.clicked.connect(self._new_db_dialog)
+        lay.addWidget(QLabel("Database:"))
+        lay.addWidget(self.le_db_global, 1)
+        lay.addWidget(btn_open)
+        lay.addWidget(btn_new)
+        return bar
+
     def __init__(self, settings: SettingsManager, parent=None):
         super().__init__(parent)
         self.settings = settings
@@ -280,23 +482,65 @@ class MainWindow(QMainWindow):
 
         # --- Central with stacked background ----------------------------------------
         # --- Central content (no background image) ---
-        self.tabs = QTabWidget(self)
+        # --- NEW: big headers (Documents / RFI) with global DB bar under the brand bar ---
+        self.mainTabs = QTabWidget(self)
 
-        wrap = QWidget(self)
+        doc_page = QWidget(self)
+        doc_v = QVBoxLayout(doc_page);
+        doc_v.setContentsMargins(0, 0, 0, 0);
+        doc_v.setSpacing(0)
+        self.tabs = QTabWidget(doc_page)  # keep existing name so the rest of the code still works
+        doc_v.addWidget(self.tabs, 1)
+
+        self.rfi_tab = RfiTab(self)
+
+        wrap = QWidget(self);
         wrap.setObjectName("CentralWrap")
-        v = QVBoxLayout(wrap)
-        v.setContentsMargins(12, 12, 12, 12)
+        v = QVBoxLayout(wrap);
+        v.setContentsMargins(12, 12, 12, 12);
         v.setSpacing(10)
         v.addWidget(self._build_brand_bar())
-        v.addWidget(self.tabs, 1)
-
+        v.addWidget(self._build_global_db_bar())
+        v.addWidget(self.mainTabs, 1)
         self.setCentralWidget(wrap)
 
-        self.register_tab = RegisterTab(self.settings, on_proceed=self._on_register_proceed); self.tabs.addTab(self.register_tab, "Database")
-        self.transmittal_tab = TransmittalTab(); self.tabs.addTab(self.transmittal_tab, "Transmittal")
-        self.files_tab = FilesTab(); self.tabs.addTab(self.files_tab, "Files")
-        self.history_tab = HistoryTab(); self.tabs.addTab(self.history_tab, "History")
+        # Documents page keeps your current tabs
+        self.register_tab = RegisterTab(self.settings, on_proceed=self._on_register_proceed)
+        self.tabs.addTab(self.register_tab, "Register")
 
+        self.transmittal_tab = TransmittalTab()
+        self.tabs.addTab(self.transmittal_tab, "Transmittal")
+
+        self.files_tab = FilesTab()
+        self.tabs.addTab(self.files_tab, "Files")
+
+        self.history_tab = HistoryTab()
+        self.tabs.addTab(self.history_tab, "History")
+
+        # --- name the tab bars so we can style them differently ---
+        self.mainTabs.setObjectName("MainTabs")
+        self.mainTabs.tabBar().setObjectName("MainTabBar")  # top-level tabs: Document Register / RFI
+        self.tabs.tabBar().setObjectName("SubTabBar")  # inner tabs: Register / Transmittal / Files / History
+
+        # Hide the old internal DB row inside RegisterTab (we use the global bar)
+        try:
+            self.register_tab.hide_db_controls(True)
+        except Exception:
+            pass
+
+        # Top-level headers
+        self.mainTabs.addTab(doc_page, "Document Register")
+        self.mainTabs.addTab(self.rfi_tab, "RFI")
+
+        # Hide the old internal DB row inside RegisterTab (we use the global bar)
+        try:
+            self.register_tab.hide_db_controls(True)
+        except Exception:
+            pass
+
+        # Top-level headers
+        self.mainTabs.addTab(doc_page, "Document Register")
+        self.mainTabs.addTab(self.rfi_tab, "RFI")
 
         # Tab indexes and gating
         self.idx_register = self.tabs.indexOf(self.register_tab)
@@ -318,8 +562,6 @@ class MainWindow(QMainWindow):
 
         # LEFT SIDEBAR
         self.sidebar = SidebarWidget()
-        self.sidebar.set_user_name(self.settings.get("user.name",""))
-
         dock = QDockWidget("Filters & Actions", self)
         dock.setWidget(self.sidebar)
         dock.setFeatures(QDockWidget.NoDockWidgetFeatures)  # keep it fixed
@@ -333,6 +575,23 @@ class MainWindow(QMainWindow):
         self.sidebar.setObjectName("Sidebar")
         self.sidebar.setAttribute(Qt.WA_StyledBackground, True)  # <— add this
 
+        # Use the RfiTab’s actual sidebar (so its signals & project info work)
+        self.rfi_tab.sidebar.setObjectName("Sidebar")
+        self.rfi_tab.sidebar.setAttribute(Qt.WA_StyledBackground, True)
+
+        def _swap_sidebar(idx: int):
+            try:
+                dock = self.findChild(QDockWidget, "LeftDock")
+                if idx == self.mainTabs.indexOf(self.rfi_tab):
+                    dock.setWidget(self.rfi_tab.sidebar)  # ← use the instance owned by RfiTab
+                else:
+                    dock.setWidget(self.sidebar)
+            except Exception:
+                pass
+
+        self.mainTabs.currentChanged.connect(_swap_sidebar)
+        _swap_sidebar(self.mainTabs.currentIndex())  # ensure correct widget on startup
+
         # Menu: User
         m = self.menuBar().addMenu("User")
         act_name = QAction("Set Name…", self); act_name.triggered.connect(self._set_user_name); m.addAction(act_name)
@@ -342,6 +601,12 @@ class MainWindow(QMainWindow):
         act_appearance = QAction("Appearance…", self)
         act_appearance.triggered.connect(self._open_appearance_dialog)
         m_view.addAction(act_appearance)
+        # --- RFI Test ---
+        from .rfi_test_dialog import RfiTestDialog
+        m_rfi = self.menuBar().addMenu("RFI")
+        act_rfi_test = QAction("RFI Drop Test…", self)
+        act_rfi_test.triggered.connect(lambda: RfiTestDialog(self).exec_())
+        m_rfi.addAction(act_rfi_test)
 
         # Listen for project info from the Register tab
         self.register_tab.projectInfoReady.connect(self._on_project_info_ready)
@@ -388,6 +653,8 @@ class MainWindow(QMainWindow):
         # Sidebar → Project Settings
         self.sidebar.projectSettingsRequested.connect(self._open_project_settings)
         self.sidebar.templatesRequested.connect(self._open_templates_viewer)
+        self.rfi_tab.sidebar.projectSettingsRequested.connect(self._open_project_settings)
+        self.rfi_tab.sidebar.templatesRequested.connect(self._open_templates_viewer)
         # Auto-refresh progress donut when the register table changes
         try:
             self.register_tab.model.dataChanged.connect(lambda *a, **k: self.sidebar.refresh_progress())
@@ -659,7 +926,7 @@ class MainWindow(QMainWindow):
         }
 
         # Save next to the DB in a clear folder
-        out_dir = dbp.parent / "Progress Reports"
+        out_dir = dbp.parent / "Reports"
         out_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
         job = proj.get("project_code") or "PROJECT"
@@ -672,6 +939,11 @@ class MainWindow(QMainWindow):
             return
 
         QMessageBox.information(self, "Progress Report", f"Saved:\n{out_pdf}")
+        try:
+            import webbrowser
+            webbrowser.open_new(str(out_pdf))
+        except Exception:
+            pass
 
     def _open_appearance_dialog(self):
         # Lazy import to avoid circulars if any
@@ -754,6 +1026,8 @@ class MainWindow(QMainWindow):
                 self.history_tab.set_db_path(db_path)
                 self.transmittal_tab.set_db_path(db_path)   # no project_root now
                 self.sidebar.set_db_path(db_path)
+                self.rfi_tab.set_db_path(db_path)  # <— add this
+
 
             except Exception as e:
                 print(f"[MainWindow] ERROR wiring tabs: {e}", flush=True)
@@ -771,8 +1045,6 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getText(self, "Your name", "Enter display name:", text=cur)
         if ok:
             self.settings.set("user.name", name)
-            self.sidebar.set_user_name(name)
-
         try:
             self._brand_user.setText(name or "—")
         except Exception:
@@ -907,3 +1179,31 @@ class MainWindow(QMainWindow):
                 self, "Remap complete",
                 f"Updated {trans_number} and rebuilt.\n\n{trans_dir_path}"
             )
+
+    def _apply_db_path(self, path: Path):
+        if not path: return
+        self.le_db_global.setText(str(path))
+        try:
+            # Load via RegisterTab (it will emit projectInfoReady)
+            self.register_tab.load_db_from_path(str(path))
+        except Exception:
+            pass
+        try:
+            # Also refresh RFI tab explicitly
+            self.rfi_tab.set_db_path(Path(path))
+        except Exception:
+            pass
+
+    def _open_db_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open Project DB", "", "Database (*.db)")
+        if path:
+            self._apply_db_path(Path(path))
+
+    def _new_db_dialog(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Create Project DB", "", "Database (*.db)")
+        if not path:
+            return
+        # Delegate to existing RegisterTab "New" logic by simulating its flow:
+        # simplest is: set the global line and let the Register tab's "New…" handle it,
+        # but to avoid UI duplication just open it then load.
+        self._apply_db_path(Path(path))
