@@ -10,6 +10,15 @@ from PyQt5.QtWidgets import (
     QComboBox, QLineEdit
 )
 
+from ..services.transmittal_service import (
+    rebuild_receipt_only,           # <-- add
+    rebuild_transmittal_bundle,     # keep for other flows if needed
+    edit_transmittal_add_items,
+    edit_transmittal_remove_items,
+    edit_transmittal_update_header,
+    soft_delete_transmittal_bundle,
+    purge_transmittal_bundle,
+)
 # ---- DB / services (robust imports) -----------------------------------------
 try:
     from ..services.db import (
@@ -77,12 +86,23 @@ class HistoryTab(QWidget):
         top.addWidget(self.btn_reload)
         top.addWidget(self.lbl_sel, 1, alignment=Qt.AlignRight)
 
-        # Date edit + Save Header
         top.addWidget(QLabel("Submission date:", self))
-        self.le_date = QLineEdit(self)
-        self.le_date.setPlaceholderText("DD/MM/YYYY or DD/MM/YYYY HH:MM")
-        self.le_date.setFixedWidth(200)
+        self.le_date = QLineEdit(self); self.le_date.setPlaceholderText("DD/MM/YYYY or DD/MM/YYYY HH:MM"); self.le_date.setFixedWidth(200)
         top.addWidget(self.le_date)
+
+        top.addWidget(QLabel("Title:", self))
+        self.le_title = QLineEdit(self); self.le_title.setPlaceholderText("Transmittal title"); self.le_title.setFixedWidth(260)
+        top.addWidget(self.le_title)
+
+        top.addWidget(QLabel("Who by:", self))
+        self.le_by = QLineEdit(self); self.le_by.setPlaceholderText("Created by"); self.le_by.setFixedWidth(160)
+        top.addWidget(self.le_by)
+
+        top.addWidget(QLabel("To:", self))
+        self.le_to = QLineEdit(self); self.le_to.setPlaceholderText("Recipient (Client Reference)")
+        self.le_to.setFixedWidth(220)
+        top.addWidget(self.le_to)
+
         self.btn_save_hdr = QPushButton("Save Header", self)
         self.btn_save_hdr.clicked.connect(self._save_header_edits)
         top.addWidget(self.btn_save_hdr)
@@ -120,8 +140,8 @@ class HistoryTab(QWidget):
 
         btns = QHBoxLayout()
         self.btn_remove = QPushButton("← Remove", gb_right); self.btn_remove.clicked.connect(self._remove_selected)
-        self.btn_remap = QPushButton("Attempt Remap…", gb_right); self.btn_remap.clicked.connect(self._request_remap)
-        self.btn_save = QPushButton("Save & Rebuild", gb_right); self.btn_save.clicked.connect(self._save_and_rebuild)
+        self.btn_remap = QPushButton("Remap Files…", gb_right); self.btn_remap.clicked.connect(self._request_remap)
+        self.btn_save = QPushButton("Reprint Receipt…", gb_right); self.btn_save.clicked.connect(self._save_and_rebuild)
         btns.addWidget(self.btn_remove); btns.addStretch(1); btns.addWidget(self.btn_remap); btns.addWidget(self.btn_save)
         right_l.addLayout(btns)
 
@@ -179,8 +199,10 @@ class HistoryTab(QWidget):
             self._current_header = None
             self.lbl_sel.setText("No transmittal selected")
             self._items_right, self._items_left = [], []
-            if hasattr(self, "le_date"):
-                self.le_date.setText("")
+            if hasattr(self, "le_date"):  self.le_date.setText("")
+            if hasattr(self, "le_title"): self.le_title.setText("")
+            if hasattr(self, "le_by"):    self.le_by.setText("")
+            if hasattr(self, "le_to"):    self.le_to.setText("")
             self._render_tables()
             return
 
@@ -198,6 +220,25 @@ class HistoryTab(QWidget):
                 co = dt.strftime("%d/%m/%Y %H:%M") if ":" in co else dt.strftime("%d/%m/%Y")
             if hasattr(self, "le_date"):
                 self.le_date.setText(co)
+            # Prefill title / who by
+            try:
+                if hasattr(self, "le_date"):  self.le_date.setText(co)
+                if hasattr(self, "le_title"): self.le_title.setText((self._current_header or {}).get("title", "") or "")
+                if hasattr(self, "le_by"):    self.le_by.setText(
+                    (self._current_header or {}).get("created_by", "") or "")
+                if hasattr(self, "le_to"):
+                    # store recipient in transmittals.client; fallback to project client_reference
+                    to_val = (self._current_header or {}).get("client", "") or ""
+                    if not to_val:
+                        try:
+                            from ..services.db import get_project
+                            proj = get_project(self.db_path) or {}
+                            to_val = proj.get("client_reference", "") or ""
+                        except Exception:
+                            pass
+                    self.le_to.setText(to_val)
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -305,11 +346,12 @@ class HistoryTab(QWidget):
         if not number:
             return
         try:
-            trans_dir = rebuild_transmittal_bundle(self.db_path, number)
-            QMessageBox.information(self, "Rebuilt",
-                                    f"Rebuilt transmittal folder + receipt for {number}.\n\n{trans_dir}")
+            # reprint the receipt PDF only
+            trans_dir = rebuild_receipt_only(self.db_path, number)
+            QMessageBox.information(self, "Receipt reprinted",
+                                    f"Reprinted receipt for {number}.\n\n{trans_dir}")
         except Exception as e:
-            QMessageBox.warning(self, "Rebuild failed", str(e))
+            QMessageBox.warning(self, "Reprint failed", str(e))
 
     # -------- Remap handoff (to FilesTab) -----------------------------------
     def _request_remap(self):
@@ -340,8 +382,6 @@ class HistoryTab(QWidget):
             "created_on": (self._current_header or {}).get("created_on", ""),
         }
         self.remapRequested.emit(payload)
-        self.remapRequested.emit(payload)
-
 
     # -------- Save  -------------------------------------------------
     def _save_header_edits(self):
@@ -353,9 +393,19 @@ class HistoryTab(QWidget):
         try:
             # Save date only (extend to title/client later if you want)
             co_text = (self.le_date.text().strip() if hasattr(self, "le_date") else "")
-            edit_transmittal_update_header(self.db_path, number, created_on_str=co_text)
+            title_txt = (self.le_title.text().strip() if hasattr(self, "le_title") else "")
+            by_text = (self.le_by.text().strip() if hasattr(self, "le_by") else "")
+            to_text = (self.le_to.text().strip() if hasattr(self, "le_to") else "")
+
+            edit_transmittal_update_header(
+                self.db_path, number,
+                created_on_str=co_text or None,
+                title=title_txt or None,
+                created_by=by_text or None,
+                client=to_text or None  # store “To” in transmittals.client
+            )
             self.refresh()
-            QMessageBox.information(self, "Saved", "Submission date updated.")
+            QMessageBox.information(self, "Saved", "Header updated.")
         except Exception as e:
             QMessageBox.warning(self, "Update failed", str(e))
 
@@ -381,5 +431,10 @@ class HistoryTab(QWidget):
                                 QMessageBox.Yes | QMessageBox.No,
                                 QMessageBox.No) != QMessageBox.Yes:
             return
-        if purge_transmittal_bundle(self.db_path, number):
+        ok = purge_transmittal_bundle(self.db_path, number)
+        if ok:
             self.refresh()
+        else:
+            QMessageBox.warning(self, "Purge failed",
+                                f"Could not fully remove on-disk folder for {number}.\n"
+                                "Close any programs using files in that folder and try again.")

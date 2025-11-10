@@ -96,7 +96,15 @@ class TransmittalTab(QWidget):
 
     def set_db(self, db_path: Path):
         self.db_path = Path(db_path) if db_path else None
-
+        # Prefill Client with Project Settings → Client Reference
+        try:
+            if self.db_path:
+                from ..services.db import get_project  # lazy import
+                proj = get_project(self.db_path) or {}
+                if not self.le_client.text().strip():
+                    self.le_client.setText(proj.get("client_reference", "") or "")
+        except Exception:
+            pass
     def set_db_path(self, db_path: Path):
         self.set_db(db_path)
 

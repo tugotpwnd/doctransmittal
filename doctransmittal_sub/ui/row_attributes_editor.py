@@ -50,6 +50,29 @@ class _ListEditor(QWidget):
         row2 = QHBoxLayout(); row2.addWidget(btn_del); row2.addStretch(1); row2.addWidget(btn_up); row2.addWidget(btn_down)
         lay.addLayout(row2)
 
+        theme = (parent.settings.get("ui.theme", "dark") or "dark").lower() if hasattr(parent, "settings") else "dark"
+        if theme == "light":
+            text_col = "#0b1325"
+            border_col = "#d7deea"
+            bg_col = "#ffffff"
+        else:
+            text_col = "#E7ECF4"
+            border_col = "#233044"
+            bg_col = "#0f1724"
+
+        self.list.setStyleSheet(f"""
+        QListWidget {{
+            background: {bg_col};
+            color: {text_col};
+            border: 1px solid {border_col};
+            border-radius: 8px;
+        }}
+        QListWidget::item:selected {{
+            background: rgba(79,125,255,0.35);
+            color: {'#000' if theme == 'light' else '#fff'};
+        }}
+        """)
+
     def _add(self):
         t = self.ed.text().strip()
         if not t: return
@@ -96,6 +119,54 @@ class RowAttributesEditor(QDialog):
         btns.addStretch(1); btns.addWidget(btn_cancel); btns.addWidget(btn_save)
         lay.addLayout(btns)
         self._save_cb = save_cb
+        self._apply_theme()  # theme-aware colors for the three list widgets
+
+    # --- NEW ---
+    def _apply_theme(self):
+        """
+        Style the three list panes (doc_types, file_types, statuses) based on the parent's
+        settings['ui.theme'] ('light' or 'dark'). Falls back to dark.
+        """
+        theme = "dark"
+        try:
+            p = self.parent()
+            if hasattr(p, "settings"):
+                theme = (p.settings.get("ui.theme", "dark") or "dark").lower()
+        except Exception:
+            pass
+
+        if theme == "light":
+            text_col = "#0b1325"
+            bg_col = "#ffffff"
+            border_col = "#d7deea"
+            sel_bg = "rgba(45,91,255,0.14)"
+            sel_fg = "#000000"
+        else:
+            text_col = "#E7ECF4"
+            bg_col = "#0f1724"
+            border_col = "#233044"
+            sel_bg = "rgba(79,125,255,0.35)"
+            sel_fg = "#ffffff"
+
+        ss = f"""
+        QListWidget {{
+            background: {bg_col};
+            color: {text_col};
+            border: 1px solid {border_col};
+            border-radius: 8px;
+        }}
+        QListWidget::item {{ padding: 3px 6px; }}
+        QListWidget::item:selected {{
+            background: {sel_bg};
+            color: {sel_fg};
+        }}
+        """
+
+        for w in (self.doc_types.list, self.file_types.list, self.statuses.list):
+            try:
+                w.setStyleSheet(ss)
+            except Exception:
+                pass
 
     def _save(self):
         # normalize any free-text (e.g., "Drawing") back to a 3-letter code

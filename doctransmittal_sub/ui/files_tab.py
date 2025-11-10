@@ -132,15 +132,22 @@ class _MapHighlightDelegate(QStyledItemDelegate):
             if not model.isDir(index):
                 fp = model.filePath(index)
                 if fp:
-                    # Duplicates first (caution state)
+                    # If this exact path is manually mapped, show manual green (overrides duplicate amber)
+                    if self._tab._is_manual_mapped_path(fp):
+                        opt = QStyleOptionViewItem(option)
+                        opt.palette.setColor(QPalette.Text, getattr(self._tab, "_green_manual", QColor(38, 185, 110)))
+                        return super().paint(painter, opt, index)
+
+                    # Duplicates (only if not manually chosen)
                     if self._tab._is_duplicate_basename(fp):
                         opt = QStyleOptionViewItem(option)
                         opt.palette.setColor(QPalette.Text, self._amber)
                         return super().paint(painter, opt, index)
-                    # Then mapped (OK state)
+
+                    # Auto/normal mapped
                     if fp in self._tab._used_paths_set():
                         opt = QStyleOptionViewItem(option)
-                        opt.palette.setColor(QPalette.Text, self._green)
+                        opt.palette.setColor(QPalette.Text, getattr(self._tab, "_green_auto", QColor(46, 160, 67)))
                         return super().paint(painter, opt, index)
         except Exception:
             pass
@@ -166,11 +173,18 @@ class FilesTab(QWidget):
 
         # Edit/remap state
         self._edit_mode: bool = False
+        # NEW: track duplicates specific to current submission set
+        self._dup_for_selection: Dict[str, List[str]] = {}
         self._edit_transmittal_number: Optional[str] = None
 
-        # Duplicate tracking state
+        # Duplicate tracking state (names and full paths that belong to *selected* DocID+Rev duplicates)
         self._dup_names: set[str] = set()
         self._dup_paths: set[str] = set()
+        # --- NEW: track manual mappings so we can tint them differently ---
+        self._manual_mapped_docids: set[str] = set()
+        # --- NEW: greens ---
+        self._green_auto = QColor(46, 160, 67)  # existing
+        self._green_manual = QColor(38, 185, 110)  # slightly different shade
 
         # ===== UI =====
         root = QVBoxLayout(self)
@@ -343,7 +357,9 @@ class FilesTab(QWidget):
         self.items = []
         self.doc_ids = []
         self.mapping.clear()
+        self._manual_mapped_docids.clear()
         self.root_dir = None
+        self._dup_for_selection.clear()
         self._dup_names.clear(); self._dup_paths.clear()
         self._edit_mode = False
         self._edit_transmittal_number = None
@@ -360,8 +376,33 @@ class FilesTab(QWidget):
         except Exception:
             return str(Path(p))
 
+    def _norm_rev(self, raw: str) -> str:
+        """NEW: normalize 'Rev A' / ' a ' -> 'A'."""
+        r = (raw or "").strip().upper()
+        if r.startswith("REV"):
+            r = r[3:].strip()
+        return r
+
     def _used_paths_set(self) -> set:
         return {self._normpath(v) for v in self.mapping.values() if v}
+
+    # --- NEW: helpers for manual tinting ---
+    def _manual_paths_set(self) -> set:
+        out = set()
+        try:
+            for d in self._manual_mapped_docids:
+                p = self.mapping.get(d)
+                if p:
+                    out.add(self._normpath(p))
+        except Exception:
+            pass
+        return out
+
+    def _is_manual_mapped_path(self, p: str) -> bool:
+        try:
+            return self._normpath(p) in self._manual_paths_set()
+        except Exception:
+            return False
 
     def _find_doc_for_path(self, p: str) -> Optional[str]:
         np = self._normpath(p)
@@ -374,9 +415,10 @@ class FilesTab(QWidget):
         pairs: List[Tuple[str, str]] = []
         for it in self.items:
             did = (it.get("doc_id") or "").strip()
-            rev = (it.get("revision") or "").strip()
-            if did and rev:
-                pairs.append((did, rev))
+            rv = (it.get("revision") or it.get("latest_rev_token") or it.get("latest_rev") or it.get("rev") or "").strip()
+            rv = self._norm_rev(rv)
+            if did and rv:
+                pairs.append((did, rv))
         return pairs
 
     def _display_path(self, p: Optional[str]) -> str:
@@ -412,7 +454,7 @@ class FilesTab(QWidget):
                 rev_lookup[did] = rev
         for d in self.doc_ids:
             rv = rev_lookup.get(d, "")
-            label = f"{d}  —  Rev {rv}" if rv else d
+            label = f"{d}  —  Rev {self._norm_rev(rv)}" if rv else d
             self.list_docs.addItem(QListWidgetItem(label))
         self._apply_colors()
 
@@ -421,11 +463,13 @@ class FilesTab(QWidget):
         for d in self.doc_ids:
             p = self.mapping.get(d)
             it = QListWidgetItem(self._display_path(p))
-            if p and self._is_duplicate_basename(p):
-                it.setForeground(QBrush(QColor(210, 130, 10)))  # amber
-                it.setToolTip("Duplicate filename under root; excluded from auto-match.")
-            elif p:
-                it.setForeground(QBrush(QColor(46, 160, 67)))  # green
+            if p:
+                if self._is_manual_mapped_path(p):
+                    it.setForeground(QBrush(getattr(self, "_green_manual", QColor(38, 185, 110))))
+                elif self._is_duplicate_basename(p):
+                    it.setForeground(QBrush(QColor(210, 130, 10)))  # amber
+                else:
+                    it.setForeground(QBrush(getattr(self, "_green_auto", QColor(46, 160, 67))))
             else:
                 it.setForeground(QBrush(QColor(200, 60, 60)))  # red
             self.list_map.addItem(it)
@@ -433,67 +477,143 @@ class FilesTab(QWidget):
         self._apply_colors()
 
     def _apply_colors(self):
-        green = QBrush(QColor(46, 160, 67))
-        red   = QBrush(QColor(200, 60, 60))
+        green_auto = QBrush(getattr(self, "_green_auto", QColor(46, 160, 67)))
+        green_manual = QBrush(getattr(self, "_green_manual", QColor(38, 185, 110)))
+        red = QBrush(QColor(200, 60, 60))
         amber = QBrush(QColor(210, 130, 10))
+
         for i, d in enumerate(self.doc_ids):
             mapped_path = self.mapping.get(d)
+
+            # Middle list (Files for transmittal)
             it_mid = self.list_docs.item(i)
             if it_mid:
-                if mapped_path and self._is_duplicate_basename(mapped_path):
-                    it_mid.setForeground(amber)
-                elif mapped_path:
-                    it_mid.setForeground(green)
+                if mapped_path:
+                    if self._is_manual_mapped_path(mapped_path):
+                        it_mid.setForeground(green_manual)  # manual overrides duplicate
+                    elif self._is_duplicate_basename(mapped_path):
+                        it_mid.setForeground(amber)
+                    else:
+                        it_mid.setForeground(green_auto)
                 else:
                     it_mid.setForeground(red)
+
+            # Right list (Mapped files)
             it_right = self.list_map.item(i)
             if it_right:
-                if mapped_path and self._is_duplicate_basename(mapped_path):
-                    it_right.setForeground(amber)
-                elif mapped_path:
-                    it_right.setForeground(green)
+                if mapped_path:
+                    if self._is_manual_mapped_path(mapped_path):
+                        it_right.setForeground(green_manual)  # manual overrides duplicate
+                    elif self._is_duplicate_basename(mapped_path):
+                        it_right.setForeground(amber)
+                    else:
+                        it_right.setForeground(green_auto)
                 else:
                     it_right.setForeground(red)
+
         self.tree.viewport().update()
 
     # ===== Duplicate detection =====
+    # --- OLD (commented): global scan across *all* filenames under root ---
+    # def _scan_duplicates(self):
+    #     """Build sets of duplicate basenames and their full paths under current root_dir."""
+    #     self._dup_names = set()
+    #     self._dup_paths = set()
+    #     if not self.root_dir:
+    #         self._update_dup_banner(0)
+    #         self.tree.viewport().update()
+    #         return
+    #     counts: Dict[str, List[str]] = {}
+    #     try:
+    #         for p in self.root_dir.rglob("*"):
+    #             try:
+    #                 if p.is_file():
+    #                     name = p.name.lower()
+    #                     counts.setdefault(name, []).append(self._normpath(str(p)))
+    #             except Exception:
+    #                 continue
+    #     except Exception:
+    #         counts = {}
+    #     self._dup_names = {n for n, lst in counts.items() if len(lst) > 1}
+    #     self._dup_paths = {pp for n, lst in counts.items() if len(lst) > 1 for pp in lst}
+    #     total = len(self._dup_names)
+    #     self._update_dup_banner(total)
+    #     if total:
+    #         examples = sorted(list(self._dup_names))[:10]
+    #         msg = [f"Detected {total} duplicate filename(s) under:\n{self.root_dir}\n",
+    #                "These files are excluded from auto-matching.\nYou can still map them manually.\n"]
+    #         if examples:
+    #             msg.append("\nExamples:\n" + "\n".join(f"• {e}" for e in examples))
+    #             rem = total - len(examples)
+    #             if rem > 0:
+    #                 msg.append(f"\n… and {rem} more.")
+    #         QMessageBox.warning(self, "Duplicate files detected", "".join(msg))
+    #     self._refresh_map_list()
+    #     self.tree.viewport().update()
+
+    # --- NEW: only flag duplicates for the *selected* DocID+Rev pairs ---
     def _scan_duplicates(self):
-        """Build sets of duplicate basenames and their full paths under current root_dir."""
+        """
+        Build duplicate sets **only** for items in the current submission.
+        We look for files named like:
+            <DocID>_<REV>.*, <DocID>-<REV>.*, <DocID> <REV>.*
+        (case-insensitive)
+        """
+        import re
+        self._dup_for_selection.clear()
         self._dup_names = set()
         self._dup_paths = set()
+
         if not self.root_dir:
             self._update_dup_banner(0)
             self.tree.viewport().update()
             return
-        counts: Dict[str, List[str]] = {}
+
+        pairs = self._doc_rev_pairs()
+        if not pairs:
+            self._update_dup_banner(0)
+            self.tree.viewport().update()
+            return
+
+        # Compile per-DocID target regexes
+        targets: Dict[str, List[re.Pattern]] = {}
+        for did, rv in pairs:
+            if not did or not rv:
+                continue
+            bases = {f"{did}_{rv}", f"{did}-{rv}", f"{did} {rv}"}
+            targets[did] = [re.compile(rf"^{re.escape(b)}\.[A-Za-z0-9]+$", re.IGNORECASE) for b in bases]
+
+        # Walk once, bucket matches against targets
+        hits: Dict[str, List[str]] = {did: [] for did, _ in pairs}
         try:
             for p in self.root_dir.rglob("*"):
-                try:
-                    if p.is_file():
-                        name = p.name.lower()
-                        counts.setdefault(name, []).append(self._normpath(str(p)))
-                except Exception:
+                if not p.is_file():
                     continue
+                name = p.name
+                np = self._normpath(str(p))
+                for did, regs in targets.items():
+                    if any(rx.match(name) for rx in regs):
+                        hits.setdefault(did, []).append(np)
         except Exception:
-            counts = {}
-        self._dup_names = {n for n, lst in counts.items() if len(lst) > 1}
-        self._dup_paths = {pp for n, lst in counts.items() if len(lst) > 1 for pp in lst}
-        total = len(self._dup_names)
-        self._update_dup_banner(total)
-        if total:
-            examples = sorted(list(self._dup_names))[:10]
-            msg = [f"Detected {total} duplicate filename(s) under:\n{self.root_dir}\n",
-                   "These files are excluded from auto-matching.\nYou can still map them manually.\n"]
-            if examples:
-                msg.append("\nExamples:\n" + "\n".join(f"• {e}" for e in examples))
-                rem = total - len(examples)
-                if rem > 0:
-                    msg.append(f"\n… and {rem} more.")
-            QMessageBox.warning(self, "Duplicate files detected", "".join(msg))
+            pass
+
+        # Keep only true duplicates (more than one match for that DocID+Rev)
+        self._dup_for_selection = {did: paths for did, paths in hits.items() if len(paths) > 1}
+        for paths in self._dup_for_selection.values():
+            for np in paths:
+                self._dup_paths.add(np)
+                try:
+                    self._dup_names.add(Path(np).name.lower())
+                except Exception:
+                    pass
+
+        # Banner shows number of DocIDs with duplicates
+        self._update_dup_banner(len(self._dup_for_selection))
         self._refresh_map_list()
         self.tree.viewport().update()
 
     def _is_duplicate_basename(self, p: str) -> bool:
+        """True only if this file is part of a duplicate set for one of the selected DocIDs."""
         try:
             name = Path(p).name.lower()
             return name in getattr(self, "_dup_names", set())
@@ -504,7 +624,7 @@ class FilesTab(QWidget):
         try:
             if hasattr(self, "lbl_dups"):
                 if total > 0:
-                    self.lbl_dups.setText(f"⚠ Duplicates found: {total}")
+                    self.lbl_dups.setText(f"⚠ Duplicates (selected docs): {total}")
                     self.lbl_dups.setVisible(True)
                 else:
                     self.lbl_dups.setVisible(False)
@@ -548,7 +668,7 @@ class FilesTab(QWidget):
             if self._is_duplicate_basename(np):
                 r = QMessageBox.warning(
                     self, "Duplicate filename",
-                    "This filename appears multiple times under the root.\n\n"
+                    "This filename appears multiple times under the root for the current submission.\n\n"
                     "• It will be flagged amber.\n"
                     "• It is excluded from auto-matching rules.\n\n"
                     "Proceed with manual mapping?",
@@ -573,6 +693,9 @@ class FilesTab(QWidget):
                 except Exception: pass
             # Assign
             self.mapping[doc_id] = np
+            # mark this doc as manual; if we stole it from someone else, clear theirs
+            self._manual_mapped_docids.discard(self._find_doc_for_path(np) or "")  # just in case
+            self._manual_mapped_docids.add(doc_id)
             self._refresh_map_list()
             try: self._apply_colors()
             except Exception: pass
@@ -589,17 +712,40 @@ class FilesTab(QWidget):
 
     def _clear_all(self):
         self.mapping.clear()
+        self._manual_mapped_docids.clear()
         self._refresh_map_list()
+
+    # NEW: helper to find <DocID>_latestRev.* under root (case-insensitive)
+    def _find_latestrev_file(self, doc_id: str) -> Optional[Path]:
+        if not self.root_dir or not doc_id:
+            return None
+        base_lower = f"{doc_id}_latestrev"
+        try:
+            for p in self.root_dir.rglob("*"):
+                if p.is_file() and p.suffix and p.stem.lower() == base_lower.lower():
+                    return p
+        except Exception:
+            pass
+        return None
 
     def _auto_find_exact(self):
         if not self.root_dir:
             QMessageBox.information(self, "Pick a root", "Choose a root folder first.")
             return
+
         pairs = self._doc_rev_pairs()
         try:
             found = find_docid_rev_matches(pairs, [self.root_dir], extensions=None) or {}
         except Exception:
             found = {}
+
+        # --- NEW: fallback to <DocID>_latestRev.* if no explicit DocID_Rev match was found ---
+        for d in self.doc_ids:
+            if not found.get(d):
+                alt = self._find_latestrev_file(d)
+                if alt:
+                    found[d] = alt
+
         assigned = 0
         skipped_conflict = 0
         skipped_dups = 0
@@ -621,6 +767,7 @@ class FilesTab(QWidget):
                 used.discard(self._normpath(prev))
             if np not in used or current_owner == d:
                 self.mapping[d] = np
+                self._manual_mapped_docids.discard(d)  # auto → not manual
                 used.add(np)
                 assigned += 1
             else:
@@ -699,7 +846,7 @@ class FilesTab(QWidget):
                 "type": (it.get("type") if isinstance(it, dict) else getattr(it, "type", "")) or "",
                 "file_type": (it.get("file_type") if isinstance(it, dict) else getattr(it, "file_type", "")) or "",
                 "revision": (it.get("revision") if isinstance(it, dict) else getattr(it, "revision", "")) or "",
-                "path": p or "",
+                "file_path": p or "",   # <— key expected by the service
             })
         return snap
 
@@ -709,8 +856,11 @@ class FilesTab(QWidget):
             return
         # build snapshot with warnings on unmapped
         snap = self._build_snapshot_items()
-        unmapped = [s for s in snap if not s.get("path")] \
-                   + [s for s in snap if s.get("path") and self._is_duplicate_basename(s.get("path"))]
+        unmapped = [s for s in snap if not s.get("file_path")] \
+                   + [s for s in snap
+                      if s.get("file_path")
+                      and self._is_duplicate_basename(s.get("file_path"))
+                      and not self._is_manual_mapped_path(s.get("file_path"))]
         if unmapped:
             names = "\n".join(f"• {s['doc_id']}" for s in unmapped[:8])
             more = max(0, len(unmapped) - 8)
@@ -725,9 +875,9 @@ class FilesTab(QWidget):
                 return
         # normalize mapping for service call
         for s in snap:
-            p = s.get("path")
+            p = s.get("file_path")
             if p:
-                s["path"] = self._normpath(p)
+                s["file_path"] = self._normpath(p)
         # EDIT flow
         if self._edit_mode and self._edit_transmittal_number:
             try:

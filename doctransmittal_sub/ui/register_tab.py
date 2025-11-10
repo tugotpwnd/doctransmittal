@@ -780,31 +780,18 @@ class RegisterTab(QWidget):
         self.le_db.setText(path)
         self._load_db()
 
+    # --- drop-in replacement for RegisterTab._new_db ---
     def _new_db(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Create Project DB", "", "Database (*.db)")
-        if not path:
-            return
-        p = Path(path)
-        code, ok = QInputDialog.getText(self, "Project code", "8-digit job number / code:")
-        if not ok or not code.strip():
-            return
-        name, ok = QInputDialog.getText(self, "Project name", "Project name:")
-        if not ok or not name.strip():
-            return
-
-        init_db(p)
-        upsert_project(p, code.strip(), name.strip(), str(p.parent))
-
-        # seed DB (not JSON) with default lists so Manage Lists isn’t blank
+        # Delegate to MainWindow's central "New…" flow
         try:
-            proj = get_project(p)
-            if proj:
-                set_row_options(p, proj["id"], DEFAULT_ROW_OPTIONS)
+            mw = self.window()
+            if hasattr(mw, "_new_db_dialog"):
+                mw._new_db_dialog()
+                return
         except Exception:
             pass
-
-        self.le_db.setText(str(p))
-        self._load_db()
+        # Fallback (shouldn't be hit): original inline new-db flow removed on purpose.
+        QMessageBox.information(self, "New DB", "Please use the global New… button.")
 
     def _maybe_load_on_edit(self):
         text = self.le_db.text().strip()
@@ -1270,7 +1257,7 @@ class RegisterTab(QWidget):
 
         # --- Single add ---
         if getattr(dlg, "payload", None):
-            from .services.db import upsert_document
+            from ..services.db import upsert_document
             upsert_document(self.db_path, self.project_id, dlg.payload)
 
             # Optional: apply template only for single add

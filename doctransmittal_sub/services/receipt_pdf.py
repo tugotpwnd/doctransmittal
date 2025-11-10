@@ -408,15 +408,39 @@ def export_transmittal_pdf(out_pdf: Path, header: Dict[str, Any], items: List[Di
     flow.append(Spacer(1, 6))
 
     # Transmittal Info
-    to_name = (header.get("to") or header.get("client_contact") or header.get("client") or "").strip()
+    def _proj_meta_from_header(hdr: Dict[str, Any]) -> Dict[str, Any]:
+        db_hint = hdr.get("db_path") or hdr.get("register_path")
+        if db_hint:
+            try:
+                from ..services.db import get_project
+            except Exception:
+                try:
+                    from .db import get_project  # fallback if layout differs
+                except Exception:
+                    get_project = None
+            if get_project:
+                try:
+                    return get_project(Path(db_hint)) or {}
+                except Exception:
+                    pass
+        # fallback: allow header to carry these keys directly
+        return {
+            "client_company": hdr.get("client_company", ""),
+            "client_reference": hdr.get("client_reference", ""),
+            "end_user": hdr.get("end_user", "")
+        }
+
+    proj_meta = _proj_meta_from_header(header)
+
     from_name = (header.get("from") or header.get("created_by") or header.get("user") or "").strip()
     proj_no = (header.get("project_code") or header.get("project_no") or "").strip()
     proj_title = (header.get("title") or header.get("project_title") or "").strip()
-    client = (header.get("client") or "").strip()
-    end_user = (header.get("end_user") or "").strip()
     date_str = (header.get("created_on") or header.get("date") or "").strip()
-    purpose = (header.get("purpose") or header.get("status") or "").strip()
 
+    # Mappings per spec
+    to_name = (header.get("to") or header.get("client") or proj_meta.get("client_reference", "")).strip()
+    client = (proj_meta.get("client_company", "") or "").strip()
+    end_user = (proj_meta.get("end_user", "") or "").strip()
     side_w = (doc.width / 2) - 8*mm
     key_w = max(22*mm, side_w * 0.33)
     val_w = side_w - key_w
@@ -425,15 +449,14 @@ def export_transmittal_pdf(out_pdf: Path, header: Dict[str, Any], items: List[Di
         ["To:", to_name],
         ["Project No.:", proj_no],
         ["Project Title:", proj_title],
-        ["Client:", client],
-    ], col0_width_mm=key_w/mm, col1_width_mm=val_w/mm)
+        ["Client:", client],  # project client company
+    ], col0_width_mm=key_w / mm, col1_width_mm=val_w / mm)
 
     right_tbl = _kv_table([
         ["From:", from_name],
         ["Date:", date_str],
-        ["End User:", end_user],
-        ["Purpose:", purpose],
-    ], col0_width_mm=key_w/mm, col1_width_mm=val_w/mm)
+        ["End User:", end_user],  # project end user
+    ], col0_width_mm=key_w / mm, col1_width_mm=val_w / mm)
 
     info_tbl = Table([[left_tbl, right_tbl]], colWidths=[side_w, side_w])
     info_tbl.setStyle(TableStyle([

@@ -6,7 +6,7 @@ from typing import List
 
 import pandas as pd
 from PyQt5.QtWidgets import QMainWindow, QTabWidget, QAction, QMessageBox, QInputDialog, QDockWidget, QSizePolicy, \
-    QApplication, QActionGroup, QFileDialog
+    QApplication, QActionGroup, QFileDialog, QDialog
 from PyQt5.QtCore import Qt
 from doctransmittal_sub.core.settings import SettingsManager
 from doctransmittal_sub.core.excepthook import install_excepthook
@@ -960,6 +960,16 @@ class MainWindow(QMainWindow):
         self.settings.set("ui.theme", theme)
         self.settings.set("ui.font_delta", int(delta))
         self._apply_theme()
+        self.apply_theme_to_open_dialogs()
+
+    def apply_theme_to_open_dialogs(self):
+        for w in QApplication.topLevelWidgets():
+            if isinstance(w, QDialog):
+                try:
+                    if hasattr(w, "_apply_theme"):
+                        w._apply_theme()
+                except Exception:
+                    pass
 
     def _init_appearance_defaults(self):
         """Capture a stable base font once and load saved appearance prefs."""
@@ -1200,10 +1210,57 @@ class MainWindow(QMainWindow):
             self._apply_db_path(Path(path))
 
     def _new_db_dialog(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Create Project DB", "", "Database (*.db)")
-        if not path:
+        # Choose where to create
+        path_s, _ = QFileDialog.getSaveFileName(self, "Create Project DB", "", "Database (*.db)")
+        if not path_s:
             return
-        # Delegate to existing RegisterTab "New" logic by simulating its flow:
-        # simplest is: set the global line and let the Register tab's "New…" handle it,
-        # but to avoid UI duplication just open it then load.
-        self._apply_db_path(Path(path))
+        p = Path(path_s)
+        if p.suffix.lower() != ".db":
+            p = p.with_suffix(".db")
+
+        # If it already exists, offer to use it as-is (no overwrite), or overwrite fresh
+        if p.exists():
+            resp = QMessageBox.question(
+                self,
+                "Database exists",
+                f"“{p.name}” already exists.\n\n"
+                "Use this file as the current project?\n"
+                "Choose No to overwrite it with a fresh database.",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes
+            )
+            if resp == QMessageBox.Cancel:
+                return
+            if resp == QMessageBox.Yes:
+                # Just load it
+                self._apply_db_path(p)
+                return
+            # Overwrite: try to remove old file (ignore failures)
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+        # Collect minimal project metadata
+        code, ok = QInputDialog.getText(self, "Project code", "8-digit job number / code:")
+        if not ok or not code.strip():
+            return
+        name, ok = QInputDialog.getText(self, "Project name", "Project name:")
+        if not ok or not name.strip():
+            return
+
+        # Create + seed defaults (so Manage Lists isn't blank)
+        from ..services.db import init_db, upsert_project, get_project, set_row_options
+        from .row_attributes_editor import DEFAULT_ROW_OPTIONS
+
+        init_db(p)
+        upsert_project(p, code.strip(), name.strip(), str(p.parent))
+        try:
+            proj = get_project(p)
+            if proj:
+                set_row_options(p, proj["id"], DEFAULT_ROW_OPTIONS)
+        except Exception:
+            pass
+
+        # Now load the DB we just created
+        self._apply_db_path(p)

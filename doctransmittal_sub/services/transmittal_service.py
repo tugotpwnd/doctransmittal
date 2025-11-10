@@ -23,17 +23,37 @@ except Exception:
 # ---------------- helpers ----------------
 
 # NEW: accept DD/MM/YYYY, DD/MM/YYYY HH:MM, ISO date/datetime
+from datetime import datetime, date
+from typing import Optional
+
 def _normalize_created_on(s: Optional[str]) -> str:
+    """
+    Normalize various date formats to DD-MM-YYYY or DD-MM-YYYY HH:MM.
+    Accepts:
+      - DD/MM/YYYY
+      - DD/MM/YYYY HH:MM
+      - YYYY-MM-DD
+      - YYYY-MM-DD HH:MM
+    Returns:
+      String formatted as DD-MM-YYYY (or DD-MM-YYYY HH:MM if time present).
+    """
     s = (s or "").strip()
     if not s:
-        return date.today().isoformat()
+        return date.today().strftime("%d-%m-%Y")
+
     for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(s, fmt)
-            return dt.strftime("%Y-%m-%d %H:%M") if "%H:%M" in fmt else dt.strftime("%Y-%m-%d")
+            # Keep time if it existed in input
+            if "%H:%M" in fmt:
+                return dt.strftime("%d-%m-%Y %H:%M")
+            else:
+                return dt.strftime("%d-%m-%Y")
         except Exception:
-            pass
-    return date.today().isoformat()
+            continue
+
+    # Fallback to today's date if parsing fails
+    return date.today().strftime("%d-%m-%Y")
 
 
 def _base_folder_for_output(db_path: Path) -> Path:
@@ -143,16 +163,39 @@ def rebuild_transmittal_bundle(
     items = get_transmittal_items(db_path, tid)
 
     # Copy files that still exist
+    copy_errors = []
+    copied = 0
     for it in items:
-        src = (it.get("file_path") or "").strip()
+        # accept both 'file_path' (preferred) and legacy 'path'
+        src = (it.get("file_path") or it.get("path") or "").strip()
         if not src:
+            # carry useful context in the error report
+            copy_errors.append(f"{it.get('doc_id','?')} Rev {it.get('revision','?')}: no file mapped")
             continue
+
         sp = Path(src)
-        if sp.exists() and sp.is_file():
-            try:
-                shutil.copy2(sp, files_dir / sp.name)
-            except Exception:
-                pass
+        if not (sp.exists() and sp.is_file()):
+            copy_errors.append(f"{it.get('doc_id','?')} Rev {it.get('revision','?')}: missing -> {src}")
+            continue
+
+        try:
+            dst = files_dir / sp.name
+            # ensure parent exists (paranoia; files_dir was created above)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sp, dst)
+            copied += 1
+        except Exception as e:
+            copy_errors.append(f"{it.get('doc_id','?')} Rev {it.get('revision','?')}: {type(e).__name__}: {e}")
+
+    # minimal console visibility (so you can see what happened in the run output)
+    try:
+        print(f"[transmittal] Copied {copied} file(s) → {files_dir}")
+        if copy_errors:
+            print("[transmittal] Copy issues:")
+            for msg in copy_errors:
+                print(" -", msg)
+    except Exception:
+        pass
 
     header = [t for t in list_transmittals(db_path, include_deleted=True) if t["id"] == tid][0]
 
@@ -162,6 +205,91 @@ def rebuild_transmittal_bundle(
 
     pdf_path = receipt_dir / f"{transmittal_number}.pdf"
     export_transmittal_pdf(pdf_path, header, items)
+    return trans_dir
+
+# --- NEW: targeted rebuild helpers -------------------------------------------
+
+def rebuild_files_only(
+    db_path: Path,
+    transmittal_number: str,
+    out_root: Optional[Path] = None,
+) -> Path:
+    """Rebuild the Files/ folder only. Do NOT regenerate the receipt PDF."""
+    init_db(db_path)
+    tid = find_transmittal_id_by_number(db_path, transmittal_number)
+    if tid is None:
+        raise RuntimeError(f"Transmittal {transmittal_number} not found.")
+
+    out_root = out_root or _default_out_root(db_path)
+    trans_dir = out_root / transmittal_number
+    files_dir = trans_dir / "Files"
+    receipt_dir = trans_dir / "Receipt"   # keep structure stable
+
+    # clear and recreate Files; keep /Receipt untouched
+    if files_dir.exists():
+        shutil.rmtree(files_dir, ignore_errors=True)
+    files_dir.mkdir(parents=True, exist_ok=True)
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+
+    items = get_transmittal_items(db_path, tid) or []
+
+    copied, copy_errors = 0, []
+    for it in items:
+        src = (it.get("file_path") or it.get("path") or "").strip()
+        if not src:
+            copy_errors.append(f"{it.get('doc_id','?')} Rev {it.get('revision','?')}: no file mapped")
+            continue
+        sp = Path(src)
+        if not (sp.exists() and sp.is_file()):
+            copy_errors.append(f"{it.get('doc_id','?')} Rev {it.get('revision','?')}: missing -> {src}")
+            continue
+        try:
+            dst = files_dir / sp.name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sp, dst)
+            copied += 1
+        except Exception as e:
+            copy_errors.append(f"{it.get('doc_id','?')} Rev {it.get('revision','?')}: {type(e).__name__}: {e}")
+
+    try:
+        print(f"[transmittal] (files-only) Copied {copied} file(s) → {files_dir}")
+        if copy_errors:
+            print("[transmittal] Copy issues:")
+            for msg in copy_errors:
+                print(" -", msg)
+    except Exception:
+        pass
+
+    return trans_dir
+
+
+def rebuild_receipt_only(
+    db_path: Path,
+    transmittal_number: str,
+    out_root: Optional[Path] = None,
+) -> Path:
+    """Reprint the receipt PDF only. Do NOT touch the Files/ folder."""
+    init_db(db_path)
+    tid = find_transmittal_id_by_number(db_path, transmittal_number)
+    if tid is None:
+        raise RuntimeError(f"Transmittal {transmittal_number} not found.")
+
+    out_root = out_root or _default_out_root(db_path)
+    trans_dir = out_root / transmittal_number
+    receipt_dir = trans_dir / "Receipt"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+
+    items = get_transmittal_items(db_path, tid) or []
+    header = [t for t in list_transmittals(db_path, include_deleted=True) if t["id"] == tid][0]
+    header["db_path"] = str(db_path)
+    header["_pdf_out_path"] = str(receipt_dir)
+
+    pdf_path = receipt_dir / f"{transmittal_number}.pdf"
+    export_transmittal_pdf(pdf_path, header, items)
+    try:
+        print(f"[transmittal] (receipt-only) Wrote {pdf_path}")
+    except Exception:
+        pass
     return trans_dir
 
 
@@ -193,19 +321,23 @@ def edit_transmittal_remove_items(
 
 def edit_transmittal_update_header(
     db_path: Path,
-    transmittal_number: str,
+    number: str,
     *,
-    title: Optional[str] = None,
-    client: Optional[str] = None,
     created_on_str: Optional[str] = None,
-    out_root: Optional[Path] = None,
-) -> Path:
-    tid = find_transmittal_id_by_number(db_path, transmittal_number)
+    title: Optional[str] = None,
+    created_by: Optional[str] = None,
+    client: Optional[str] = None
+) -> bool:
+    tid = find_transmittal_id_by_number(db_path, number)
     if tid is None:
-        raise RuntimeError("Transmittal not found.")
-    created_on = _normalize_created_on(created_on_str) if created_on_str is not None else None
-    update_transmittal_header(db_path, tid, title=title, client=client, created_on=created_on)
-    return rebuild_transmittal_bundle(db_path, transmittal_number, out_root)
+        return False
+    return update_transmittal_header(
+        db_path, tid,
+        title=title,
+        client=client,
+        created_on=created_on_str,
+        created_by=created_by
+    )
 
 def soft_delete_transmittal_bundle(
     db_path: Path,
@@ -220,6 +352,36 @@ def soft_delete_transmittal_bundle(
 
 
 
+import os, stat, time, shutil  # keep near top of file if not already imported
+
+def _rmtree_force(path: Path, tries: int = 3, sleep_sec: float = 0.2) -> bool:
+    """
+    Robustly remove a directory tree on Windows (handles read-only files).
+    Returns True if the path no longer exists.
+    """
+    path = Path(path)
+    if not path.exists():
+        return True
+
+    def _onerror(func, p, exc_info):
+        # Make read-only files writable then retry the failing func(path)
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+
+    for _ in range(tries):
+        try:
+            shutil.rmtree(str(path), onerror=_onerror)
+        except Exception:
+            # swallow and retry
+            pass
+        if not path.exists():
+            return True
+        time.sleep(sleep_sec)
+    return not path.exists()
+
 def purge_transmittal_bundle(
     db_path: Path,
     transmittal_number: str,
@@ -230,12 +392,20 @@ def purge_transmittal_bundle(
         return False
     out_root = out_root or _default_out_root(db_path)
     trans_dir = out_root / transmittal_number
+
+    # Force-delete the whole transmittal folder in one go.
+    dir_gone = _rmtree_force(trans_dir)
+
+    # Delete DB record (function returns None), then verify by lookup
     try:
-        if trans_dir.exists():
-            shutil.rmtree(trans_dir, ignore_errors=True)
+        delete_transmittal_by_id(db_path, tid)
     except Exception:
+        # we'll still verify via lookup below
         pass
-    return delete_transmittal_by_id(db_path, tid)
+
+    db_gone = (find_transmittal_id_by_number(db_path, transmittal_number) is None)
+
+    return bool(dir_gone) and bool(db_gone)
 
 def edit_transmittal_replace_items(
     db_path: Path,
@@ -244,8 +414,7 @@ def edit_transmittal_replace_items(
     out_root: Optional[Path] = None,
 ) -> Path:
     """
-    Replace ALL items in an existing transmittal with `items` (doc_id, revision, file_path, etc),
-    then rebuild the on-disk folder and receipt PDF.
+    Replace ALL items … then rebuild on-disk.
     """
     init_db(db_path)
     tid = find_transmittal_id_by_number(db_path, transmittal_number)
@@ -260,4 +429,7 @@ def edit_transmittal_replace_items(
     if items:
         add_items_to_transmittal(db_path, tid, items)
 
-    return rebuild_transmittal_bundle(db_path, transmittal_number, out_root)
+    # OLD: rebuild_transmittal_bundle(db_path, transmittal_number, out_root)
+    # NEW: files only (do NOT reprint receipt)
+    return rebuild_files_only(db_path, transmittal_number, out_root)
+

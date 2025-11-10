@@ -5,9 +5,11 @@ import getpass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-from PyQt5.QtCore import Qt, QTimer, QSize, QEvent, QSortFilterProxyModel, pyqtSignal
 from PyQt5.QtGui import QFontMetrics, QTextOption
 from PyQt5.QtWidgets import QStyle, QStyleOptionButton
+
+from PyQt5.QtCore import Qt, QTimer, QSize, QEvent, QSortFilterProxyModel, pyqtSignal
+from PyQt5.QtGui import QFontMetrics, QTextOption
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QTableView, QLabel, QTabWidget, QHeaderView,
     QStyledItemDelegate, QComboBox, QTextEdit, QPushButton, QMessageBox,
@@ -396,6 +398,8 @@ class RfiTab(QWidget):
         def __init__(self, *, bg_html: str, req_html: str, parent=None):
             super().__init__(parent)
             self.setWindowTitle("Edit RFI Contents")
+            self.resize(1200, 900)  # ← 🔥 doubles dialog size (was ~600x450 equivalent)
+            self.setMinimumSize(1000, 800)  # optional safeguard
             v = QV(self); v.setContentsMargins(8,8,8,8); v.setSpacing(8)
 
             from PyQt5.QtWidgets import QGroupBox, QVBoxLayout as QVL, QLabel, QTextEdit

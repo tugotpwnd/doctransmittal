@@ -99,24 +99,35 @@ class ProjectSettingsDialog(QDialog):
         self.lst_logos = QListWidget(self)
         self.lst_logos.setSelectionMode(self.lst_logos.ExtendedSelection)
 
-        # Make text white + keep dark theme consistent
-        self.lst_logos.setStyleSheet("""
-        QListWidget { 
+        theme = (settings.get("ui.theme", "dark") or "dark").lower()
+        if theme == "light":
+            text_col = "#0b1325"
+            border_col = "#d7deea"
+            sel_bg = "rgba(45,91,255,0.14)"
+            hover_bg = "rgba(45,91,255,0.08)"
+        else:
+            text_col = "#E7ECF4"
+            border_col = "#233044"
+            sel_bg = "rgba(79,125,255,0.35)"
+            hover_bg = "rgba(79,125,255,0.15)"
+
+        self.lst_logos.setStyleSheet(f"""
+        QListWidget {{
             background: transparent;
-            color: #E7ECF4;           /* normal text */
-            border: 1px solid #233044;
-        }
-        QListWidget::item {
-            color: #E7ECF4;           /* row text */
+            color: {text_col};
+            border: 1px solid {border_col};
+        }}
+        QListWidget::item {{
+            color: {text_col};
             padding: 4px 6px;
-        }
-        QListWidget::item:selected {
-            color: #FFFFFF;           /* selected text */
-            background: rgba(79,125,255,0.35);
-        }
-        QListWidget::item:hover {
-            background: rgba(79,125,255,0.15);
-        }
+        }}
+        QListWidget::item:selected {{
+            color: {'#000' if theme == 'light' else '#fff'};
+            background: {sel_bg};
+        }}
+        QListWidget::item:hover {{
+            background: {hover_bg};
+        }}
         """)
 
         logos_vb.addWidget(self.lst_logos, 1)
