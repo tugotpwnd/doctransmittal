@@ -530,17 +530,10 @@ class MainWindow(QMainWindow):
 
         # Top-level headers
         self.mainTabs.addTab(doc_page, "Document Register")
-        self.mainTabs.addTab(self.rfi_tab, "RFI")
-
-        # Hide the old internal DB row inside RegisterTab (we use the global bar)
-        try:
-            self.register_tab.hide_db_controls(True)
-        except Exception:
-            pass
-
+        self.mainTabs.addTab(self.rfi_tab, "RFI (Disabled)")
         # Top-level headers
-        self.mainTabs.addTab(doc_page, "Document Register")
-        self.mainTabs.addTab(self.rfi_tab, "RFI")
+        self.mainTabs.setTabEnabled(1, False)  # Disable RFI tab
+
 
         # Tab indexes and gating
         self.idx_register = self.tabs.indexOf(self.register_tab)

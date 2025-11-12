@@ -1319,26 +1319,68 @@ class RegisterTab(QWidget):
         except Exception:
             QMessageBox.information(self, "Add Documents", f"Added {len(added_ids)} document(s).")
 
+    # --- imports (with your other Qt imports) ---
+    from PyQt5.QtWidgets import QMessageBox, QFileDialog
+    from PyQt5.QtCore import Qt
+
+
+    # --- inside class RegisterTab ------------------------------------------------
+    def _show_batch_import_preamble(self) -> bool:
+        """Small modal explainer before choosing a file."""
+        from PyQt5.QtWidgets import QMessageBox
+        from PyQt5.QtCore import Qt
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Information)
+        box.setWindowTitle("Batch Import – Excel/CSV Format")
+        box.setTextFormat(Qt.RichText)
+        box.setText(
+            "<b>Default (RevMate export) mapping:</b><br>"
+            "• <b>Start at Row 2</b> (first row is ignored)<br>"
+            "• <b>Col A</b> → <code>REVISION</code><br>"
+            "• <b>Col C</b> → <code>DOC_ID</code> (match key)<br>"
+            "• <b>Col D</b> → <code>DESCRIPTION</code><br><br>"
+            "<span style='color:#c00'><b>Note:</b> If you exported from <b>RevMate</b> to Excel, "
+            "you can load the file directly without edits.</span><br><br>"
+            "<b>Also accepted (headered files):</b><br>"
+            "<code>DOC_ID, REVISION, DESCRIPTION</code> (case-insensitive; extra columns ignored).<br><br>"
+            "<b>Rules</b><br>"
+            "• File types: <code>.csv</code>, <code>.xlsx</code> (active sheet).<br>"
+            "• DOC_ID is trimmed and matched case-insensitively to existing docs.<br>"
+            "• Empty cells are ignored for that field; rows without DOC_ID are skipped."
+        )
+        box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        return box.exec_() == QMessageBox.Ok
+
     def _import_batch_updates(self):
         if not (self.db_path and self.project_id):
-            QMessageBox.information(self, "Project", "Open a project database first."); return
+            QMessageBox.information(self, "Project", "Open a project database first.")
+            return
+
+        # Show explainer
+        if not self._show_batch_import_preamble():
+            return
+
         path, _ = QFileDialog.getOpenFileName(
             self, "Import CSV/XLSX", "", "Spreadsheets (*.csv *.xlsx)"
         )
-        if not path: return
-        updates = self._read_updates_file(path)
-        if not updates:
-            QMessageBox.information(self, "Import", "No valid rows found."); return
-        try:
-            summary = bulk_update_docs(self.db_path, self.project_id, updates)
-        except Exception as e:
-            QMessageBox.information(self, "Import Error", f"Update failed:\n{e}")
+        if not path:
             return
-        self._reload_rows(); self.proxy.invalidateFilter()
-        QMessageBox.information(self, "Import Complete",
-                                f"Matched: {summary['matched']}\n"
-                                f"Revisions updated: {summary['updated_rev']}\n"
-                                f"Descriptions updated: {summary['updated_desc']}")
+
+        updates = self._read_updates_file(path)  # your existing reader/mapping
+        if not updates:
+            QMessageBox.information(self, "Import", "No valid rows found.")
+            return
+
+        summary = bulk_update_docs(self.db_path, self.project_id, updates)  # existing
+        self._reload_rows()
+        self.proxy.invalidateFilter()
+        QMessageBox.information(
+            self, "Import Complete",
+            f"Matched: {summary.get('matched', 0)}\n"
+            f"Revisions updated: {summary.get('updated_rev', 0)}\n"
+            f"Descriptions updated: {summary.get('updated_desc', 0)}"
+        )
 
     def _read_updates_file(self, path: str):
         path = path.strip()
@@ -1367,28 +1409,65 @@ class RegisterTab(QWidget):
             return {}
         return updates
 
+    # --- inside class RegisterTab ---
     def _rows_to_updates(self, rows):
-        if not rows: return {}
+        """
+        Default: RevMate layout
+          - Row 2 onward are data (skip first row)
+          - Col A -> REVISION (index 0)
+          - Col C -> DOC_ID   (index 2)
+          - Col D -> DESCRIPTION (index 3)
+        Fallback: if a header row exists, use header names instead.
+        """
+        if not rows:
+            return {}
+
+        # Normalize header probe
         header_like = [str(x).strip().lower() for x in rows[0]]
-        has_headers = "doc_id" in header_like or "revision" in header_like or "description" in header_like
-        data = rows[1:] if has_headers else rows
-        idx_doc = (header_like.index("doc_id") if has_headers and "doc_id" in header_like else 0)
-        idx_rev = (header_like.index("revision") if has_headers and "revision" in header_like else 1)
-        idx_desc = (header_like.index("description") if has_headers and "description" in header_like else 2)
+        has_headers = any(k in header_like for k in ("doc_id", "revision", "description"))
+
+        if has_headers:
+            # Headered files: map by name; still skip first row as header
+            data = rows[1:]
+            # Provide sensible fallbacks to RevMate positions if a name is missing
+            idx_doc = header_like.index("doc_id") if "doc_id" in header_like else 2
+            idx_rev = header_like.index("revision") if "revision" in header_like else 0
+            idx_desc = header_like.index("description") if "description" in header_like else 3
+        else:
+            # RevMate default layout (Row1 ignored, use A/C/D)
+            data = rows[1:]  # start at Row 2
+            idx_rev, idx_doc, idx_desc = 0, 2, 3
+
         updates = {}
         for r in data:
-            if not any(r):
+            if not r or not any(r):
                 continue
-            doc_id = (str(r[idx_doc]) if idx_doc < len(r) else "").strip().upper()
+
+            # DOC_ID (match key)
+            doc_id = ""
+            if idx_doc < len(r) and r[idx_doc] not in (None, ""):
+                doc_id = str(r[idx_doc]).strip().upper()
             if not doc_id:
                 continue
-            revision = (str(r[idx_rev]).strip() if idx_rev < len(r) and r[idx_rev] not in (None, "") else None)
-            description = (str(r[idx_desc]).strip() if idx_desc < len(r) and r[idx_desc] not in (None, "") else None)
-            updates[doc_id] = {}
+
+            # REVISION and DESCRIPTION (optional)
+            revision = None
+            description = None
+            if idx_rev < len(r) and r[idx_rev] not in (None, ""):
+                revision = str(r[idx_rev]).strip()
+            if idx_desc < len(r) and r[idx_desc] not in (None, ""):
+                description = str(r[idx_desc]).strip()
+
+            if revision is None and description is None:
+                continue
+
+            d = {}
             if revision is not None:
-                updates[doc_id]["revision"] = revision
+                d["revision"] = revision
             if description is not None:
-                updates[doc_id]["description"] = description
+                d["description"] = description
+            updates[doc_id] = d
+
         return updates
 
     # ----------------- Persist when model lacks callbacks ---------------------
