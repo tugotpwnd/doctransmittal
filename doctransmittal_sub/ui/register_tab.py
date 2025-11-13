@@ -1264,7 +1264,7 @@ class RegisterTab(QWidget):
             try:
                 if dlg.payload.get("use_template"):
                     print("[RegisterTab] attempting template apply with payload:", dlg.payload, flush=True)
-                    from .services.template_apply import apply_template_for_new_doc
+                    from ..services.template_apply import apply_template_for_new_doc
                     created = apply_template_for_new_doc(Path(self.db_path), dlg.payload)
                     print("[RegisterTab] template apply result:", created, flush=True)
             except Exception as e:
