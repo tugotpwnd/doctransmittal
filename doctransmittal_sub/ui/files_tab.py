@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QTreeView, QFileSystemModel,
     QPushButton, QLabel, QMessageBox, QFileDialog,
     QStyledItemDelegate, QStyleOptionViewItem, QLineEdit,
-    QAbstractItemView
+    QAbstractItemView, QToolButton, QMenu,
 )
 from PyQt5.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 
@@ -37,6 +37,13 @@ except Exception:
             raise RuntimeError("transmittal_service not available")
         def edit_transmittal_replace_items(**kwargs):
             raise RuntimeError("transmittal_service not available")
+
+
+try:
+    from .checkprint_service import start_checkprint_batch
+except Exception:
+    from ..services.checkprint_service import start_checkprint_batch
+
 
 # --- Toast helper import (robust) ---
 try:
@@ -159,6 +166,7 @@ class FilesTab(QWidget):
     backRequested = pyqtSignal()
     proceedCompleted = pyqtSignal(str)  # emits transmittal directory path on success
     remapCompleted = pyqtSignal(str, str)  # (transmittal_number, dir_path) after edit/remap
+    checkprintStarted = pyqtSignal(str, str)  # (cp_code, cp_dir)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -202,9 +210,23 @@ class FilesTab(QWidget):
         self.le_date.setFixedWidth(180)
         nav.addWidget(self.le_date)
 
-        self.btn_proceed = QPushButton("Proceed: Build Transmittal ▶", self)
-        self.btn_proceed.setToolTip("Copies mapped files and generates a receipt PDF.")
+        # --- NEW: split Proceed button with CheckPrint option ---
+        self.btn_proceed = QToolButton(self)
+        self.btn_proceed.setText("Proceed: Build Transmittal ▶")
+        self.btn_proceed.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.btn_proceed.setPopupMode(QToolButton.MenuButtonPopup)
+
+        menu = QMenu(self.btn_proceed)
+        act_build = menu.addAction("Build Transmittal Now (legacy)")
+        act_cp = menu.addAction("Submit for CheckPrint…")
+
+        act_build.triggered.connect(self._proceed_build_transmittal)
+        act_cp.triggered.connect(self._proceed_submit_checkprint)
+
+        self.btn_proceed.setMenu(menu)
+        # Default click still builds a transmittal as before
         self.btn_proceed.clicked.connect(self._proceed_build_transmittal)
+
         nav.addWidget(self.btn_proceed)
         root.addLayout(nav)
 
@@ -915,3 +937,151 @@ class FilesTab(QWidget):
             "Files were copied to the 'Files' subfolder and a PDF receipt was generated in 'Receipt/'."
         )
         self.proceedCompleted.emit(str(trans_dir))
+
+    def _proceed_submit_checkprint(self):
+        """
+        New flow: instead of immediately building a transmittal, send the files to CheckPrint.
+        """
+        from doctransmittal_sub.services.transmittal_service import (
+            reserve_transmittal_for_checkprint,
+        )
+
+        if not self.db_path:
+            QMessageBox.warning(self, "Missing DB", "No database path available.")
+            return
+
+        # Build snapshot of selected register items (same as transmittal path)
+        snap = self._build_snapshot_items()
+
+        # Same unmapped/duplicate pre-check logic
+        unmapped = [s for s in snap if not s.get("file_path")] \
+                   + [s for s in snap
+                      if s.get("file_path")
+                      and self._is_duplicate_basename(s.get("file_path"))
+                      and not self._is_manual_mapped_path(s.get("file_path"))]
+
+        if unmapped:
+            names = "\n".join(f"• {s['doc_id']}" for s in unmapped[:8])
+            more = max(0, len(unmapped) - 8)
+            suffix = f"\n… and {more} more" if more else ""
+            r = QMessageBox.question(
+                self,
+                "Unmapped / duplicate files",
+                "Some documents are not mapped to a file or appear to be duplicates:\n\n"
+                f"{names}{suffix}\n\nProceed with CheckPrint anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if r != QMessageBox.Yes:
+                return
+
+        # Normalise file paths
+        for s in snap:
+            p = s.get("file_path")
+            if p:
+                s["file_path"] = self._normpath(p)
+
+        # Prevent use while editing
+        if self._edit_mode:
+            QMessageBox.warning(
+                self,
+                "CheckPrint not available",
+                "CheckPrint is only available when creating a new transmittal, "
+                "not when editing an existing one.",
+            )
+            return
+
+        # Ask user to confirm
+        r = QMessageBox.question(
+            self,
+            "Proceed to CheckPrint?",
+            "This will reserve the next transmittal number, place these files into a CheckPrint "
+            "folder, and start the review workflow.\n\nContinue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if r != QMessageBox.Yes:
+            return
+
+        # Reserve a transmittal number and create placeholder folder + CP folder
+        try:
+            transmittal_number, cp_dir, placeholder_trans_dir = (
+                reserve_transmittal_for_checkprint(self.db_path)
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to reserve transmittal:\n{e}")
+            return
+
+        # Copy files into CP folder, suffixing with _CP_1
+        copied_items = []
+        failures = []
+
+        for s in snap:
+            src = s.get("file_path")
+            if not src:
+                failures.append((s["doc_id"], "No file mapped."))
+                continue
+
+            try:
+                src_path = Path(src)
+                if not src_path.exists():
+                    failures.append((s["doc_id"], "Source file not found."))
+                    continue
+
+                # final CP filename  e.g. DWG-001_A_CP_1.pdf
+                new_name = f"{src_path.stem}_CP_1{src_path.suffix}"
+                dst_path = cp_dir / new_name
+
+                shutil.copy2(src_path, dst_path)
+
+                copied_items.append({
+                    "doc_id": s["doc_id"],
+                    "revision": s.get("revision"),
+                    "checkprint_stage": 1,
+                    "dst": str(dst_path),
+                })
+
+            except Exception as e:
+                failures.append((s["doc_id"], str(e)))
+
+        # Warn about failures
+        if failures:
+            msg = "\n".join(f"• {doc}: {err}" for doc, err in failures[:8])
+            more = max(0, len(failures) - 8)
+            suffix = f"\n… and {more} more" if more else ""
+            QMessageBox.warning(
+                self,
+                "Copy Failures",
+                f"Some documents failed to copy into CheckPrint:\n\n{msg}{suffix}"
+            )
+
+        # Insert a basic CheckPrint session record in the DB
+        try:
+            from doctransmittal_sub.db import insert_checkprint_session
+            insert_checkprint_session(
+                self.db_path,
+                transmittal_number=transmittal_number,
+                cp_path=str(cp_dir),
+                items=copied_items,
+            )
+        except Exception as e:
+            # Non-fatal, but warn
+            QMessageBox.warning(
+                self,
+                "DB Warning",
+                f"Files copied but failed to record CheckPrint session in DB:\n{e}"
+            )
+
+        QMessageBox.information(
+            self,
+            "CheckPrint Started",
+            f"CheckPrint session created:\n\n"
+            f"Transmittal Number: {transmittal_number}\n"
+            f"Folder:\n{cp_dir}"
+        )
+
+        # Optionally refresh UI
+        try:
+            self.refresh()
+        except Exception:
+            pass

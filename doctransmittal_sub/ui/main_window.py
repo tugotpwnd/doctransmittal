@@ -530,7 +530,7 @@ class MainWindow(QMainWindow):
 
         # Top-level headers
         self.mainTabs.addTab(doc_page, "Document Register")
-        self.mainTabs.addTab(self.rfi_tab, "RFI (Disabled)")
+        # self.mainTabs.addTab(self.rfi_tab, "RFI (Disabled)")
         # Top-level headers
         self.mainTabs.setTabEnabled(1, False)  # Disable RFI tab
 
@@ -596,10 +596,10 @@ class MainWindow(QMainWindow):
         m_view.addAction(act_appearance)
         # --- RFI Test ---
         from .rfi_test_dialog import RfiTestDialog
-        m_rfi = self.menuBar().addMenu("RFI")
-        act_rfi_test = QAction("RFI Drop Test…", self)
-        act_rfi_test.triggered.connect(lambda: RfiTestDialog(self).exec_())
-        m_rfi.addAction(act_rfi_test)
+        # m_rfi = self.menuBar().addMenu("RFI")
+        # act_rfi_test = QAction("RFI Drop Test…", self)
+        # act_rfi_test.triggered.connect(lambda: RfiTestDialog(self).exec_())
+        # m_rfi.addAction(act_rfi_test)
 
         # Listen for project info from the Register tab
         self.register_tab.projectInfoReady.connect(self._on_project_info_ready)

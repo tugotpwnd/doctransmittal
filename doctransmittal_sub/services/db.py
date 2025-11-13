@@ -124,6 +124,49 @@ DDL = [
         file_path TEXT
     );''',
 
+    # --- CheckPrint (new) ---
+    '''CREATE TABLE IF NOT EXISTS checkprint_batches (
+        id INTEGER PRIMARY KEY,
+        project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        code TEXT NOT NULL UNIQUE,           -- e.g. CP-TRN-001
+        title TEXT NOT NULL,
+        client TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        created_on TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'in_progress',  -- in_progress / completed / cancelled
+        submitted_on TEXT,
+        reviewer TEXT,
+        reviewer_notes TEXT
+    );''',
+
+    '''CREATE TABLE IF NOT EXISTS checkprint_items (
+        id INTEGER PRIMARY KEY,
+        batch_id INTEGER NOT NULL REFERENCES checkprint_batches(id) ON DELETE CASCADE,
+        doc_id TEXT NOT NULL,
+        revision TEXT,
+        base_name TEXT NOT NULL,            -- original basename without _CP_N
+        cp_version INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'pending',  -- pending / accepted / rejected
+        submitter TEXT NOT NULL,
+        reviewer TEXT,
+        last_submitted_on TEXT,
+        last_reviewed_on TEXT,
+        last_reviewer_note TEXT,
+        source_path TEXT NOT NULL,          -- actual source file (_CP_N) on disk
+        cp_path TEXT NOT NULL               -- path to the copy in CheckPrint folder
+    );''',
+
+    '''CREATE TABLE IF NOT EXISTS checkprint_events (
+        id INTEGER PRIMARY KEY,
+        item_id INTEGER NOT NULL REFERENCES checkprint_items(id) ON DELETE CASCADE,
+        happened_on TEXT NOT NULL,
+        actor TEXT,
+        event TEXT NOT NULL,          -- submitted / resubmitted / accepted / rejected / status_changed
+        from_status TEXT,
+        to_status TEXT,
+        note TEXT
+    );''',
+
     # --- RFIs (new) ---
     '''CREATE TABLE IF NOT EXISTS rfis (
         id INTEGER PRIMARY KEY,
@@ -1187,3 +1230,195 @@ def update_rfi_fields(db_path: Path, project_id: int, number: str, fields: Dict[
         return changed
 
     return _retry_write(_do)
+
+
+# ====================== CheckPrint helpers ======================
+
+def create_checkprint_batch(
+    db_path: Path,
+    *,
+    project_id: int,
+    code: str,
+    title: str,
+    client: str,
+    created_by: str,
+    created_on: str,
+    items: List[Dict[str, Any]],
+) -> int:
+    """
+    Create a CheckPrint batch + items.
+    items = [{
+        doc_id, revision, base_name, cp_version,
+        status, submitter, source_path, cp_path,
+        last_submitted_on
+    }, ...]
+    """
+    init_db(db_path)
+
+    def _do():
+        con = _connect(db_path); cur = con.cursor()
+        cur.execute("""
+            INSERT INTO checkprint_batches(
+                project_id, code, title, client,
+                created_by, created_on, status
+            ) VALUES (?,?,?,?,?,?, 'in_progress')
+        """, (project_id, code, title, client, created_by, created_on))
+        batch_id = cur.lastrowid
+
+        rows = []
+        for it in items:
+            rows.append((
+                batch_id,
+                it["doc_id"],
+                it.get("revision") or "",
+                it["base_name"],
+                int(it.get("cp_version", 1)),
+                it.get("status", "pending"),
+                it.get("submitter", created_by),
+                it.get("reviewer") or "",
+                it.get("last_submitted_on", created_on),
+                it.get("last_reviewed_on") or "",
+                it.get("last_reviewer_note") or "",
+                it["source_path"],
+                it["cp_path"],
+            ))
+        cur.executemany("""
+            INSERT INTO checkprint_items(
+                batch_id, doc_id, revision, base_name, cp_version,
+                status, submitter, reviewer, last_submitted_on,
+                last_reviewed_on, last_reviewer_note,
+                source_path, cp_path
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, rows)
+
+        con.commit(); con.close()
+        return batch_id
+
+    return _retry_write(_do)
+
+
+def list_checkprint_batches(db_path: Path, project_id: int) -> List[Dict[str, Any]]:
+    init_db(db_path)
+    con = _connect(db_path)
+    rows = con.execute("""
+        SELECT id, code, title, client, created_by, created_on,
+               status, submitted_on, reviewer, reviewer_notes
+          FROM checkprint_batches
+         WHERE project_id=?
+         ORDER BY created_on DESC, id DESC
+    """, (int(project_id),)).fetchall()
+    con.close()
+    cols = ["id","code","title","client","created_by","created_on",
+            "status","submitted_on","reviewer","reviewer_notes"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def get_checkprint_items(db_path: Path, batch_id: int) -> List[Dict[str, Any]]:
+    init_db(db_path)
+    con = _connect(db_path)
+    rows = con.execute("""
+        SELECT id, batch_id, doc_id, revision, base_name, cp_version,
+               status, submitter, reviewer, last_submitted_on,
+               last_reviewed_on, last_reviewer_note,
+               source_path, cp_path
+          FROM checkprint_items
+         WHERE batch_id=?
+         ORDER BY doc_id, cp_version
+    """, (int(batch_id),)).fetchall()
+    con.close()
+    cols = [
+        "id","batch_id","doc_id","revision","base_name","cp_version",
+        "status","submitter","reviewer","last_submitted_on",
+        "last_reviewed_on","last_reviewer_note",
+        "source_path","cp_path"
+    ]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def get_latest_checkprint_versions(
+    db_path: Path,
+    project_id: int,
+    doc_ids: List[str],
+) -> Dict[str, int]:
+    """
+    Returns {doc_id: max_cp_version} across all batches for this project.
+    """
+    if not doc_ids:
+        return {}
+    init_db(db_path)
+    con = _connect(db_path)
+    placeholders = ",".join("?" for _ in doc_ids)
+    rows = con.execute(f"""
+        SELECT ci.doc_id, MAX(ci.cp_version)
+          FROM checkprint_items ci
+          JOIN checkprint_batches cb ON cb.id = ci.batch_id
+         WHERE cb.project_id=? AND ci.doc_id IN ({placeholders})
+         GROUP BY ci.doc_id
+    """, (int(project_id), *doc_ids)).fetchall()
+    con.close()
+    return {str(r[0]): int(r[1]) for r in rows}
+
+
+def update_checkprint_item_status(
+    db_path: Path,
+    item_id: int,
+    *,
+    status: Optional[str] = None,
+    reviewer: Optional[str] = None,
+    note: Optional[str] = None,
+) -> None:
+    """
+    Update status / reviewer / note for a single item.
+    """
+    fields: Dict[str, Any] = {}
+    if status is not None:
+        fields["status"] = status
+        fields["last_reviewed_on"] = "datetime('now')"  # special
+    if reviewer is not None:
+        fields["reviewer"] = reviewer
+    if note is not None:
+        fields["last_reviewer_note"] = note
+
+    if not fields:
+        return
+
+    sets_sql = []
+    vals: List[Any] = []
+    for k,v in fields.items():
+        if v == "datetime('now')":
+            sets_sql.append(f"{k}=datetime('now')")
+        else:
+            sets_sql.append(f"{k}=?"); vals.append(v)
+    vals.append(int(item_id))
+
+    def _do():
+        con = _connect(db_path); cur = con.cursor()
+        cur.execute(f"""
+            UPDATE checkprint_items
+               SET {", ".join(sets_sql)}
+             WHERE id=?
+        """, vals)
+        con.commit(); con.close()
+
+    _retry_write(_do)
+
+
+def append_checkprint_event(
+    db_path: Path,
+    *,
+    item_id: int,
+    actor: str,
+    event: str,
+    from_status: Optional[str],
+    to_status: Optional[str],
+    note: str = "",
+) -> None:
+    def _do():
+        con = _connect(db_path); cur = con.cursor()
+        cur.execute("""
+            INSERT INTO checkprint_events(
+                item_id, happened_on, actor, event, from_status, to_status, note
+            ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?)
+        """, (int(item_id), actor, event, from_status, to_status, note))
+        con.commit(); con.close()
+    _retry_write(_do)
