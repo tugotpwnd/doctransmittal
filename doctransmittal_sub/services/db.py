@@ -1297,20 +1297,23 @@ def create_checkprint_batch(
     return _retry_write(_do)
 
 
-def list_checkprint_batches(db_path: Path, project_id: int) -> List[Dict[str, Any]]:
+def list_checkprint_batches(db_path: Path) -> List[Dict[str, Any]]:
     init_db(db_path)
     con = _connect(db_path)
     rows = con.execute("""
         SELECT id, code, title, client, created_by, created_on,
                status, submitted_on, reviewer, reviewer_notes
           FROM checkprint_batches
-         WHERE project_id=?
          ORDER BY created_on DESC, id DESC
-    """, (int(project_id),)).fetchall()
+    """).fetchall()
     con.close()
-    cols = ["id","code","title","client","created_by","created_on",
-            "status","submitted_on","reviewer","reviewer_notes"]
+
+    cols = [
+        "id","code","title","client","created_by","created_on",
+        "status","submitted_on","reviewer","reviewer_notes"
+    ]
     return [dict(zip(cols, r)) for r in rows]
+
 
 
 def get_checkprint_items(db_path: Path, batch_id: int) -> List[Dict[str, Any]]:

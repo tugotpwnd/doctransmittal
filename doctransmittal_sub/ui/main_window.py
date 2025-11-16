@@ -33,6 +33,7 @@ from datetime import datetime, date
 from .rfi_tab import RfiTab
 from .widgets.rfi_sidebar import RfiSidebarWidget
 from PyQt5.QtWidgets import QLineEdit, QPushButton, QLabel, QHBoxLayout  # if not already imported
+from .checkprint_tab import CheckPrintTab
 
 
 # --- UI assets helper (works in dev + PyInstaller) --------------------------
@@ -516,6 +517,10 @@ class MainWindow(QMainWindow):
 
         self.history_tab = HistoryTab()
         self.tabs.addTab(self.history_tab, "History")
+
+        self.checkprint_tab = CheckPrintTab()
+        self.idx_checkprint = self.tabs.addTab(self.checkprint_tab, "CheckPrint")
+        self.tabs.setTabEnabled(self.idx_checkprint, True)
 
         # --- name the tab bars so we can style them differently ---
         self.mainTabs.setObjectName("MainTabs")
@@ -1030,6 +1035,9 @@ class MainWindow(QMainWindow):
                 self.transmittal_tab.set_db_path(db_path)   # no project_root now
                 self.sidebar.set_db_path(db_path)
                 self.rfi_tab.set_db_path(db_path)  # <— add this
+                self.checkprint_tab.set_db_path(db_path)
+                print("Set paths")
+
 
 
             except Exception as e:

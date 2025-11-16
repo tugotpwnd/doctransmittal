@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import shutil
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
@@ -941,9 +943,13 @@ class FilesTab(QWidget):
     def _proceed_submit_checkprint(self):
         """
         New flow: instead of immediately building a transmittal, send the files to CheckPrint.
+        Uses checkprint_service.start_checkprint_batch, which:
+          - renames source files to *_CP_N
+          - copies them into the CheckPrint folder
+          - records the batch + items in the DB.
         """
-        from doctransmittal_sub.services.transmittal_service import (
-            reserve_transmittal_for_checkprint,
+        from doctransmittal_sub.services.checkprint_service import (
+            start_checkprint_batch,
         )
 
         if not self.db_path:
@@ -981,7 +987,7 @@ class FilesTab(QWidget):
             if p:
                 s["file_path"] = self._normpath(p)
 
-        # Prevent use while editing
+        # Prevent use while editing existing transmittals
         if self._edit_mode:
             QMessageBox.warning(
                 self,
@@ -991,92 +997,53 @@ class FilesTab(QWidget):
             )
             return
 
+        # Filter out items with no mapped file_path to avoid service trying to rename ''
+        mapped_items = [s for s in snap if s.get("file_path")]
+        if not mapped_items:
+            QMessageBox.warning(
+                self,
+                "No mapped files",
+                "No documents with mapped files are available to send to CheckPrint.",
+            )
+            return
+
         # Ask user to confirm
         r = QMessageBox.question(
             self,
             "Proceed to CheckPrint?",
-            "This will reserve the next transmittal number, place these files into a CheckPrint "
-            "folder, and start the review workflow.\n\nContinue?",
+            "This will rename the mapped files for CheckPrint, copy them into a "
+            "CheckPrint folder, and start the review workflow.\n\nContinue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if r != QMessageBox.Yes:
             return
 
-        # Reserve a transmittal number and create placeholder folder + CP folder
+        # Kick off the CheckPrint batch via the service
         try:
-            transmittal_number, cp_dir, placeholder_trans_dir = (
-                reserve_transmittal_for_checkprint(self.db_path)
+            result = start_checkprint_batch(
+                self.db_path,
+                items=mapped_items,
+                user_name=getattr(self, "user", "") or "",
+                title=getattr(self, "title", "") or "",
+                client=getattr(self, "client", "") or "",
             )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to reserve transmittal:\n{e}")
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to start CheckPrint batch:\n{e}",
+            )
             return
 
-        # Copy files into CP folder, suffixing with _CP_1
-        copied_items = []
-        failures = []
-
-        for s in snap:
-            src = s.get("file_path")
-            if not src:
-                failures.append((s["doc_id"], "No file mapped."))
-                continue
-
-            try:
-                src_path = Path(src)
-                if not src_path.exists():
-                    failures.append((s["doc_id"], "Source file not found."))
-                    continue
-
-                # final CP filename  e.g. DWG-001_A_CP_1.pdf
-                new_name = f"{src_path.stem}_CP_1{src_path.suffix}"
-                dst_path = cp_dir / new_name
-
-                shutil.copy2(src_path, dst_path)
-
-                copied_items.append({
-                    "doc_id": s["doc_id"],
-                    "revision": s.get("revision"),
-                    "checkprint_stage": 1,
-                    "dst": str(dst_path),
-                })
-
-            except Exception as e:
-                failures.append((s["doc_id"], str(e)))
-
-        # Warn about failures
-        if failures:
-            msg = "\n".join(f"• {doc}: {err}" for doc, err in failures[:8])
-            more = max(0, len(failures) - 8)
-            suffix = f"\n… and {more} more" if more else ""
-            QMessageBox.warning(
-                self,
-                "Copy Failures",
-                f"Some documents failed to copy into CheckPrint:\n\n{msg}{suffix}"
-            )
-
-        # Insert a basic CheckPrint session record in the DB
-        try:
-            from doctransmittal_sub.db import insert_checkprint_session
-            insert_checkprint_session(
-                self.db_path,
-                transmittal_number=transmittal_number,
-                cp_path=str(cp_dir),
-                items=copied_items,
-            )
-        except Exception as e:
-            # Non-fatal, but warn
-            QMessageBox.warning(
-                self,
-                "DB Warning",
-                f"Files copied but failed to record CheckPrint session in DB:\n{e}"
-            )
+        cp_code = (result or {}).get("code", "")
+        cp_dir = (result or {}).get("dir", "")
 
         QMessageBox.information(
             self,
             "CheckPrint Started",
-            f"CheckPrint session created:\n\n"
-            f"Transmittal Number: {transmittal_number}\n"
+            "CheckPrint batch created:\n\n"
+            f"Batch Code: {cp_code or '(unknown)'}\n"
             f"Folder:\n{cp_dir}"
         )
 
