@@ -1,4 +1,7 @@
 from __future__ import annotations
+
+import os
+import shutil
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
@@ -183,23 +186,22 @@ class CheckPrintTab(QWidget):
         if not fp:
             return
 
-        # Apply rules:
-        #   rejected → pending + CP increment
-        #   accepted → pending + CP increment
-        #   pending  → pending + NO increment
-        # resubmit_checkprint_items ALWAYS increments cp_version,
-        # so we handle "no increment" case manually.
         try:
             if status == "pending":
-                # overwrite current CP version, don't bump cp_version
-                self._overwrite_without_increment(it, Path(fp))
+                # overwrite same CP version
+                overwrite_checkprint_items(
+                    self.db_path,
+                    batch_id=self.current_batch_id,
+                    item_id_to_new_path={it["id"]: Path(fp)},
+                    submitter="submitter",   # swap in your real username if you have it
+                )
             else:
-                # use service (increments cp_version)
+                # accepted / rejected → increment CP version
                 resubmit_checkprint_items(
                     self.db_path,
                     batch_id=self.current_batch_id,
                     item_id_to_new_path={it["id"]: Path(fp)},
-                    submitter="submitter"
+                    submitter="submitter",
                 )
 
         except Exception as e:
@@ -208,75 +210,6 @@ class CheckPrintTab(QWidget):
 
         QMessageBox.information(self, "CheckPrint", f"{doc_id} resubmitted.")
         self._load_items_for_submitter()
-
-    # -------------------------------------------------------------------------
-    # Manual overwrite without CP increment
-    # -------------------------------------------------------------------------
-    def _overwrite_without_increment(self, it, new_file: Path):
-        """
-        Pending → pending, but CP version does NOT increment.
-        Replace the existing CP file with the uploaded one.
-
-        Required:
-            • keep doc_id
-            • include revision in filename (if present)
-            • keep CP_N the same
-            • delete old CP file
-            • copy new file into its place
-        """
-        import shutil
-        from ..services.checkprint_service import _safe_rename, _split_basename
-        from ..services.db import _connect, _retry_write
-
-        doc_id       = it["doc_id"]
-        revision     = it.get("revision") or ""
-        cp_version   = it["cp_version"]
-        old_cp_path = Path(resolve_company_library_path(it["cp_path"]))
-        cp_dir       = old_cp_path.parent
-        ext          = new_file.suffix
-
-        # Build correct target filename
-        if revision:
-            final_name = f"{doc_id}_{revision}_CP_{cp_version}{ext}"
-        else:
-            final_name = f"{doc_id}_CP_{cp_version}{ext}"
-
-        new_cp_path = cp_dir / final_name
-
-        # Remove previous CP file
-        print(old_cp_path)
-        if old_cp_path.exists():
-            try:
-                old_cp_path.unlink()
-            except Exception as e:
-                raise RuntimeError(f"Failed to delete old CP file:\n{old_cp_path}\n{e}")
-            
-        else:
-            print(f"old cp path: {old_cp_path} does not exist")
-
-        # Copy uploaded file to the correct CP filename
-        try:
-            shutil.copy2(str(new_file), str(new_cp_path))
-        except Exception as e:
-            raise RuntimeError(f"Failed to copy new file into CheckPrint directory:\n{e}")
-
-        # Update DB paths + status
-        def _do():
-            con = _connect(self.db_path); cur = con.cursor()
-            cur.execute("""
-                UPDATE checkprint_items
-                   SET status='pending',
-                       reviewer=NULL,
-                       last_reviewer_note=NULL,
-                       source_path=?,
-                       cp_path=?,
-                       last_submitted_on=datetime('now')
-                 WHERE id=?
-            """, (str(Path(new_cp_path).relative_to(company_library_root())),
-                            str(Path(new_cp_path).relative_to(company_library_root())),
-                            it["id"]))
-            con.commit(); con.close()
-        _retry_write(_do)
 
     def _cancel_checkprint(self):
         if not self.current_batch_id:

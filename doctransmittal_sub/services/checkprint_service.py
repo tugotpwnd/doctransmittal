@@ -202,6 +202,176 @@ def start_checkprint_batch(
             except OSError:
                 pass
         raise
+from pathlib import Path
+from typing import Dict
+from datetime import datetime
+import shutil
+from ..core.paths import company_library_root, resolve_company_library_path
+from .db import get_checkprint_items, append_checkprint_event, _retry_write, _connect, init_db
+
+
+def _apply_checkprint_update(
+    db_path: Path,
+    *,
+    item: Dict,
+    new_file: Path,
+    submitter: str,
+    mode: str,          # "overwrite" or "increment"
+) -> None:
+    """
+    Shared logic for CheckPrint updates.
+
+    mode = "overwrite"  → pending: overwrite same CP version
+    mode = "increment"  → accepted/rejected: create new CP version
+    """
+    db_path = Path(db_path)
+    new_file = Path(new_file)
+
+    if not new_file.exists():
+        raise RuntimeError(f"Replacement file not found:\n{new_file}")
+
+    # Resolve current CP / source paths
+    old_cp_abs = Path(resolve_company_library_path(item["cp_path"]))
+    old_src_abs = Path(resolve_company_library_path(item["source_path"]))
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    now_date = datetime.now().strftime("%Y-%m-%d")
+
+    current_version = int(item.get("cp_version") or 1)
+
+    if mode == "overwrite":
+        # PENDING: overwrite same CP version
+        new_version = current_version
+
+        # Supersede *CP* file with timestamp
+        superseded_dir = old_cp_abs.parent / "superseded"
+        superseded_dir.mkdir(exist_ok=True)
+        if old_cp_abs.exists():
+            superseded_name = f"{old_cp_abs.stem}_SUPERSEDED_{ts}{old_cp_abs.suffix}"
+            old_cp_abs.rename(superseded_dir / superseded_name)
+
+        # Remove old source file (we only care about keeping current)
+        if old_src_abs.exists():
+            try:
+                old_src_abs.unlink()
+            except Exception:
+                pass
+
+    elif mode == "increment":
+        # ACCEPTED / REJECTED: create new CP version
+        new_version = current_version + 1
+
+        # Do NOT touch the old CP_N – keep it in place
+        # Only old source file is removed
+        if old_src_abs.exists():
+            try:
+                old_src_abs.unlink()
+            except Exception:
+                pass
+
+    else:
+        raise ValueError(f"Unknown CheckPrint update mode: {mode}")
+
+    # Build new filename: <doc>[_<rev>]_CP_<version><ext>
+    doc_id = item["doc_id"]
+    rev = item.get("revision") or ""
+    base = f"{doc_id}_{rev}" if rev else doc_id
+    new_name = f"{base}_CP_{new_version}{new_file.suffix}"
+
+    new_cp_abs = old_cp_abs.parent / new_name
+    new_src_abs = old_src_abs.parent / new_name
+
+    # Copy new file into both locations
+    new_cp_abs.parent.mkdir(parents=True, exist_ok=True)
+    new_src_abs.parent.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy2(str(new_file), str(new_src_abs))
+    shutil.copy2(str(new_file), str(new_cp_abs))
+
+    # DB paths relative to company library root
+    rel_src = str(new_src_abs.relative_to(company_library_root()))
+    rel_cp = str(new_cp_abs.relative_to(company_library_root()))
+
+    old_status = item.get("status") or "pending"
+    new_status = "pending"  # any resubmission returns to pending
+
+    def _do():
+        con = _connect(db_path)
+        cur = con.cursor()
+        if mode == "overwrite":
+            # CP version unchanged, status already pending
+            cur.execute("""
+                UPDATE checkprint_items
+                   SET source_path=?,
+                       cp_path=?,
+                       submitter=?,
+                       last_submitted_on=?
+                 WHERE id=?
+            """, (rel_src, rel_cp, submitter, now_date, int(item["id"])))
+        else:
+            # increment version and reset status/reviewer
+            cur.execute("""
+                UPDATE checkprint_items
+                   SET source_path=?,
+                       cp_path=?,
+                       submitter=?,
+                       cp_version=?,
+                       status=?,
+                       reviewer=NULL,
+                       last_reviewer_note=NULL,
+                       last_submitted_on=?
+                 WHERE id=?
+            """, (rel_src, rel_cp, submitter,
+                  new_version, new_status, now_date, int(item["id"])))
+        con.commit()
+        con.close()
+
+    _retry_write(_do)
+
+    # Event log
+    append_checkprint_event(
+        db_path,
+        item_id=int(item["id"]),
+        actor=submitter,
+        event="resubmitted",
+        from_status=old_status,
+        to_status=new_status if mode == "increment" else old_status,
+        note="Document resubmitted by submitter",
+    )
+
+
+def overwrite_checkprint_items(
+    db_path: Path,
+    *,
+    batch_id: int,
+    item_id_to_new_path: Dict[int, Path],
+    submitter: str,
+) -> bool:
+    """
+    Pending case:
+        • Overwrite same CP version
+        • Supersede old CP file with timestamp
+        • Replace source + CP with new file
+    """
+    db_path = Path(db_path)
+    init_db(db_path)
+
+    items = get_checkprint_items(db_path, batch_id)
+    items_by_id = {int(it["id"]): it for it in items}
+
+    for item_id, new_path in item_id_to_new_path.items():
+        it = items_by_id.get(int(item_id))
+        if not it:
+            continue
+        _apply_checkprint_update(
+            db_path,
+            item=it,
+            new_file=Path(new_path),
+            submitter=submitter,
+            mode="overwrite",
+        )
+
+    return True
 
 
 def resubmit_checkprint_items(
@@ -210,99 +380,36 @@ def resubmit_checkprint_items(
     batch_id: int,
     item_id_to_new_path: Dict[int, Path],
     submitter: str,
-) -> None:
+) -> bool:
     """
-    For submitter: resubmit rejected/pending items with new PDF files.
-    Renames + copies new source files to *_CP_N and updates DB.
+    Accepted / rejected case:
+        • Increment CP version
+        • Keep old CP_N in place (no supersede)
+        • Replace source file with new version
+        • New CP_N+1 created
     """
     db_path = Path(db_path)
     init_db(db_path)
-    items = {it["id"]: it for it in get_checkprint_items(db_path, batch_id)}
-    if not items:
-        raise RuntimeError("No items found for this CheckPrint batch.")
 
-    proj = get_project(db_path)
-    project_code = proj["project_code"]
-    project_id = proj["id"]
-    cp_root = _checkprint_root(db_path)
+    items = get_checkprint_items(db_path, batch_id)
+    items_by_id = {int(it["id"]): it for it in items}
 
-    # find this batch's directory
-    batch = None
-    cp_dir = None
-    for p in cp_root.iterdir():
-        if p.is_dir():
-            if any(str(it["cp_path"]).startswith(str(p)) for it in items.values()):
-                cp_dir = p
-                break
-    if not cp_dir:
-        raise RuntimeError("CheckPrint batch folder could not be located on disk.")
+    for item_id, new_path in item_id_to_new_path.items():
+        it = items_by_id.get(int(item_id))
+        if not it:
+            continue
+        _apply_checkprint_update(
+            db_path,
+            item=it,
+            new_file=Path(new_path),
+            submitter=submitter,
+            mode="increment",
+        )
 
-    doc_ids = [items[i]["doc_id"] for i in item_id_to_new_path.keys() if i in items]
-    latest_versions = get_latest_checkprint_versions(db_path, project_id, doc_ids)
+    return True
 
-    renames: List[tuple[Path, Path]] = []
 
-    try:
-        for item_id, new_file in item_id_to_new_path.items():
-            it = items.get(item_id)
-            if not it:
-                continue
-            if not new_file or not Path(new_file).exists():
-                raise RuntimeError(f"New file does not exist:\n{new_file}")
 
-            doc_id = it["doc_id"]
-            base_name, ext = _split_basename(Path(new_file).name)
-            cp_version = latest_versions.get(doc_id, it.get("cp_version", 1)) + 1
-            cp_name = f"{base_name}_CP_{cp_version}{ext}"
-
-            # rename source (new_file) to cp name in its folder
-            src_new = Path(new_file)
-            dst_src = src_new.with_name(cp_name)
-            _safe_rename(src_new, dst_src)
-            renames.append((dst_src, src_new))
-
-            dst_cp = Path(cp_dir) / cp_name
-            shutil.copy2(str(dst_src), str(dst_cp))
-
-            # DB updates
-            from_status = it["status"]
-            update_checkprint_item_status(
-                db_path,
-                item_id=item_id,
-                status="pending",
-                reviewer=None,
-                note=None,
-            )
-            # manual field updates for paths/version
-            def _do():
-                con = _connect(db_path); cur = con.cursor()
-                cur.execute("""
-                    UPDATE checkprint_items
-                       SET cp_version=?, source_path=?, cp_path=?, last_submitted_on=datetime('now')
-                     WHERE id=?
-                """, (cp_version, str(Path(dst_src).relative_to(company_library_root())),
-                      str(Path(dst_cp).relative_to(company_library_root())), int(item_id)))
-                con.commit(); con.close()
-            _retry_write(_do)
-
-            append_checkprint_event(
-                db_path,
-                item_id=item_id,
-                actor=submitter,
-                event="resubmitted",
-                from_status=from_status,
-                to_status="pending",
-                note="Resubmitted for CheckPrint",
-            )
-
-    except Exception:
-        for new_path, old_path in reversed(renames):
-            try:
-                if new_path.exists():
-                    new_path.rename(old_path)
-            except OSError:
-                pass
-        raise
 
 
 def finalize_checkprint_to_transmittal(
