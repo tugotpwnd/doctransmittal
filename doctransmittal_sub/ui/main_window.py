@@ -420,6 +420,41 @@ class MainWindow(QMainWindow):
             color: #9aa3b2;
             background: transparent;
         }}
+                /* ===== CHECKPRINT TAB TEXT COLOURS ===== */
+        QWidget#CheckPrintTab QLabel {{
+            color: {text};
+            background: transparent;
+        }}
+
+        QWidget#CheckPrintTab QGroupBox {{
+            color: {text};
+            background: transparent;
+        }}
+
+        QWidget#CheckPrintTab QListWidget {{
+            color: {text};
+            background: transparent;
+        }}
+
+        QWidget#CheckPrintTab QTreeView {{
+            color: {text};
+            background: transparent;
+        }}
+
+        QWidget#CheckPrintTab QTreeWidget {{
+            color: {text};
+            background: transparent;
+        }}
+
+        QWidget#CheckPrintTab QCheckBox {{
+            color: {text};
+            background: transparent;
+        }}
+
+        QWidget#CheckPrintTab QPushButton {{
+            color: {text};
+        }}
+
         """)
 
     def _build_brand_bar(self):

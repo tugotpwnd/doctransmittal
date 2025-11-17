@@ -1425,3 +1425,82 @@ def append_checkprint_event(
         """, (int(item_id), actor, event, from_status, to_status, note))
         con.commit(); con.close()
     _retry_write(_do)
+
+def get_active_checkprint_batch(db_path: Path):
+    con = _connect(db_path)
+    cur = con.cursor()
+    r = cur.execute("""
+        SELECT id, code, status, created_on
+          FROM checkprint_batches
+         WHERE status IN ('in_progress', 'submitted', 'awaiting_review')
+         ORDER BY id DESC
+         LIMIT 1
+    """).fetchone()
+    con.close()
+
+    if not r:
+        return None
+
+    cols = ["id", "code", "status", "created_on"]
+    return dict(zip(cols, r))
+
+def get_checkprint_batch(db_path: Path, batch_id: int):
+    """
+    Fetch a CheckPrint batch, including a CP directory reference
+    derived from the first item's cp_path.
+    Always returns a dict.
+    """
+    con = _connect(db_path)
+
+    batch_row = con.execute("""
+        SELECT id, code, status, created_on
+          FROM checkprint_batches
+         WHERE id=?
+    """, (batch_id,)).fetchone()
+
+    if not batch_row:
+        con.close()
+        return None
+
+    # Convert tuple -> dict
+    cols = ["id", "code", "status", "created_on"]
+    batch = dict(zip(cols, batch_row))
+
+    # Fetch one item's cp_path so we know where the folder is
+    item_row = con.execute("""
+        SELECT cp_path
+          FROM checkprint_items
+         WHERE batch_id=?
+         ORDER BY id ASC
+         LIMIT 1
+    """, (batch_id,)).fetchone()
+
+    con.close()
+
+    batch["cp_path"] = item_row[0] if item_row else None
+    return batch
+
+
+
+
+
+def cancel_checkprint_batch(db_path: Path, batch_id: int):
+    con = _connect(db_path)
+    cur = con.cursor()
+
+    # Mark batch cancelled
+    cur.execute("""
+        UPDATE checkprint_batches
+           SET status='cancelled'
+         WHERE id=?
+    """, (batch_id,))
+
+    # Mark items cancelled
+    cur.execute("""
+        UPDATE checkprint_items
+           SET status='cancelled'
+         WHERE batch_id=?
+    """, (batch_id,))
+
+    con.commit()
+    con.close()

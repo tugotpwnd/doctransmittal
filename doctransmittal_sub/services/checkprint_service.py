@@ -3,13 +3,15 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import shutil, re, os
+from ..core.paths import company_library_root, resolve_company_library_path
 
 try:
     from .db import (
         init_db, get_project,
         create_checkprint_batch, get_checkprint_items,
         get_latest_checkprint_versions, update_checkprint_item_status,
-        append_checkprint_event, insert_transmittal, _retry_write, _connect,
+        append_checkprint_event, insert_transmittal, _retry_write, _connect, get_active_checkprint_batch,
+        cancel_checkprint_batch, get_checkprint_batch,
 )
     from .transmittal_service import _base_folder_for_output, _default_out_root, next_transmittal_number
 except Exception:
@@ -34,23 +36,30 @@ def _checkprint_root(db_path: Path) -> Path:
 
 
 
-def _next_cp_code(cp_root: Path) -> str:
+def _next_cp_code(db_path: Path) -> str:
     """
-    Scan existing CP-TRN-### dirs under cp_root and return the next code.
+    Determine next CheckPrint code based on DB contents,
+    NOT the filesystem, to ensure uniqueness.
     """
-    pat = re.compile(r"^CP-TRN-(\d+)$", re.IGNORECASE)
-    maxn = 0
-    if cp_root.exists():
-        for p in cp_root.iterdir():
-            if not p.is_dir():
-                continue
-            m = pat.match(p.name)
-            if m:
-                try:
-                    maxn = max(maxn, int(m.group(1)))
-                except ValueError:
-                    continue
-    return f"CP-TRN-{maxn + 1:03d}"
+    con = _connect(db_path)
+    rows = con.execute("""
+        SELECT code FROM checkprint_batches
+        ORDER BY id DESC
+        LIMIT 1
+    """).fetchone()
+    con.close()
+
+    if not rows:
+        return "CP-TRN-001"
+
+    last_code = rows[0]  # e.g. 'CP-TRN-001'
+    try:
+        last_num = int(last_code.split("-")[-1])
+    except Exception:
+        last_num = 0
+
+    return f"CP-TRN-{last_num + 1:03d}"
+
 
 
 def _split_basename(name: str) -> (str, str):
@@ -106,14 +115,18 @@ def start_checkprint_batch(
     project_code = proj["project_code"]
     project_id = proj["id"]
 
+    active = get_active_checkprint_batch(db_path)
+    if active:
+        raise RuntimeError(
+            f"Cannot start a new CheckPrint: batch {active['code']} is still {active['status']}."
+        )
+
     cp_root = _checkprint_root(db_path)
-    cp_code = _next_cp_code(cp_root)
+    cp_code = _next_cp_code(db_path)
     batch_dir = cp_root / cp_code
     batch_dir.mkdir(parents=True, exist_ok=True)
 
     now = created_on_str or datetime.now().strftime("%Y-%m-%d")
-    doc_ids = [s["doc_id"] for s in items if s.get("file_path")]
-    latest_versions = get_latest_checkprint_versions(db_path, project_id, doc_ids)
 
     prepared_items: List[Dict[str, Any]] = []
     renames: List[tuple[Path, Path]] = []   # (new_path, old_path) for rollback
@@ -128,7 +141,7 @@ def start_checkprint_batch(
                 raise RuntimeError(f"Mapped file for {doc_id} does not exist:\n{src}")
 
             base_name, ext = _split_basename(src.name)
-            cp_version = latest_versions.get(doc_id, 0) + 1
+            cp_version = 1
             cp_suffix_name = f"{base_name}_CP_{cp_version}{ext}"
 
             # rename source in place
@@ -147,8 +160,8 @@ def start_checkprint_batch(
                 "cp_version": cp_version,
                 "status": "pending",
                 "submitter": user_name,
-                "source_path": str(dst_src),
-                "cp_path": str(dst_cp),
+                "source_path": str(Path(dst_src).relative_to(company_library_root())),
+                "cp_path": str(Path(dst_cp).relative_to(company_library_root())),
                 "last_submitted_on": now,
             })
 
@@ -267,7 +280,8 @@ def resubmit_checkprint_items(
                     UPDATE checkprint_items
                        SET cp_version=?, source_path=?, cp_path=?, last_submitted_on=datetime('now')
                      WHERE id=?
-                """, (cp_version, str(dst_src), str(dst_cp), int(item_id)))
+                """, (cp_version, str(Path(dst_src).relative_to(company_library_root())),
+                      str(Path(dst_cp).relative_to(company_library_root())), int(item_id)))
                 con.commit(); con.close()
             _retry_write(_do)
 
@@ -336,7 +350,8 @@ def finalize_checkprint_to_transmittal(
     renames: List[tuple[Path, Path]] = []
     try:
         for it in items:
-            src = Path(it["source_path"])
+            src = resolve_company_library_path(it["source_path"])
+            src = Path(src)
             if not src.exists():
                 raise RuntimeError(f"Source CheckPrint file missing:\n{src}")
             base, ext = _split_basename(src.name)
@@ -409,3 +424,62 @@ def finalize_checkprint_to_transmittal(
     except Exception:
         # We don't attempt rollback of the de-suffixed names here – at that point user intervention is safer.
         raise
+
+
+def cancel_checkprint(db_path: Path, batch_id: int):
+    """
+    Cancels a CheckPrint:
+      • Marks batch + items as cancelled in DB
+      • Reverts source files to original names (removes _CP_N)
+      • Renames CP folder to CANCELLED-<name>
+      • Keeps all CP files for audit/markup retention
+    """
+    from ..services.db import cancel_checkprint_batch
+
+    # --- 1. Fetch batch
+    batch = get_checkprint_batch(db_path, batch_id)
+    if batch and batch["status"] == "cancelled":
+        return True  # Already cancelled
+
+    # --- 2. Resolve CP folder
+    # cp_path in DB is relative → convert to absolute
+    cp_file_path = Path(resolve_company_library_path(batch["cp_path"]))
+    cp_dir = cp_file_path.parent
+
+    # --- 3. Revert source files (remove _CP_N only if present)
+    con = _connect(db_path)
+    cur = con.cursor()
+    items = [
+        {"id": r[0], "source_path": r[1]}
+        for r in cur.execute("""
+            SELECT id, source_path
+              FROM checkprint_items
+             WHERE batch_id=?
+        """, (batch_id,))
+    ]
+    con.close()
+
+    for it in items:
+        src_rel = it["source_path"]
+        abs_src = Path(resolve_company_library_path(src_rel))
+
+        if abs_src.exists() and "_CP_" in abs_src.name:
+            original_name = abs_src.name.split("_CP_")[0] + abs_src.suffix
+            try:
+                abs_src.rename(abs_src.with_name(original_name))
+            except Exception:
+                # Non-fatal: keep going, as it may already be reverted or read-only
+                pass
+
+    # --- 4. Rename CP folder to CANCELLED-<name>
+    cancelled_dir = cp_dir.with_name(f"CANCELLED-{cp_dir.name}")
+    try:
+        cp_dir.rename(cancelled_dir)
+    except Exception:
+        # If rename fails (folder open, permissions), still continue
+        pass
+
+    # --- 5. Mark DB entries cancelled
+    cancel_checkprint_batch(db_path, batch_id)
+
+    return True

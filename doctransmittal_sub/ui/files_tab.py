@@ -956,6 +956,19 @@ class FilesTab(QWidget):
             QMessageBox.warning(self, "Missing DB", "No database path available.")
             return
 
+        from doctransmittal_sub.services.db import get_active_checkprint_batch
+
+        active = get_active_checkprint_batch(self.db_path)
+        if active:
+            QMessageBox.warning(
+                self,
+                "Active CheckPrint exists",
+                f"You already have an active CheckPrint:\n\n"
+                f"    {active['code']} ({active['status']})\n\n"
+                "You must complete or cancel that CheckPrint before starting a new one."
+            )
+            return
+
         # Build snapshot of selected register items (same as transmittal path)
         snap = self._build_snapshot_items()
 
@@ -1046,6 +1059,14 @@ class FilesTab(QWidget):
             f"Batch Code: {cp_code or '(unknown)'}\n"
             f"Folder:\n{cp_dir}"
         )
+
+        # Refresh CheckPrint tab so the new batch appears immediately
+        try:
+            mw = self.window()  # MainWindow
+            if hasattr(mw, "checkprint_tab"):
+                mw.checkprint_tab._reload_batches()
+        except Exception as e:
+            print("Failed to refresh CheckPrint tab:", e)
 
         # Optionally refresh UI
         try:

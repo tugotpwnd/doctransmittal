@@ -13,6 +13,8 @@ except:
     from services.db import list_checkprint_batches, get_checkprint_items
     from services.checkprint_service import resubmit_checkprint_items
 
+from ..core.paths import resolve_company_library_path, company_library_root
+
 
 class CheckPrintTab(QWidget):
     """
@@ -33,6 +35,7 @@ class CheckPrintTab(QWidget):
         self.db_path: Path | None = None
         self.project_id: int | None = None
         self.current_batch_id: int | None = None
+        self.setObjectName("CheckPrintTab")
 
         root = QVBoxLayout(self)
 
@@ -69,6 +72,10 @@ class CheckPrintTab(QWidget):
         self.btn_resubmit = QPushButton("Resubmit Selected File…")
         self.btn_resubmit.clicked.connect(self._resubmit_selected)
         sv.addWidget(self.btn_resubmit)
+
+        self.btn_cancel = QPushButton("Cancel This CheckPrint")
+        self.btn_cancel.clicked.connect(self._cancel_checkprint)
+        sv.addWidget(self.btn_cancel)
 
         root.addWidget(self.box_submitter)
 
@@ -109,8 +116,27 @@ class CheckPrintTab(QWidget):
     def _enter_submitter_mode(self):
         if not self.current_batch_id:
             return
+
+        # Fetch batch metadata
+        from ..services.db import get_checkprint_batch
+        batch = get_checkprint_batch(self.db_path, self.current_batch_id)
+
+        # Prevent editing cancelled batches
+        if batch and batch["status"] == "cancelled":
+            QMessageBox.information(
+                self,
+                "CheckPrint Cancelled",
+                "This CheckPrint has already been cancelled and cannot be edited."
+            )
+            self.box_submitter.setVisible(False)
+            return
+
+        # Show submitter UI
         self.box_submitter.setVisible(True)
         self._load_items_for_submitter()
+
+        # Only allow Cancel if batch is active
+        self.btn_cancel.setEnabled(batch["status"] != "cancelled")
 
     def _load_items_for_submitter(self):
         self.list_items.clear()
@@ -205,7 +231,7 @@ class CheckPrintTab(QWidget):
         doc_id       = it["doc_id"]
         revision     = it.get("revision") or ""
         cp_version   = it["cp_version"]
-        old_cp_path  = Path(it["cp_path"])
+        old_cp_path = Path(resolve_company_library_path(it["cp_path"]))
         cp_dir       = old_cp_path.parent
         ext          = new_file.suffix
 
@@ -246,6 +272,48 @@ class CheckPrintTab(QWidget):
                        cp_path=?,
                        last_submitted_on=datetime('now')
                  WHERE id=?
-            """, (str(new_cp_path), str(new_cp_path), it["id"]))
+            """, (str(Path(new_cp_path).relative_to(company_library_root())),
+                            str(Path(new_cp_path).relative_to(company_library_root())),
+                            it["id"]))
             con.commit(); con.close()
         _retry_write(_do)
+
+    def _cancel_checkprint(self):
+        if not self.current_batch_id:
+            return
+
+        r = QMessageBox.question(
+            self,
+            "Cancel CheckPrint?",
+            (
+                "<html>"
+                "Are you sure you want to cancel this CheckPrint?<br><br>"
+                "• All items will be marked as cancelled<br>"
+                "• Source files will revert to original names<br>"
+                "• The CheckPrint folder will be archived as CANCELLED-&lt;name&gt;<br>"
+                "• You may start a new CheckPrint immediately afterwards<br><br>"
+                "<span style='color:red; font-weight:bold;'>This process cannot be undone.</span>"
+                "</html>"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if r != QMessageBox.Yes:
+            return
+
+        try:
+            from ..services.checkprint_service import cancel_checkprint
+            cancel_checkprint(self.db_path, self.current_batch_id)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to cancel CheckPrint:\n{e}")
+            return
+
+        QMessageBox.information(
+            self,
+            "CheckPrint Cancelled",
+            "The CheckPrint has been cancelled and archived."
+        )
+
+        self.box_submitter.setVisible(False)
+        self._reload_batches()

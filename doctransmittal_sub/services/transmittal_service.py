@@ -109,49 +109,6 @@ def _checkprint_root(db_path: Path) -> Path:
     return root
 
 
-def reserve_transmittal_for_checkprint(
-    db_path: Path,
-    out_root: Optional[Path] = None,
-) -> tuple[str, Path, Path]:
-    """
-    Reserves the next transmittal number for a CheckPrint session.
-
-    - Chooses the next transmittal number using the existing Transmittals folder.
-    - Creates a placeholder folder:
-          <Doc Control>/Transmittals/<transmittal_number>
-      so that number is "burnt" and later calls will move to the next TRN.
-    - Creates a CheckPrint folder:
-          <Doc Control>/CheckPrint/CP-<transmittal_number>
-
-    Returns:
-        (transmittal_number, checkprint_dir, transmittal_dir)
-    """
-    init_db(db_path)
-    proj = get_project(db_path)
-    if not proj:
-        raise RuntimeError("Project metadata not set in DB.")
-    project_code = proj["project_code"]
-
-    # Normal transmittal root (e.g. <Doc Control>/Transmittals)
-    trans_root = out_root or _default_out_root(db_path)
-    trans_root.mkdir(parents=True, exist_ok=True)
-
-    # Get the next project_code-TRN-00N
-    transmittal_number = next_transmittal_number(project_code, trans_root)
-
-    # Placeholder transmittal folder so the number is reserved
-    trans_dir = trans_root / transmittal_number
-    trans_dir.mkdir(parents=True, exist_ok=True)
-
-    # CheckPrint root and folder: <Doc Control>/CheckPrint/CP-<TRN>
-    cp_root = _checkprint_root(db_path)
-    cp_dir = cp_root / f"CP-{transmittal_number}"
-    cp_dir.mkdir(parents=True, exist_ok=True)
-
-    return transmittal_number, cp_dir, trans_dir
-
-
-
 # ---------------- core flows ----------------
 
 def create_transmittal(
