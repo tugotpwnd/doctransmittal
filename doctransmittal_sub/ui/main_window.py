@@ -1329,3 +1329,27 @@ class MainWindow(QMainWindow):
 
         # Now load the DB we just created
         self._apply_db_path(p)
+
+# ======== APPLICATION ENTRY POINT FOR PYINSTALLER ========
+
+def main_window_entry():
+    """
+    Launches the full application when running from PyInstaller.
+    Mirrors doctransmittal_sub.app.run(), but avoids relative import issues.
+    """
+    import sys
+    from PyQt5.QtWidgets import QApplication
+    from doctransmittal_sub.core.settings import SettingsManager
+
+    # Create Qt application
+    app = QApplication(sys.argv)
+
+    # Settings manager
+    settings = SettingsManager()
+
+    # Create and show main window
+    win = MainWindow(settings)
+    win.show()
+
+    # Start event loop
+    sys.exit(app.exec_())

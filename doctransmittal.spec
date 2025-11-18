@@ -1,31 +1,69 @@
-# -*- mode: python ; coding: utf-8 -*-
+# doctransmittal.spec
 
+import sys
 from PyInstaller.utils.hooks import collect_submodules, collect_data_files
+from PyInstaller.building.build_main import Analysis, PYZ, EXE, COLLECT
 
-block_cipher = None
+# -------------------------------------------------------------------
+# PACKAGES THAT MUST BE INCLUDED
+# -------------------------------------------------------------------
 
-# Collect all modules inside the doctransmittal_sub package
-hiddenimports = collect_submodules('doctransmittal_sub')
+hidden = collect_submodules("doctransmittal_sub")
 
-# Collect resources (png, ico, jpeg, templates, etc.)
-datas = collect_data_files('doctransmittal_sub')
+datas = []
+# include non-Python files inside doctransmittal_sub/resources
+datas += collect_data_files("doctransmittal_sub", includes=["resources/*"])
 
-a = Analysis(
-    ['launch.py'],
-    pathex=['.'],
-    binaries=[],
-    datas=datas,
-    hiddenimports=hiddenimports,
-    hookspath=[],
-    hooksconfig={},
-    runtime_hooks=[],
-    excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher
+
+# -------------------------------------------------------------------
+# 🔥 ADD THIS BLOCK (Qt platform plugins & support files)
+# -------------------------------------------------------------------
+# Ensures PyQt5 loads properly in the built EXE (fixes blank window / no UI)
+
+qt_platforms = collect_data_files(
+    "PyQt5",
+    includes=["Qt/plugins/platforms/*"]
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+qt_svg = collect_data_files(
+    "PyQt5",
+    includes=["Qt/plugins/iconengines/*"]
+)
+
+qt_styles = collect_data_files(
+    "PyQt5",
+    includes=["Qt/plugins/styles/*"]
+)
+
+datas += qt_platforms + qt_svg + qt_styles
+# -------------------------------------------------------------------
+
+
+# -------------------------------------------------------------------
+# ANALYSIS
+# -------------------------------------------------------------------
+
+a = Analysis(
+    ["launch.py"],              # ENTRY POINT
+    pathex=["."],
+    binaries=[],
+    datas=datas,
+    hiddenimports=hidden + [
+        "PyQt5.QtGui",
+        "PyQt5.QtWidgets",
+        "PyQt5.QtCore",
+        "PyQt5.QtPrintSupport",
+        "PyQt5.QtSvg",
+    ],
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=[],
+    noarchive=False,
+)
+
+# -------------------------------------------------------------------
+
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
@@ -33,11 +71,11 @@ exe = EXE(
     a.binaries,
     a.zipfiles,
     a.datas,
-    debug=False,
+    name="DocumentTransmittal",
+    debug=True,        # change to True if you want console logging
     strip=False,
     upx=False,
-    console=False,
-    name='DocumentTransmittal'
+    console=True,      # temporarily set to True to see errors
 )
 
 coll = COLLECT(
@@ -47,5 +85,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name='DocumentTransmittal'
+    name="DocumentTransmittal",
 )
