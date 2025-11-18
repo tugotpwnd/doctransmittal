@@ -199,39 +199,6 @@ class FilesTab(QWidget):
         # ===== UI =====
         root = QVBoxLayout(self)
 
-        # Top nav row
-        nav = QHBoxLayout()
-        self.btn_back = QPushButton("◀ Back", self)
-        self.btn_back.clicked.connect(lambda: self.backRequested.emit())
-        nav.addWidget(self.btn_back)
-
-        nav.addStretch(1)
-        nav.addWidget(QLabel("Submission date:", self))
-        self.le_date = QLineEdit(self)
-        self.le_date.setPlaceholderText("DD/MM/YYYY or DD/MM/YYYY HH:MM")
-        self.le_date.setFixedWidth(180)
-        nav.addWidget(self.le_date)
-
-        # --- NEW: split Proceed button with CheckPrint option ---
-        self.btn_proceed = QToolButton(self)
-        self.btn_proceed.setText("Proceed: Build Transmittal ▶")
-        self.btn_proceed.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.btn_proceed.setPopupMode(QToolButton.MenuButtonPopup)
-
-        menu = QMenu(self.btn_proceed)
-        act_build = menu.addAction("Build Transmittal Now (legacy)")
-        act_cp = menu.addAction("Submit for CheckPrint…")
-
-        act_build.triggered.connect(self._proceed_build_transmittal)
-        act_cp.triggered.connect(self._proceed_submit_checkprint)
-
-        self.btn_proceed.setMenu(menu)
-        # Default click still builds a transmittal as before
-        self.btn_proceed.clicked.connect(self._proceed_build_transmittal)
-
-        nav.addWidget(self.btn_proceed)
-        root.addLayout(nav)
-
         # Middle area: splitter L/M/R
         splitter = QSplitter(Qt.Horizontal, self)
 
@@ -309,6 +276,57 @@ class FilesTab(QWidget):
         splitter.addWidget(right_box)
 
         root.addWidget(splitter, 1)
+
+        # === Bottom navigation bar (moved from top) ===
+        bottom_nav = QHBoxLayout()
+        bottom_nav.setSpacing(12)
+        bottom_nav.setContentsMargins(4, 4, 4, 4)
+
+        # Back button
+        self.btn_back = QPushButton("◀ Back", self)
+        self.btn_back.setFixedHeight(32)
+        bottom_nav.addWidget(self.btn_back)
+        self.btn_back.clicked.connect(lambda: self.backRequested.emit())
+
+        bottom_nav.addStretch(1)
+
+        # Date label + field
+        bottom_nav.addWidget(QLabel("Submission date:", self))
+
+        self.le_date = QLineEdit(self)
+        self.le_date.setPlaceholderText("DD/MM/YYYY or DD/MM/YYYY HH:MM")
+        self.le_date.setFixedWidth(200)
+        self.le_date.setMinimumWidth(180)
+        self.le_date.setFixedHeight(32)
+        bottom_nav.addWidget(self.le_date)
+
+        # Buttons
+        self.btn_build_trans = QPushButton("Build Transmittal", self)
+        self.btn_submit_cp = QPushButton("Submit for CheckPrint", self)
+
+        self.btn_build_trans.setFixedHeight(32)
+        self.btn_submit_cp.setFixedHeight(32)
+
+        # Confirmation wrapper
+        def _confirm_build_transmittal():
+            r = QMessageBox.question(
+                self,
+                "Build Transmittal?",
+                "This will move all mapped files and create a transmittal.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if r == QMessageBox.Yes:
+                self._proceed_build_transmittal()
+
+        self.btn_build_trans.clicked.connect(_confirm_build_transmittal)
+        self.btn_submit_cp.clicked.connect(self._proceed_submit_checkprint)
+
+        bottom_nav.addWidget(self.btn_build_trans)
+        bottom_nav.addWidget(self.btn_submit_cp)
+
+        # Add bottom nav to root
+        root.addLayout(bottom_nav)
 
         # Reset tree to its root
         try:
@@ -1068,8 +1086,5 @@ class FilesTab(QWidget):
         except Exception as e:
             print("Failed to refresh CheckPrint tab:", e)
 
-        # Optionally refresh UI
-        try:
-            self.refresh()
-        except Exception:
-            pass
+        self.checkprintStarted.emit(cp_code, cp_dir)
+

@@ -1,9 +1,25 @@
 from __future__ import annotations
+
+import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import shutil, re, os
 from ..core.paths import company_library_root, resolve_company_library_path
+from ..core.settings import SettingsManager
+
+from ..core.paths import company_library_root, resolve_company_library_path
+from ..core.settings import SettingsManager
+
+from .file_safety import (
+    plan_copy,
+    plan_rename,
+    plan_delete,
+    preflight_ops,
+    execute_ops,
+    PreflightError,
+)
+
 
 try:
     from .db import (
@@ -202,12 +218,101 @@ def start_checkprint_batch(
             except OSError:
                 pass
         raise
+
 from pathlib import Path
 from typing import Dict
 from datetime import datetime
 import shutil
 from ..core.paths import company_library_root, resolve_company_library_path
 from .db import get_checkprint_items, append_checkprint_event, _retry_write, _connect, init_db
+
+def _plan_checkprint_update_ops(
+    item: Dict[str, Any],
+    new_file: Path,
+    *,
+    mode: str,  # "overwrite" or "increment"
+) -> tuple[list, Dict[str, Any]]:
+    """
+    Build the list of FileOps needed to update a single CheckPrint item,
+    without touching the filesystem yet.
+
+    Returns:
+        (ops, meta)
+        ops  = list of FileOp objects
+        meta = {
+            "new_src_abs": Path,
+            "new_cp_abs": Path,
+            "new_version": int,
+            "old_status": str,
+            "new_status": str,
+        }
+    """
+    new_file = Path(new_file)
+    if not new_file.exists():
+        raise RuntimeError(f"Replacement file not found:\n{new_file}")
+
+    old_cp_abs = Path(resolve_company_library_path(item["cp_path"]))
+    old_src_abs = Path(resolve_company_library_path(item["source_path"]))
+
+    ops = []
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    current_version = int(item.get("cp_version") or 1)
+
+    if mode == "overwrite":
+        new_version = current_version
+
+        # Supersede old CP file
+        if old_cp_abs.exists():
+            superseded_dir = old_cp_abs.parent / "superseded"
+            superseded_dir.mkdir(parents=True, exist_ok=True)
+            superseded_name = f"{old_cp_abs.stem}_SUPERSEDED_{ts}{old_cp_abs.suffix}"
+            superseded_path = superseded_dir / superseded_name
+            ops.append(plan_rename(old_cp_abs, superseded_path))
+
+        # Remove old source
+        if old_src_abs.exists():
+            ops.append(plan_delete(old_src_abs))
+
+    elif mode == "increment":
+        new_version = current_version + 1
+
+        # Only remove old source; keep old CP_N in place
+        if old_src_abs.exists():
+            ops.append(plan_delete(old_src_abs))
+    else:
+        raise ValueError(f"Unknown CheckPrint update mode: {mode}")
+
+    # Build new filename: <doc>[_<rev>]_CP_<version><ext>
+    doc_id = item["doc_id"]
+    rev = item.get("revision") or ""
+    base = f"{doc_id}_{rev}" if rev else doc_id
+    new_name = f"{base}_CP_{new_version}{new_file.suffix}"
+
+    new_cp_abs = old_cp_abs.parent / new_name
+    new_src_abs = old_src_abs.parent / new_name
+
+    # Ensure parents exist (safe before preflight)
+    new_cp_abs.parent.mkdir(parents=True, exist_ok=True)
+    new_src_abs.parent.mkdir(parents=True, exist_ok=True)
+
+    # Copy new file into both locations
+    ops.append(plan_copy(new_file, new_src_abs))
+    ops.append(plan_copy(new_file, new_cp_abs))
+
+    old_status = item.get("status") or "pending"
+    # Any resubmission returns to 'pending' in increment mode; overwrite keeps status
+    new_status = "pending" if mode == "increment" else old_status
+
+    meta = {
+        "new_src_abs": new_src_abs,
+        "new_cp_abs": new_cp_abs,
+        "new_version": new_version,
+        "old_status": old_status,
+        "new_status": new_status,
+    }
+    return ops, meta
+
 
 
 def _apply_checkprint_update(
@@ -223,83 +328,42 @@ def _apply_checkprint_update(
 
     mode = "overwrite"  → pending: overwrite same CP version
     mode = "increment"  → accepted/rejected: create new CP version
+
+    This version is file-safe:
+      - Preflight all ops first
+      - Execute all file ops
+      - Only then touch the DB
     """
     db_path = Path(db_path)
     new_file = Path(new_file)
 
-    if not new_file.exists():
-        raise RuntimeError(f"Replacement file not found:\n{new_file}")
+    # Plan all file operations for this item
+    ops, meta = _plan_checkprint_update_ops(item, new_file, mode=mode)
 
-    # Resolve current CP / source paths
-    old_cp_abs = Path(resolve_company_library_path(item["cp_path"]))
-    old_src_abs = Path(resolve_company_library_path(item["source_path"]))
+    # Preflight – fail fast, no changes yet
+    ok, bad_path, reason = preflight_ops(ops)
+    if not ok:
+        raise PreflightError(bad_path, reason or "File operation preflight failed.")
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    now_date = datetime.now().strftime("%Y-%m-%d")
+    # Execute all ops (best-effort rollback on error)
+    execute_ops(ops)
 
-    current_version = int(item.get("cp_version") or 1)
+    # Compute new relative paths
+    new_src_abs = meta["new_src_abs"]
+    new_cp_abs = meta["new_cp_abs"]
+    new_version = meta["new_version"]
+    old_status = meta["old_status"]
+    new_status = meta["new_status"]
 
-    if mode == "overwrite":
-        # PENDING: overwrite same CP version
-        new_version = current_version
-
-        # Supersede *CP* file with timestamp
-        superseded_dir = old_cp_abs.parent / "superseded"
-        superseded_dir.mkdir(exist_ok=True)
-        if old_cp_abs.exists():
-            superseded_name = f"{old_cp_abs.stem}_SUPERSEDED_{ts}{old_cp_abs.suffix}"
-            old_cp_abs.rename(superseded_dir / superseded_name)
-
-        # Remove old source file (we only care about keeping current)
-        if old_src_abs.exists():
-            try:
-                old_src_abs.unlink()
-            except Exception:
-                pass
-
-    elif mode == "increment":
-        # ACCEPTED / REJECTED: create new CP version
-        new_version = current_version + 1
-
-        # Do NOT touch the old CP_N – keep it in place
-        # Only old source file is removed
-        if old_src_abs.exists():
-            try:
-                old_src_abs.unlink()
-            except Exception:
-                pass
-
-    else:
-        raise ValueError(f"Unknown CheckPrint update mode: {mode}")
-
-    # Build new filename: <doc>[_<rev>]_CP_<version><ext>
-    doc_id = item["doc_id"]
-    rev = item.get("revision") or ""
-    base = f"{doc_id}_{rev}" if rev else doc_id
-    new_name = f"{base}_CP_{new_version}{new_file.suffix}"
-
-    new_cp_abs = old_cp_abs.parent / new_name
-    new_src_abs = old_src_abs.parent / new_name
-
-    # Copy new file into both locations
-    new_cp_abs.parent.mkdir(parents=True, exist_ok=True)
-    new_src_abs.parent.mkdir(parents=True, exist_ok=True)
-
-    shutil.copy2(str(new_file), str(new_src_abs))
-    shutil.copy2(str(new_file), str(new_cp_abs))
-
-    # DB paths relative to company library root
     rel_src = str(new_src_abs.relative_to(company_library_root()))
     rel_cp = str(new_cp_abs.relative_to(company_library_root()))
-
-    old_status = item.get("status") or "pending"
-    new_status = "pending"  # any resubmission returns to pending
+    now_date = datetime.now().strftime("%Y-%m-%d")
 
     def _do():
         con = _connect(db_path)
         cur = con.cursor()
         if mode == "overwrite":
-            # CP version unchanged, status already pending
+            # CP version unchanged, status unchanged
             cur.execute("""
                 UPDATE checkprint_items
                    SET source_path=?,
@@ -340,6 +404,7 @@ def _apply_checkprint_update(
     )
 
 
+
 def overwrite_checkprint_items(
     db_path: Path,
     *,
@@ -348,10 +413,13 @@ def overwrite_checkprint_items(
     submitter: str,
 ) -> bool:
     """
-    Pending case:
+    Pending case (batch-safe):
         • Overwrite same CP version
         • Supersede old CP file with timestamp
         • Replace source + CP with new file
+
+    Atomic across the batch:
+        - If any file op cannot proceed, nothing is changed.
     """
     db_path = Path(db_path)
     init_db(db_path)
@@ -359,16 +427,69 @@ def overwrite_checkprint_items(
     items = get_checkprint_items(db_path, batch_id)
     items_by_id = {int(it["id"]): it for it in items}
 
+    all_ops = []
+    per_item_meta: Dict[int, Dict[str, Any]] = {}
+    now_date = datetime.now().strftime("%Y-%m-%d")
+
+    # 1) Plan ops for all items
     for item_id, new_path in item_id_to_new_path.items():
         it = items_by_id.get(int(item_id))
         if not it:
             continue
-        _apply_checkprint_update(
+        ops, meta = _plan_checkprint_update_ops(it, Path(new_path), mode="overwrite")
+        all_ops.extend(ops)
+        per_item_meta[int(item_id)] = meta
+
+    if not all_ops:
+        return True  # nothing to do
+
+    # 2) Preflight entire batch
+    ok, bad_path, reason = preflight_ops(all_ops)
+    if not ok:
+        raise PreflightError(bad_path, reason or "File operation preflight failed.")
+
+    # 3) Execute all file ops
+    execute_ops(all_ops)
+
+    # 4) DB updates + events
+    for item_id, new_path in item_id_to_new_path.items():
+        it = items_by_id.get(int(item_id))
+        if not it or item_id not in per_item_meta:
+            continue
+
+        meta = per_item_meta[item_id]
+        new_src_abs = meta["new_src_abs"]
+        new_cp_abs = meta["new_cp_abs"]
+        old_status = meta["old_status"]
+        new_status = meta["new_status"]  # same as old_status here
+
+        rel_src = str(new_src_abs.relative_to(company_library_root()))
+        rel_cp = str(new_cp_abs.relative_to(company_library_root()))
+
+        def _do():
+            con = _connect(db_path)
+            cur = con.cursor()
+            cur.execute("""
+                UPDATE checkprint_items
+                   SET source_path=?,
+                       cp_path=?,
+                       submitter=?,
+                       last_submitted_on=?
+                 WHERE id=?
+            """, (rel_src, rel_cp, submitter, now_date, int(it["id"])))
+            con.commit()
+            con.close()
+
+        _retry_write(_do)
+
+        append_checkprint_event(
             db_path,
-            item=it,
-            new_file=Path(new_path),
-            submitter=submitter,
-            mode="overwrite",
+            item_id=int(it["id"]),
+            actor=submitter,
+            event="resubmitted",
+            from_status=old_status,
+            to_status=new_status,
+            note="Document resubmitted by submitter",
         )
 
     return True
@@ -382,11 +503,13 @@ def resubmit_checkprint_items(
     submitter: str,
 ) -> bool:
     """
-    Accepted / rejected case:
+    Accepted / rejected case (batch-safe):
         • Increment CP version
         • Keep old CP_N in place (no supersede)
         • Replace source file with new version
         • New CP_N+1 created
+
+    Atomic across the batch.
     """
     db_path = Path(db_path)
     init_db(db_path)
@@ -394,23 +517,78 @@ def resubmit_checkprint_items(
     items = get_checkprint_items(db_path, batch_id)
     items_by_id = {int(it["id"]): it for it in items}
 
+    all_ops = []
+    per_item_meta: Dict[int, Dict[str, Any]] = {}
+    now_date = datetime.now().strftime("%Y-%m-%d")
+
+    # 1) Plan ops for all items
     for item_id, new_path in item_id_to_new_path.items():
         it = items_by_id.get(int(item_id))
         if not it:
             continue
-        _apply_checkprint_update(
+        ops, meta = _plan_checkprint_update_ops(it, Path(new_path), mode="increment")
+        all_ops.extend(ops)
+        per_item_meta[int(item_id)] = meta
+
+    if not all_ops:
+        return True  # nothing to do
+
+    # 2) Preflight entire batch
+    ok, bad_path, reason = preflight_ops(all_ops)
+    if not ok:
+        raise PreflightError(bad_path, reason or "File operation preflight failed.")
+
+    # 3) Execute all file ops
+    execute_ops(all_ops)
+
+    # 4) DB updates + events
+    for item_id, new_path in item_id_to_new_path.items():
+        it = items_by_id.get(int(item_id))
+        if not it or item_id not in per_item_meta:
+            continue
+
+        meta = per_item_meta[item_id]
+        new_src_abs = meta["new_src_abs"]
+        new_cp_abs = meta["new_cp_abs"]
+        new_version = meta["new_version"]
+        old_status = meta["old_status"]
+        new_status = meta["new_status"]  # "pending"
+
+        rel_src = str(new_src_abs.relative_to(company_library_root()))
+        rel_cp = str(new_cp_abs.relative_to(company_library_root()))
+
+        def _do():
+            con = _connect(db_path)
+            cur = con.cursor()
+            cur.execute("""
+                UPDATE checkprint_items
+                   SET source_path=?,
+                       cp_path=?,
+                       submitter=?,
+                       cp_version=?,
+                       status=?,
+                       reviewer=NULL,
+                       last_reviewer_note=NULL,
+                       last_submitted_on=?
+                 WHERE id=?
+            """, (rel_src, rel_cp, submitter,
+                  new_version, new_status, now_date, int(it["id"])))
+            con.commit()
+            con.close()
+
+        _retry_write(_do)
+
+        append_checkprint_event(
             db_path,
-            item=it,
-            new_file=Path(new_path),
-            submitter=submitter,
-            mode="increment",
+            item_id=int(it["id"]),
+            actor=submitter,
+            event="resubmitted",
+            from_status=old_status,
+            to_status=new_status,
+            note="Document resubmitted by submitter",
         )
 
     return True
-
-
-
-
 
 def finalize_checkprint_to_transmittal(
     db_path: Path,
@@ -420,173 +598,258 @@ def finalize_checkprint_to_transmittal(
     out_root: Optional[Path] = None,
 ) -> Path:
     """
-    For reviewer: once ALL docs in a batch are accepted, build the actual transmittal.
+    FINALIZED WORKFLOW — FILE-SAFE VERSION
 
-    - Renames source files back to their original base names (drop _CP_N).
-    - Allocates next transmittal number.
-    - Inserts transmittal header/items into DB.
-    - Copies final PDFs into Transmittals/<PROJECT>-TRN-###/Files.
-    Returns the transmittal directory path.
+    ✔ Uses CP file as final approved file
+    ✔ Removes _CP_N suffix for both source & transmittal
+    ✔ Replaces source file with the approved version
+    ✔ Copies final files into Transmittals/<TRN>/Files
+    ✔ Preflights ALL file operations before touching DB
     """
     db_path = Path(db_path)
     init_db(db_path)
+
     proj = get_project(db_path)
     if not proj:
         raise RuntimeError("Project metadata not set in DB.")
     project_code = proj["project_code"]
 
-    # Load batch + items
+    username = SettingsManager().get("user", "Maxwell Industries")
+
+    # --- Load batch ----
     con = _connect(db_path)
-    batch_row = con.execute("""
+    batch = con.execute("""
         SELECT id, project_id, code, title, client, created_by, created_on, status
-          FROM checkprint_batches WHERE id=?
+        FROM checkprint_batches
+        WHERE id=?
     """, (int(batch_id),)).fetchone()
     con.close()
-    if not batch_row:
-        raise RuntimeError("CheckPrint batch not found.")
-    _, project_id, code, title, client, created_by, created_on, status = batch_row
 
+    if not batch:
+        raise RuntimeError("CheckPrint batch not found.")
+
+    (_, project_id, code, title, client,
+     created_by, created_on, status) = batch
+
+    # --- Load items ----
     items = get_checkprint_items(db_path, batch_id)
     if not items:
         raise RuntimeError("No items in CheckPrint batch.")
 
-    if any(it["status"] != "accepted" for it in items):
-        raise RuntimeError("All documents must be accepted before creating the transmittal.")
+    # Must ALL be accepted
+    if any((it.get("status") or "").lower() != "accepted" for it in items):
+        raise RuntimeError("All documents must be accepted before finalizing.")
 
-    # rename sources back (drop _CP_N)
-    renames: List[tuple[Path, Path]] = []
-    try:
-        for it in items:
-            src = resolve_company_library_path(it["source_path"])
-            src = Path(src)
-            if not src.exists():
-                raise RuntimeError(f"Source CheckPrint file missing:\n{src}")
-            base, ext = _split_basename(src.name)
-            # base is original stem, so final name is base + ext
-            final_name = base + Path(it["base_name"]).suffix
-            dst = src.with_name(final_name)
-            if dst.exists() and dst != src:
-                # gently clobber: rename existing to *_pre_cp if needed
-                backup = dst.with_name(dst.stem + "_pre_cp" + dst.suffix)
-                dst.rename(backup)
-            _safe_rename(src, dst)
-            renames.append((dst, src))  # record for info; we don't roll back on success
+    # --- Prepare output root & TRN folder ----
+    out_root = out_root or _default_out_root(db_path)
+    out_root.mkdir(parents=True, exist_ok=True)
 
-        # Now create the transmittal using current (de-suffixed) sources
-        out_root = out_root or _default_out_root(db_path)
-        out_root.mkdir(parents=True, exist_ok=True)
+    number = next_transmittal_number(project_code, out_root)
 
-        number = next_transmittal_number(project_code, out_root)
-        header = {
-            "project_code": project_code,
-            "number": number,
-            "title": title,
-            "client": client,
-            "created_by": reviewer or created_by,
-            "created_on": created_on,
-        }
+    trn_dir = out_root / f"{project_code}-TRN-{int(number.split('-')[-1]):03d}"
+    files_dir = trn_dir / "Files"
+    receipt_dir = trn_dir / "Receipt"
+    files_dir.mkdir(parents=True, exist_ok=True)
+    receipt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build items list for insert_transmittal
-        trans_items: List[Dict[str, Any]] = []
-        for it in items:
-            src_cp = Path(it["source_path"])
-            base, ext = _split_basename(src_cp.name)
-            final_name = base + Path(it["base_name"]).suffix
-            final_src = src_cp.with_name(final_name)
-            trans_items.append({
-                "doc_id": it["doc_id"],
-                "doc_type": "",  # will be filled from live register snapshot
-                "revision": it.get("revision") or "",
-                "file_path": str(final_src),
-            })
+    if isinstance(created_on, dict):
+        created_on_str = created_on.get("date", "")
+    else:
+        created_on_str = created_on
 
-        tid = insert_transmittal(db_path, header, trans_items)
+    username = SettingsManager().get("user.name", "")
+    if not isinstance(username, str):
+        username = str(username)
 
-        # Create transmittal folder structure and copy files
-        trans_dir = out_root / f"{project_code}-TRN-{int(number.split('-')[-1]):03d}"
-        files_dir = trans_dir / "Files"
-        files_dir.mkdir(parents=True, exist_ok=True)
+    # --- Header for DB + receipt ----
+    header = {
+        "project_code": project_code,
+        "number": number,
+        "title": title,
+        "client": proj.get("client_company", ""),
+        "end_user": proj.get("end_user", ""),
+        "created_by": username,
+        "created_on": created_on_str,
+    }
 
-        for it in trans_items:
-            src = Path(it["file_path"])
-            dst = files_dir / src.name
-            shutil.copy2(str(src), str(dst))
-
-        # mark batch completed
-        def _do():
-            con = _connect(db_path); cur = con.cursor()
-            cur.execute("""
-                UPDATE checkprint_batches
-                   SET status='completed',
-                       submitted_on=datetime('now'),
-                       reviewer=?,
-                       reviewer_notes=COALESCE(reviewer_notes,'')
-                 WHERE id=?
-            """, (reviewer or created_by, int(batch_id)))
-            con.commit(); con.close()
-        _retry_write(_do)
-
-        return trans_dir
-
-    except Exception:
-        # We don't attempt rollback of the de-suffixed names here – at that point user intervention is safer.
-        raise
-
-
-def cancel_checkprint(db_path: Path, batch_id: int):
-    """
-    Cancels a CheckPrint:
-      • Marks batch + items as cancelled in DB
-      • Reverts source files to original names (removes _CP_N)
-      • Renames CP folder to CANCELLED-<name>
-      • Keeps all CP files for audit/markup retention
-    """
-    from ..services.db import cancel_checkprint_batch
-
-    # --- 1. Fetch batch
-    batch = get_checkprint_batch(db_path, batch_id)
-    if batch and batch["status"] == "cancelled":
-        return True  # Already cancelled
-
-    # --- 2. Resolve CP folder
-    # cp_path in DB is relative → convert to absolute
-    cp_file_path = Path(resolve_company_library_path(batch["cp_path"]))
-    cp_dir = cp_file_path.parent
-
-    # --- 3. Revert source files (remove _CP_N only if present)
-    con = _connect(db_path)
-    cur = con.cursor()
-    items = [
-        {"id": r[0], "source_path": r[1]}
-        for r in cur.execute("""
-            SELECT id, source_path
-              FROM checkprint_items
-             WHERE batch_id=?
-        """, (batch_id,))
-    ]
-    con.close()
+    # --- Plan all file operations & build trans_items ----
+    all_ops = []
+    trans_items: List[Dict[str, Any]] = []
 
     for it in items:
-        src_rel = it["source_path"]
-        abs_src = Path(resolve_company_library_path(src_rel))
+        rel_cp = it["cp_path"]
+        cp_abs = Path(resolve_company_library_path(rel_cp))
+        if not cp_abs.exists():
+            raise RuntimeError(f"Approved CP file missing:\n{cp_abs}")
 
-        if abs_src.exists() and "_CP_" in abs_src.name:
-            original_name = abs_src.name.split("_CP_")[0] + abs_src.suffix
-            try:
-                abs_src.rename(abs_src.with_name(original_name))
-            except Exception:
-                # Non-fatal: keep going, as it may already be reverted or read-only
-                pass
+        # final name in source dir (no _CP_N)
+        base, ext = _split_basename(cp_abs.name)
+        final_name = base + ext
 
-    # --- 4. Rename CP folder to CANCELLED-<name>
-    cancelled_dir = cp_dir.with_name(f"CANCELLED-{cp_dir.name}")
-    try:
-        cp_dir.rename(cancelled_dir)
-    except Exception:
-        # If rename fails (folder open, permissions), still continue
-        pass
+        rel_source = it["source_path"]
+        src_abs = Path(resolve_company_library_path(rel_source))
+        src_final = src_abs.with_name(final_name)
 
-    # --- 5. Mark DB entries cancelled
-    cancel_checkprint_batch(db_path, batch_id)
+        # 1) Copy CP → final source filename (this file WILL exist after ops run)
+        all_ops.append(plan_copy(cp_abs, src_final))
+
+        # 2) Copy final source → TRN Files (this is allowed because src_final will be created)
+        dst_trn = files_dir / src_final.name
+        all_ops.append(plan_copy(cp_abs, dst_trn))  # <-- IMPORTANT: cp_abs is the real source
+
+        # 3) Delete old CP_N variants AFTER we know the new file will exist
+        src_dir = src_abs.parent
+        base_no_cp = base
+        try:
+            for f in src_dir.iterdir():
+                fn = f.name
+                if fn.startswith(base_no_cp + "_CP_"):
+                    all_ops.append(plan_delete(f))
+        except Exception:
+            pass
+
+        # 4) Record final source path for transmittal DB entry
+        trans_items.append({
+            "doc_id": it["doc_id"],
+            "doc_type": "",
+            "revision": it.get("revision") or "",
+            "file_path": str(src_final),
+        })
+
+    if not all_ops:
+        raise RuntimeError("No file operations planned for finalization.")
+
+    # --- Preflight entire set of operations ----
+    ok, bad_path, reason = preflight_ops(all_ops)
+    if not ok:
+        raise PreflightError(bad_path, reason or "File operation preflight failed.")
+
+    # --- Execute all file ops ----
+    execute_ops(all_ops)
+
+    # --- Insert transmittal into DB ----
+    # Normalize all header fields into strings (bulletproof)
+    for k, v in header.items():
+        if isinstance(v, dict):
+            header[k] = json.dumps(v)  # or v.get("name", "") for created_by
+        elif v is None:
+            header[k] = ""
+        else:
+            header[k] = str(v)
+
+    tid = insert_transmittal(db_path, header, trans_items)
+
+    # --- Generate PDF receipt / bundle ----
+    from .transmittal_service import rebuild_transmittal_bundle
+    rebuild_transmittal_bundle(db_path, number, out_root=out_root)
+
+    # --- Mark batch completed ----
+    def _do():
+        con = _connect(db_path)
+        cur = con.cursor()
+        cur.execute("""
+            UPDATE checkprint_batches
+               SET status='completed',
+                   submitted_on=datetime('now'),
+                   reviewer=?,
+                   reviewer_notes=COALESCE(reviewer_notes, '')
+             WHERE id=?
+        """, (username, int(batch_id)))
+        con.commit()
+        con.close()
+
+    _retry_write(_do)
+
+    return trn_dir
+
+
+
+def cancel_checkprint(db_path: Path, *, batch_id: int, actor: str) -> bool:
+    """
+    Cancel a CheckPrint batch.
+
+    Correct behaviour:
+        • Restore ALL source files to their original names (remove _CP_N)
+        • Leave CP files in their batch folder
+        • Rename batch folder to *_cancelled_<timestamp>
+        • Mark batch as cancelled in DB
+        • Never delete source files
+        • Never delete CP folder
+    """
+
+    if batch_id is None:
+        raise ValueError("No batch_id provided to cancel_checkprint().")
+
+    batch_id = int(batch_id)
+
+    db_path = Path(db_path)
+    init_db(db_path)
+
+    # Load batch row (to get folder name)
+    batch = get_checkprint_batch(db_path, batch_id)
+    if not batch:
+        raise RuntimeError("Cannot cancel: Batch not found.")
+
+    batch_code = batch["code"]          # e.g. CP-TRN-004
+    cp_root = _checkprint_root(db_path)  # CheckPrint root folder
+    batch_dir = cp_root / batch_code     # <CheckPrint>/CP-TRN-XXX
+
+    batch_items = get_checkprint_items(db_path, batch_id)
+    if not batch_items:
+        raise RuntimeError("Cannot cancel: Batch contains no documents.")
+
+    all_ops = []
+
+    # --- Restore original source files ---
+    for it in batch_items:
+        src_abs = Path(resolve_company_library_path(it["source_path"]))
+        base, ext = _split_basename(src_abs.name)  # removes _CP_N
+        final_name = base + ext                    # restored name
+        src_final = src_abs.with_name(final_name)
+
+        # Rename _CP_N file back to original
+        if src_abs.exists():
+            all_ops.append(plan_rename(src_abs, src_final))
+
+    # --- Rename batch folder to mark cancelled ---
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+    cancelled_dir = batch_dir.with_name(f"{batch_code}_cancelled_{ts}")
+
+    if batch_dir.exists():
+        all_ops.append(plan_rename(batch_dir, cancelled_dir))
+
+    # --- Preflight ---
+    ok, bad_path, reason = preflight_ops(all_ops)
+    if not ok:
+        raise PreflightError(bad_path, reason or "CheckPrint cancellation aborted due to locked file.")
+
+    # --- Execute ---
+    execute_ops(all_ops)
+
+    # --- DB update ---
+    _mark_checkprint_cancelled(db_path, batch_id, actor)
 
     return True
+
+
+def _mark_checkprint_cancelled(db_path: Path, batch_id: int, actor: str):
+    """Internal helper to update CheckPrint batch state."""
+    db_path = Path(db_path)
+
+    def _do():
+        con = _connect(db_path)
+        cur = con.cursor()
+        cur.execute("""
+            UPDATE checkprint_batches
+               SET status='cancelled',
+                   reviewer=?,
+                   reviewer_notes=COALESCE(reviewer_notes, ''),
+                   submitted_on=NULL
+             WHERE id=?
+        """, (actor, int(batch_id)))
+        con.commit()
+        con.close()
+
+    _retry_write(_do)
+
+    # No event log here — batch-level cancellation does NOT apply to item-level history.

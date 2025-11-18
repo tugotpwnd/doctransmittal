@@ -1019,6 +1019,25 @@ class RegisterTab(QWidget):
         items = self._ticked_items()
         if not items:
             QMessageBox.information(self, "No selection", "Please tick one or more documents to submit."); return
+
+
+        missing = []
+        for it in items:
+            rev_raw = getattr(it, "latest_rev_raw", "") or ""
+            tok = getattr(it, "latest_rev_token", "") or ""
+
+            if not rev_raw.strip() or not tok.strip():
+                missing.append(getattr(it, "doc_id", "<unknown>"))
+
+        if missing:
+            msg = (
+                    "The following documents do NOT have revisions assigned:\n\n" +
+                    "\n".join(f"• {d}" for d in missing) +
+                    "\n\nPlease assign revisions before proceeding."
+            )
+            QMessageBox.warning(self, "Missing Revisions", msg)
+            return
+
         self.on_proceed(items, self.db_path)
 
     # ----------------- Revisions ---------------------------------------------

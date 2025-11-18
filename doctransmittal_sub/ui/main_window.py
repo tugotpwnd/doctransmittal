@@ -171,7 +171,7 @@ class MainWindow(QMainWindow):
             margin-top: 4px;
         }}
         QTabBar#MainTabBar::tab {{
-            min-width: 260px;
+            min-width: 300px;
             min-height: 60px;            /* clearly taller */
             padding: 16px 36px;
             margin: 8px 10px;
@@ -556,6 +556,7 @@ class MainWindow(QMainWindow):
         self.checkprint_tab = CheckPrintTab()
         self.idx_checkprint = self.tabs.addTab(self.checkprint_tab, "CheckPrint")
         self.tabs.setTabEnabled(self.idx_checkprint, True)
+        self.files_tab.checkprintStarted.connect(self._on_checkprint_started)
 
         # --- name the tab bars so we can style them differently ---
         self.mainTabs.setObjectName("MainTabs")
@@ -1199,6 +1200,34 @@ class MainWindow(QMainWindow):
         # Go back to Register/Database tab
         self.tabs.setCurrentIndex(self.idx_register)
 
+    def _on_checkprint_started(self, cp_code: str, cp_dir: str):
+        """
+        After 'Proceed: Submit for CheckPrint' completes,
+        reset the entire workflow back to the clean Register state.
+        Mirrors the legacy transmittal reset behaviour.
+        """
+
+        try:
+            # ---- Reset FILES TAB ----
+            if hasattr(self.files_tab, "reset"):
+                self.files_tab.reset()
+
+            # ---- Reset TRANSMITTAL TAB (if running workflows before CheckPrint) ----
+            if hasattr(self.transmittal_tab, "reset"):
+                self.transmittal_tab.reset()
+
+            # ---- Disable Transmittal + Files unless user starts flow again ----
+            try:
+                self.tabs.setTabEnabled(self.idx_transmit, False)
+                self.tabs.setTabEnabled(self.idx_files, False)
+            except Exception:
+                pass
+
+            # Go back to Register/Database tab
+            self.tabs.setCurrentIndex(self.idx_register)
+
+        except Exception as e:
+            print("Error syncing after CheckPrint:", e)
 
     def _start_remap_from_history(self, payload: dict):
         """
