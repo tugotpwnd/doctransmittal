@@ -21,7 +21,6 @@ CATEGORIES = [
     ("document", "Report/Document"),
     ("schedule", "Schedule"),
     ("drawing",  "Drawing"),
-    ("rfi", "RFI"),
     ("calculation", "Calculation"),
 ]
 CATEGORY_KEYS = {k for k, _ in CATEGORIES}

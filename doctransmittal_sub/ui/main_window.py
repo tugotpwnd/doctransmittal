@@ -30,8 +30,6 @@ from PyQt5.QtWidgets import QApplication, QAction
 from ..services.db import get_project, list_documents_with_latest
 from ..services.receipt_pdf import export_progress_report_pdf
 from datetime import datetime, date
-from .rfi_tab import RfiTab
-from .widgets.rfi_sidebar import RfiSidebarWidget
 from PyQt5.QtWidgets import QLineEdit, QPushButton, QLabel, QHBoxLayout  # if not already imported
 from .checkprint_tab import CheckPrintTab
 
@@ -523,7 +521,6 @@ class MainWindow(QMainWindow):
 
         # --- Central with stacked background ----------------------------------------
         # --- Central content (no background image) ---
-        # --- NEW: big headers (Documents / RFI) with global DB bar under the brand bar ---
         self.mainTabs = QTabWidget(self)
 
         doc_page = QWidget(self)
@@ -532,8 +529,6 @@ class MainWindow(QMainWindow):
         doc_v.setSpacing(0)
         self.tabs = QTabWidget(doc_page)  # keep existing name so the rest of the code still works
         doc_v.addWidget(self.tabs, 1)
-
-        self.rfi_tab = RfiTab(self)
 
         wrap = QWidget(self);
         wrap.setObjectName("CentralWrap")
@@ -565,7 +560,7 @@ class MainWindow(QMainWindow):
 
         # --- name the tab bars so we can style them differently ---
         self.mainTabs.setObjectName("MainTabs")
-        self.mainTabs.tabBar().setObjectName("MainTabBar")  # top-level tabs: Document Register / RFI
+        self.mainTabs.tabBar().setObjectName("MainTabBar")  # top-level tabs: Document Register
         self.tabs.tabBar().setObjectName("SubTabBar")  # inner tabs: Register / Transmittal / Files / History
 
         # Hide the old internal DB row inside RegisterTab (we use the global bar)
@@ -576,10 +571,7 @@ class MainWindow(QMainWindow):
 
         # Top-level headers
         self.mainTabs.addTab(doc_page, "Document Register")
-        # self.mainTabs.addTab(self.rfi_tab, "RFI (Disabled)")
         # Top-level headers
-        self.mainTabs.setTabEnabled(1, False)  # Disable RFI tab
-
 
         # Tab indexes and gating
         self.idx_register = self.tabs.indexOf(self.register_tab)
@@ -612,23 +604,7 @@ class MainWindow(QMainWindow):
         dock.setObjectName("LeftDock")
         self.sidebar.setObjectName("Sidebar")
         self.sidebar.setAttribute(Qt.WA_StyledBackground, True)  # <— add this
-
-        # Use the RfiTab’s actual sidebar (so its signals & project info work)
-        self.rfi_tab.sidebar.setObjectName("Sidebar")
-        self.rfi_tab.sidebar.setAttribute(Qt.WA_StyledBackground, True)
-
-        def _swap_sidebar(idx: int):
-            try:
-                dock = self.findChild(QDockWidget, "LeftDock")
-                if idx == self.mainTabs.indexOf(self.rfi_tab):
-                    dock.setWidget(self.rfi_tab.sidebar)  # ← use the instance owned by RfiTab
-                else:
-                    dock.setWidget(self.sidebar)
-            except Exception:
-                pass
-
-        self.mainTabs.currentChanged.connect(_swap_sidebar)
-        _swap_sidebar(self.mainTabs.currentIndex())  # ensure correct widget on startup
+        dock.setWidget(self.sidebar)
 
         # Menu: User
         m = self.menuBar().addMenu("User")
@@ -639,12 +615,6 @@ class MainWindow(QMainWindow):
         act_appearance = QAction("Appearance…", self)
         act_appearance.triggered.connect(self._open_appearance_dialog)
         m_view.addAction(act_appearance)
-        # --- RFI Test ---
-        from .rfi_test_dialog import RfiTestDialog
-        # m_rfi = self.menuBar().addMenu("RFI")
-        # act_rfi_test = QAction("RFI Drop Test…", self)
-        # act_rfi_test.triggered.connect(lambda: RfiTestDialog(self).exec_())
-        # m_rfi.addAction(act_rfi_test)
 
         # Listen for project info from the Register tab
         self.register_tab.projectInfoReady.connect(self._on_project_info_ready)
@@ -691,8 +661,7 @@ class MainWindow(QMainWindow):
         # Sidebar → Project Settings
         self.sidebar.projectSettingsRequested.connect(self._open_project_settings)
         self.sidebar.templatesRequested.connect(self._open_templates_viewer)
-        self.rfi_tab.sidebar.projectSettingsRequested.connect(self._open_project_settings)
-        self.rfi_tab.sidebar.templatesRequested.connect(self._open_templates_viewer)
+
         # Auto-refresh progress donut when the register table changes
         try:
             self.register_tab.model.dataChanged.connect(lambda *a, **k: self.sidebar.refresh_progress())
@@ -1070,7 +1039,6 @@ class MainWindow(QMainWindow):
                 self.history_tab.set_db_path(db_path)
                 self.transmittal_tab.set_db_path(db_path)   # no project_root now
                 self.sidebar.set_db_path(db_path)
-                self.rfi_tab.set_db_path(db_path)  # <— add this
                 self.checkprint_tab.set_db_path(db_path)
                 print("Set paths")
 
@@ -1238,18 +1206,10 @@ class MainWindow(QMainWindow):
             )
 
     def _apply_db_path(self, path: Path):
-        if not path: return
+        if not path:
+            return
         self.le_db_global.setText(str(path))
-        try:
-            # Load via RegisterTab (it will emit projectInfoReady)
-            self.register_tab.load_db_from_path(str(path))
-        except Exception:
-            pass
-        try:
-            # Also refresh RFI tab explicitly
-            self.rfi_tab.set_db_path(Path(path))
-        except Exception:
-            pass
+        self.register_tab.load_db_from_path(str(path))
 
     def _open_db_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Project DB", "", "Database (*.db)")
