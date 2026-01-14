@@ -206,6 +206,16 @@ def init_db(db_path: Path) -> None:
     _ensure_index(con, "ux_ti_trans_doc",
                   "CREATE UNIQUE INDEX ux_ti_trans_doc ON transmittal_items(transmittal_id, doc_id);")
 
+    # checkprint_items...
+    # Soft-remove support (keeps audit trail; prevents orphan files).
+    _ensure_column(con, "checkprint_items", "state", "TEXT NOT NULL DEFAULT 'active'")
+    _ensure_index(
+        con,
+        "idx_cp_items_batch_state",
+        "CREATE INDEX idx_cp_items_batch_state ON checkprint_items(batch_id, state);",
+    )
+
+
     con.commit(); con.close()
 
 
@@ -1076,26 +1086,181 @@ def list_checkprint_batches(db_path: Path) -> List[Dict[str, Any]]:
 
 
 
-def get_checkprint_items(db_path: Path, batch_id: int) -> List[Dict[str, Any]]:
+def get_checkprint_items(
+    db_path: Path,
+    batch_id: int,
+    *,
+    include_removed: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch items for a batch.
+
+    By default, items that have been removed from the batch are hidden.
+    This enables safe 'edit batch contents' workflows while preserving
+    an audit trail (removed rows are not deleted).
+    """
     init_db(db_path)
     con = _connect(db_path)
-    rows = con.execute("""
+    where = "WHERE batch_id=?" if include_removed else "WHERE batch_id=? AND state='active'"
+    rows = con.execute(
+        f"""
         SELECT id, batch_id, doc_id, revision, base_name, cp_version,
                status, submitter, reviewer, last_submitted_on,
                last_reviewed_on, last_reviewer_note,
-               source_path, cp_path
+               source_path, cp_path,
+               state
           FROM checkprint_items
-         WHERE batch_id=?
+          {where}
          ORDER BY doc_id, cp_version
-    """, (int(batch_id),)).fetchall()
+        """,
+        (int(batch_id),),
+    ).fetchall()
     con.close()
     cols = [
-        "id","batch_id","doc_id","revision","base_name","cp_version",
-        "status","submitter","reviewer","last_submitted_on",
-        "last_reviewed_on","last_reviewer_note",
-        "source_path","cp_path"
+        "id",
+        "batch_id",
+        "doc_id",
+        "revision",
+        "base_name",
+        "cp_version",
+        "status",
+        "submitter",
+        "reviewer",
+        "last_submitted_on",
+        "last_reviewed_on",
+        "last_reviewer_note",
+        "source_path",
+        "cp_path",
+        "state",
     ]
     return [dict(zip(cols, r)) for r in rows]
+
+
+def get_checkprint_items_by_ids(db_path: Path, item_ids: List[int]) -> List[Dict[str, Any]]:
+    if not item_ids:
+        return []
+    init_db(db_path)
+    con = _connect(db_path)
+    placeholders = ",".join("?" for _ in item_ids)
+    rows = con.execute(
+        f"""
+        SELECT id, batch_id, doc_id, revision, base_name, cp_version,
+               status, submitter, reviewer, last_submitted_on,
+               last_reviewed_on, last_reviewer_note,
+               source_path, cp_path,
+               state
+          FROM checkprint_items
+         WHERE id IN ({placeholders})
+        """,
+        tuple(int(x) for x in item_ids),
+    ).fetchall()
+    con.close()
+    cols = [
+        "id",
+        "batch_id",
+        "doc_id",
+        "revision",
+        "base_name",
+        "cp_version",
+        "status",
+        "submitter",
+        "reviewer",
+        "last_submitted_on",
+        "last_reviewed_on",
+        "last_reviewer_note",
+        "source_path",
+        "cp_path",
+        "state",
+    ]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def insert_checkprint_items(
+    db_path: Path,
+    *,
+    batch_id: int,
+    items: List[Dict[str, Any]],
+) -> List[int]:
+    """Insert items into an existing batch. Returns inserted item IDs."""
+    if not items:
+        return []
+    init_db(db_path)
+
+    def _do() -> List[int]:
+        con = _connect(db_path)
+        cur = con.cursor()
+
+        inserted: List[int] = []
+        for it in items:
+            cur.execute(
+                """
+                INSERT INTO checkprint_items(
+                    batch_id, doc_id, revision, base_name, cp_version,
+                    status, submitter, reviewer, last_submitted_on,
+                    last_reviewed_on, last_reviewer_note,
+                    source_path, cp_path,
+                    state
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(batch_id),
+                    str(it["doc_id"]),
+                    str(it.get("revision") or ""),
+                    str(it["base_name"]),
+                    int(it.get("cp_version") or 1),
+                    str(it.get("status") or "pending"),
+                    str(it.get("submitter") or ""),
+                    str(it.get("reviewer") or ""),
+                    str(it.get("last_submitted_on") or ""),
+                    str(it.get("last_reviewed_on") or ""),
+                    str(it.get("last_reviewer_note") or ""),
+                    str(it["source_path"]),
+                    str(it["cp_path"]),
+                    str(it.get("state") or "active"),
+                ),
+            )
+            inserted.append(int(cur.lastrowid))
+
+        con.commit()
+        con.close()
+        return inserted
+
+    return _retry_write(_do)
+
+
+def mark_checkprint_items_removed(
+    db_path: Path,
+    *,
+    batch_id: int,
+    item_ids: List[int],
+) -> int:
+    """
+    Placeholder for "remove from checkprint" (DB-only for now).
+    Hard-deletes checkprint_items rows (events cascade).
+    File operations are intentionally NOT handled here yet.
+    """
+    init_db(db_path)
+    ids = [int(x) for x in item_ids if int(x) > 0]
+    if not ids:
+        return 0
+
+    def _do():
+        con = _connect(db_path)
+        cur = con.cursor()
+
+        q = f"""
+            DELETE FROM checkprint_items
+             WHERE batch_id=?
+               AND id IN ({",".join(["?"] * len(ids))})
+        """
+        cur.execute(q, (int(batch_id), *ids))
+        count = cur.rowcount
+
+        con.commit()
+        con.close()
+        return int(count or 0)
+
+    return _retry_write(_do)
 
 
 def get_latest_checkprint_versions(
@@ -1115,7 +1280,7 @@ def get_latest_checkprint_versions(
         SELECT ci.doc_id, MAX(ci.cp_version)
           FROM checkprint_items ci
           JOIN checkprint_batches cb ON cb.id = ci.batch_id
-         WHERE cb.project_id=? AND ci.doc_id IN ({placeholders})
+         WHERE cb.project_id=? AND ci.state='active' AND ci.doc_id IN ({placeholders})
          GROUP BY ci.doc_id
     """, (int(project_id), *doc_ids)).fetchall()
     con.close()
@@ -1241,9 +1406,6 @@ def get_checkprint_batch(db_path: Path, batch_id: int):
     return batch
 
 
-
-
-
 def cancel_checkprint_batch(db_path: Path, batch_id: int):
     con = _connect(db_path)
     cur = con.cursor()
@@ -1264,3 +1426,4 @@ def cancel_checkprint_batch(db_path: Path, batch_id: int):
 
     con.commit()
     con.close()
+

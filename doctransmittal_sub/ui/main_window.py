@@ -553,7 +553,7 @@ class MainWindow(QMainWindow):
         self.history_tab = HistoryTab()
         self.tabs.addTab(self.history_tab, "History")
 
-        self.checkprint_tab = CheckPrintTab()
+        self.checkprint_tab = CheckPrintTab(user_name=self.settings.get("username", ""))
         self.idx_checkprint = self.tabs.addTab(self.checkprint_tab, "CheckPrint")
         self.tabs.setTabEnabled(self.idx_checkprint, True)
         self.files_tab.checkprintStarted.connect(self._on_checkprint_started)
@@ -1212,7 +1212,9 @@ class MainWindow(QMainWindow):
         self.register_tab.load_db_from_path(str(path))
 
     def _open_db_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open Project DB", "", "Database (*.db)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Project DB", "", "Database (*.db)"
+        )
         if path:
             self._apply_db_path(Path(path))
 

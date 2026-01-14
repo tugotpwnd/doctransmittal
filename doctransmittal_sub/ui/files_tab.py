@@ -555,44 +555,6 @@ class FilesTab(QWidget):
 
         self.tree.viewport().update()
 
-    # ===== Duplicate detection =====
-    # --- OLD (commented): global scan across *all* filenames under root ---
-    # def _scan_duplicates(self):
-    #     """Build sets of duplicate basenames and their full paths under current root_dir."""
-    #     self._dup_names = set()
-    #     self._dup_paths = set()
-    #     if not self.root_dir:
-    #         self._update_dup_banner(0)
-    #         self.tree.viewport().update()
-    #         return
-    #     counts: Dict[str, List[str]] = {}
-    #     try:
-    #         for p in self.root_dir.rglob("*"):
-    #             try:
-    #                 if p.is_file():
-    #                     name = p.name.lower()
-    #                     counts.setdefault(name, []).append(self._normpath(str(p)))
-    #             except Exception:
-    #                 continue
-    #     except Exception:
-    #         counts = {}
-    #     self._dup_names = {n for n, lst in counts.items() if len(lst) > 1}
-    #     self._dup_paths = {pp for n, lst in counts.items() if len(lst) > 1 for pp in lst}
-    #     total = len(self._dup_names)
-    #     self._update_dup_banner(total)
-    #     if total:
-    #         examples = sorted(list(self._dup_names))[:10]
-    #         msg = [f"Detected {total} duplicate filename(s) under:\n{self.root_dir}\n",
-    #                "These files are excluded from auto-matching.\nYou can still map them manually.\n"]
-    #         if examples:
-    #             msg.append("\nExamples:\n" + "\n".join(f"• {e}" for e in examples))
-    #             rem = total - len(examples)
-    #             if rem > 0:
-    #                 msg.append(f"\n… and {rem} more.")
-    #         QMessageBox.warning(self, "Duplicate files detected", "".join(msg))
-    #     self._refresh_map_list()
-    #     self.tree.viewport().update()
-
     # --- NEW: only flag duplicates for the *selected* DocID+Rev pairs ---
     def _scan_duplicates(self):
         """

@@ -23,8 +23,8 @@ from PyQt5.QtWidgets import (
 
 from PyQt5.QtGui import QColor
 
+from .checkprint_edit_dialog import CheckPrintEditDialog
 from ..core.settings import SettingsManager
-
 try:
     from ..services.db import (
         list_checkprint_batches,
@@ -35,10 +35,11 @@ try:
     from ..services.checkprint_service import (
         resubmit_checkprint_items,
         overwrite_checkprint_items,
+        resubmit_all_incoming,
         cancel_checkprint,
         finalize_checkprint_to_transmittal,
         _mark_checkprint_cancelled,
-)
+    )
     from ..core.paths import resolve_company_library_path
 except ImportError:
     from services.db import (
@@ -50,6 +51,7 @@ except ImportError:
     from services.checkprint_service import (
         resubmit_checkprint_items,
         overwrite_checkprint_items,
+        resubmit_all_incoming,
         cancel_checkprint,
         finalize_checkprint_to_transmittal,
         _mark_checkprint_cancelled,
@@ -124,8 +126,9 @@ class CheckPrintTab(QWidget):
       • Reviewer view: horizontal panes (Pending, Rejected, Accepted)
     """
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, user_name: str = ""):
         super().__init__(parent)
+        self.user_name = user_name
         self.db_path: Path | None = None
         self.current_batch_id: int | None = None
         self._batch_rows = []
@@ -190,6 +193,25 @@ class CheckPrintTab(QWidget):
         g_pend_layout.addWidget(self.btn_resubmit_pending_sub)
         sub_h.addWidget(grp_pend_sub)
 
+        self.btn_resubmit_pending_sub = QPushButton("Resubmit All Incoming")
+        self.btn_resubmit_pending_sub.setFixedWidth(300)
+        self.btn_resubmit_pending_sub.clicked.connect(self._resubmit_all_incoming)
+        g_pend_layout.addWidget(self.btn_resubmit_pending_sub)
+        sub_h.addWidget(grp_pend_sub)
+
+        # Rejected (submitter)
+        grp_rej_sub = QGroupBox("Rejected")
+        g_rej_layout = QVBoxLayout(grp_rej_sub)
+        self.list_rejected_sub = QListWidget()
+        self._wire_list_common(self.list_rejected_sub, editable=False, for_reviewer=False)
+        g_rej_layout.addWidget(self.list_rejected_sub)
+
+        btn_row_rej_sub = QHBoxLayout()
+        self.btn_resubmit_rejected_sub = QPushButton("Resubmit All Incoming")
+        self.btn_resubmit_rejected_sub.setFixedWidth(300)
+        self.btn_resubmit_rejected_sub.clicked.connect(self._resubmit_all_incoming)
+        btn_row_rej_sub.addWidget(self.btn_resubmit_rejected_sub)
+
         # Rejected (submitter)
         grp_rej_sub = QGroupBox("Rejected")
         g_rej_layout = QVBoxLayout(grp_rej_sub)
@@ -225,10 +247,17 @@ class CheckPrintTab(QWidget):
         # Cancel button (submitter)
         bottom_sub = QHBoxLayout()
         bottom_sub.addStretch(1)
+
+        self.btn_edit_docs_submitter = QPushButton("Edit Documents…")
+        self.btn_edit_docs_submitter.setFixedWidth(200)
+        self.btn_edit_docs_submitter.clicked.connect(self._edit_checkprint_documents)
+        bottom_sub.addWidget(self.btn_edit_docs_submitter)
+
         self.btn_cancel_submitter = QPushButton("Cancel This CheckPrint")
         self.btn_cancel_submitter.setFixedWidth(300)
         self.btn_cancel_submitter.clicked.connect(self._cancel_checkprint)
         bottom_sub.addWidget(self.btn_cancel_submitter)
+
         sv.addLayout(bottom_sub)
 
         root.addWidget(self.box_submitter)
@@ -418,6 +447,8 @@ class CheckPrintTab(QWidget):
         self._update_role_buttons("submitter")
         self._load_items_for_submitter()
 
+        editable = batch["status"] in {"in_progress", "submitted", "awaiting_review"}
+        self.btn_edit_docs_submitter.setEnabled(editable)
         self.btn_cancel_submitter.setEnabled(batch["status"] != "cancelled")
 
     def _load_items_for_submitter(self):
@@ -433,6 +464,31 @@ class CheckPrintTab(QWidget):
                                    self.list_pending_sub,
                                    self.list_rejected_sub,
                                    self.list_accepted_sub)
+
+    def _edit_checkprint_documents(self):
+        if not self.db_path or not self.current_batch_id:
+            return
+
+        batch = get_checkprint_batch(self.db_path, self.current_batch_id)
+        if not batch or batch.get("status") not in {"in_progress", "submitted", "awaiting_review"}:
+            QMessageBox.information(
+                self,
+                "Not editable",
+                "This CheckPrint batch is not editable in its current state.",
+            )
+            return
+
+        dlg = CheckPrintEditDialog(
+            self,
+            db_path=Path(self.db_path),
+            batch_id=int(self.current_batch_id),
+            user_name=self.user_name,
+        )
+
+        dlg.exec_()
+        # Refresh lists after any edits
+        self._load_items_for_submitter()
+
 
     # ------------------------------------------------------------------ Reviewer mode
     def _enter_reviewer_mode(self):
@@ -452,6 +508,7 @@ class CheckPrintTab(QWidget):
         self.box_reviewer.setVisible(True)
         self._update_role_buttons("reviewer")
         self._load_items_for_reviewer()
+
 
         self.btn_cancel_reviewer.setEnabled(batch["status"] != "cancelled")
 
@@ -632,56 +689,52 @@ class CheckPrintTab(QWidget):
 
     # ------------------------------------------------------------------ Submitter resubmission
     def _resubmit_from_pending(self):
-        item = self.list_pending_sub.currentItem()
-        if not item:
-            QMessageBox.information(self, "CheckPrint", "Select a pending document to resubmit.")
-            return
-        it = item.data(Qt.UserRole)
-        self._resubmit_item(it)
+        # legacy button path; now uses incoming folder flow
+        self._resubmit_all_incoming()
 
     def _resubmit_from_rejected(self):
-        item = self.list_rejected_sub.currentItem()
-        if not item:
-            QMessageBox.information(self, "CheckPrint", "Select a rejected document to resubmit.")
-            return
-        it = item.data(Qt.UserRole)
-        self._resubmit_item(it)
+        # legacy button path; now uses incoming folder flow
+        self._resubmit_all_incoming()
 
-    def _resubmit_item(self, it: dict):
-        doc_id = it["doc_id"]
-        status = it["status"]
-
-        fp, _ = QFileDialog.getOpenFileName(
-            self,
-            f"Select updated file for {doc_id}",
-            "",
-            "All Files (*.*)",
-        )
-        if not fp:
+    def _resubmit_all_incoming(self):
+        if not getattr(self, "db_path", None) or not self.current_batch_id:
+            QMessageBox.information(self, "CheckPrint", "No active CheckPrint batch selected.")
             return
 
-        actor = SettingsManager().get("user.name", "")
+        actor = SettingsManager().get("user.name", "") or ""
 
         try:
-            if status == "pending":
-                overwrite_checkprint_items(
-                    self.db_path,
-                    batch_id=self.current_batch_id,
-                    item_id_to_new_path={it["id"]: Path(fp)},
-                    submitter=actor,
-                )
-            else:
-                resubmit_checkprint_items(
-                    self.db_path,
-                    batch_id=self.current_batch_id,
-                    item_id_to_new_path={it["id"]: Path(fp)},
-                    submitter="submitter",
-                )
+            res = resubmit_all_incoming(
+                self.db_path,
+                batch_id=int(self.current_batch_id),
+                actor=actor,
+            )
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Resubmit failed:\n{e}")
             return
 
-        QMessageBox.information(self, "CheckPrint", f"{doc_id} resubmitted.")
+        if not res.get("ok"):
+            incoming_dir = res.get("incoming_dir", "CheckPrint/_CheckPrintIncoming")
+            details = res.get("details")
+            msg = f"Resubmit failed.\n\nIncoming folder:\n{incoming_dir}\n\nFiles must be named DOCID_REV.pdf"
+            if details:
+                msg += f"\n\nDetails:\n{details}"
+            QMessageBox.critical(self, "CheckPrint", msg)
+            return
+
+        msg = (
+            f"Resubmitted from _CheckPrintIncoming.\n\n"
+            f"Updated: {res.get('updated', 0)}\n"
+            f"Overwritten (pending): {res.get('overwritten', 0)}\n"
+            f"Incremented (accepted/rejected): {res.get('incremented', 0)}\n"
+            f"Incoming cleaned: {res.get('deleted_incoming', 0)} file(s)"
+        )
+        cw = res.get("cleanup_warning")
+        if cw:
+            msg += f"\n\nCleanup warning:\n{cw}"
+
+        QMessageBox.information(self, "CheckPrint", msg)
+
         # Reload both views in case user flips roles
         self._load_items_for_submitter()
         self._load_items_for_reviewer()

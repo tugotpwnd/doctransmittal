@@ -23,22 +23,44 @@ from .file_safety import (
 
 try:
     from .db import (
-        init_db, get_project,
-        create_checkprint_batch, get_checkprint_items,
-        get_latest_checkprint_versions, update_checkprint_item_status,
-        append_checkprint_event, insert_transmittal, _retry_write, _connect, get_active_checkprint_batch,
-        cancel_checkprint_batch, get_checkprint_batch,
-)
+        _connect,
+        _retry_write,
+        append_checkprint_event,
+        cancel_checkprint_batch,
+        create_checkprint_batch,
+        get_active_checkprint_batch,
+        get_checkprint_batch,
+        get_checkprint_items,
+        get_checkprint_items_by_ids,
+        get_latest_checkprint_versions,
+        get_project,
+        init_db,
+        insert_checkprint_items,
+        insert_transmittal,
+        mark_checkprint_items_removed,
+        update_checkprint_item_status,
+    )
     from .transmittal_service import _base_folder_for_output, _default_out_root, next_transmittal_number
 except Exception:
     from ..services.db import (
-        init_db, get_project,
-        create_checkprint_batch, get_checkprint_items,
-        get_latest_checkprint_versions, update_checkprint_item_status,
-        append_checkprint_event, insert_transmittal,
+        _connect,
+        _retry_write,
+        append_checkprint_event,
+        cancel_checkprint_batch,
+        create_checkprint_batch,
+        get_active_checkprint_batch,
+        get_checkprint_batch,
+        get_checkprint_items,
+        get_checkprint_items_by_ids,
+        get_latest_checkprint_versions,
+        get_project,
+        init_db,
+        insert_checkprint_items,
+        insert_transmittal,
+        mark_checkprint_items_removed,
+        update_checkprint_item_status,
     )
     from ..services.transmittal_service import _base_folder_for_output, _default_out_root, next_transmittal_number
-
 
 def _checkprint_root(db_path: Path) -> Path:
     """
@@ -49,6 +71,16 @@ def _checkprint_root(db_path: Path) -> Path:
     root = base / "CheckPrint"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+def _checkprint_incoming_dir(db_path: Path) -> Path:
+    """
+    CheckPrint incoming folder for resubmissions ONLY:
+        <CheckPrint>/_CheckPrintIncoming
+    """
+    incoming = _checkprint_root(db_path) / "_CheckPrintIncoming"
+    incoming.mkdir(parents=True, exist_ok=True)
+    return incoming
+
 
 def _project_root(db_path: Path) -> Path:
     """
@@ -610,6 +642,237 @@ def resubmit_checkprint_items(
 
     return True
 
+def resubmit_all_incoming(
+    db_path: Path,
+    *,
+    batch_id: int,
+    actor: str,
+) -> Dict[str, Any]:
+    """
+    Resubmit workflow (strict, controlled):
+
+    - Incoming folder is ALWAYS: <CheckPrint>/_CheckPrintIncoming
+    - Files MUST be named: DOCID_REV.pdf (strict)
+    - Each incoming file must match EXACTLY ONE existing checkprint_items row
+      by (doc_id, revision) within the given batch.
+    - Mixed-mode in one pass:
+        - pending   -> overwrite (same CP version)
+        - accepted/rejected -> increment (new CP_(N+1))
+    - Atomic for file ops across the batch (preflight all, then execute all)
+    - Incoming files are deleted ONLY AFTER successful DB write-back.
+    """
+    db_path = Path(db_path)
+    init_db(db_path)
+    batch_id = int(batch_id)
+
+    batch = get_checkprint_batch(db_path, batch_id)
+    if not batch:
+        return {"ok": False, "error": "batch_not_found"}
+    if batch.get("status") in {"cancelled", "completed"}:
+        return {"ok": False, "error": "batch_not_editable", "status": batch.get("status")}
+
+    incoming_dir = _checkprint_incoming_dir(db_path)
+
+    incoming_files = sorted(
+        [p for p in incoming_dir.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"],
+        key=lambda p: p.name.lower(),
+    )
+    if not incoming_files:
+        return {"ok": False, "error": "incoming_empty", "incoming_dir": str(incoming_dir)}
+
+    items = get_checkprint_items(db_path, batch_id)
+    items_by_id: Dict[int, Dict[str, Any]] = {int(it["id"]): it for it in items}
+
+    # index by (doc_id, revision) -> item_id (must be unique)
+    index: Dict[tuple[str, str], int] = {}
+    for it in items:
+        did = str(it.get("doc_id") or "").strip()
+        rev = str(it.get("revision") or "").strip()
+        if not did:
+            continue
+        key = (did, rev)
+        if key in index:
+            # This should not happen; fail safe.
+            return {"ok": False, "error": "duplicate_item_key_in_batch", "doc_id": did, "revision": rev}
+        index[key] = int(it["id"])
+
+    # Parse + match incoming files
+    matched: Dict[int, Path] = {}
+    match_errors: List[Dict[str, Any]] = []
+
+    for f in incoming_files:
+        stem = f.stem
+        if "_" not in stem:
+            match_errors.append({"file": f.name, "error": "bad_name", "reason": "Expected DOCID_REV.pdf"})
+            continue
+
+        doc_id, rev = stem.rsplit("_", 1)
+        doc_id = doc_id.strip()
+        rev = rev.strip()
+
+        if not doc_id or not rev:
+            match_errors.append({"file": f.name, "error": "bad_name", "reason": "Expected DOCID_REV.pdf"})
+            continue
+
+        key = (doc_id, rev)
+        item_id = index.get(key)
+        if not item_id:
+            match_errors.append({"file": f.name, "error": "no_match", "doc_id": doc_id, "revision": rev})
+            continue
+
+        if item_id in matched:
+            match_errors.append({"file": f.name, "error": "duplicate_match", "item_id": item_id})
+            continue
+
+        matched[item_id] = f
+
+    if match_errors:
+        return {
+            "ok": False,
+            "error": "match_failed",
+            "incoming_dir": str(incoming_dir),
+            "details": match_errors,
+        }
+
+    # Plan file ops (atomic across batch)
+    all_ops: List[Any] = []
+    per_item_meta: Dict[int, Dict[str, Any]] = {}
+    per_item_mode: Dict[int, str] = {}
+
+    for item_id, replacement_file in matched.items():
+        it = items_by_id.get(int(item_id))
+        if not it:
+            continue
+
+        mode = "overwrite" if str(it.get("status") or "").strip() == "pending" else "increment"
+        ops, meta = _plan_checkprint_update_ops(db_path, it, Path(replacement_file), mode=mode)
+
+        all_ops.extend(ops)
+        per_item_meta[int(item_id)] = meta
+        per_item_mode[int(item_id)] = mode
+
+    if not all_ops:
+        return {"ok": True, "updated": 0, "overwritten": 0, "incremented": 0, "deleted_incoming": 0}
+
+    ok, bad_path, reason = preflight_ops(all_ops)
+    if not ok:
+        return {"ok": False, "error": "preflight_failed", "path": str(bad_path), "reason": reason or ""}
+
+    # Execute file ops first
+    execute_ops(all_ops)
+
+    # DB write-back
+    now_date = datetime.now().strftime("%Y-%m-%d")
+    proj_root = _project_root(db_path)
+
+    overwritten = 0
+    incremented = 0
+
+    for item_id, src_path in matched.items():
+        meta = per_item_meta.get(int(item_id))
+        if not meta:
+            continue
+        it = items_by_id[int(item_id)]
+        mode = per_item_mode[int(item_id)]
+
+        new_src_abs = meta["new_src_abs"]
+        new_cp_abs = meta["new_cp_abs"]
+
+        rel_src = str(new_src_abs.relative_to(proj_root))
+        rel_cp = str(new_cp_abs.relative_to(proj_root))
+
+        old_status = meta.get("old_status")
+        new_status = meta.get("new_status")
+
+        if mode == "overwrite":
+            def _do_overwrite():
+                con = _connect(db_path)
+                cur = con.cursor()
+                cur.execute("""
+                    UPDATE checkprint_items
+                       SET source_path=?,
+                           cp_path=?,
+                           submitter=?,
+                           last_submitted_on=?
+                     WHERE id=?
+                """, (rel_src, rel_cp, actor or "", now_date, int(it["id"])))
+                con.commit()
+                con.close()
+
+            _retry_write(_do_overwrite)
+            overwritten += 1
+
+        else:
+            new_version = int(meta.get("new_version") or it.get("cp_version") or 1)
+
+            def _do_increment():
+                con = _connect(db_path)
+                cur = con.cursor()
+                cur.execute("""
+                    UPDATE checkprint_items
+                       SET source_path=?,
+                           cp_path=?,
+                           submitter=?,
+                           cp_version=?,
+                           status=?,
+                           reviewer=NULL,
+                           last_reviewer_note=NULL,
+                           last_submitted_on=?,
+                           last_reviewed_on=NULL
+                     WHERE id=?
+                """, (
+                    rel_src,
+                    rel_cp,
+                    actor or "",
+                    new_version,
+                    str(new_status or "pending"),
+                    now_date,
+                    int(it["id"]),
+                ))
+                con.commit()
+                con.close()
+
+            _retry_write(_do_increment)
+            incremented += 1
+
+        # Event log (best-effort)
+        try:
+            append_checkprint_event(
+                db_path,
+                item_id=int(it["id"]),
+                actor=actor or "",
+                event="resubmitted",
+                from_status=old_status,
+                to_status=new_status,
+                note=f"Resubmitted via _CheckPrintIncoming ({Path(src_path).name})",
+            )
+        except Exception:
+            pass
+
+    # Delete incoming files ONLY after DB success
+    delete_ops = [plan_delete(p) for p in incoming_files]
+    ok2, bad2, reason2 = preflight_ops(delete_ops)
+    if not ok2:
+        # We do NOT roll back the resubmission; just report the cleanup issue.
+        return {
+            "ok": True,
+            "updated": overwritten + incremented,
+            "overwritten": overwritten,
+            "incremented": incremented,
+            "deleted_incoming": 0,
+            "cleanup_warning": {"path": str(bad2), "reason": reason2 or ""},
+        }
+
+    execute_ops(delete_ops)
+
+    return {
+        "ok": True,
+        "updated": overwritten + incremented,
+        "overwritten": overwritten,
+        "incremented": incremented,
+        "deleted_incoming": len(incoming_files),
+        "incoming_dir": str(incoming_dir),
+    }
 
 def finalize_checkprint_to_transmittal(
     db_path: Path,
@@ -879,6 +1142,224 @@ def cancel_checkprint(db_path: Path, *, batch_id: int, actor: str) -> dict:
         "error_path": None,
         "error_reason": None
     }
+
+
+def _mark_checkprint_cancelled(db_path: Path, batch_id: int, actor: str):
+    """Internal helper to update CheckPrint batch state."""
+    db_path = Path(db_path)
+
+    def _do():
+        con = _connect(db_path)
+        cur = con.cursor()
+        cur.execute("""
+            UPDATE checkprint_batches
+               SET status='cancelled',
+                   reviewer=?,
+                   reviewer_notes=COALESCE(reviewer_notes, ''),
+                   submitted_on=NULL
+             WHERE id=?
+        """, (actor, int(batch_id)))
+        con.commit()
+        con.close()
+
+    _retry_write(_do)
+
+    # No event log here — batch-level cancellation does NOT apply to item-level history.
+
+def add_documents_to_checkprint(
+    db_path: Path,
+    batch_id: int,
+    *,
+    items: List[Dict[str, Any]],
+    actor: str,
+) -> Dict[str, Any]:
+    """
+    Add documents to an existing (active) CheckPrint batch.
+
+    items must match the FilesTab snapshot format at minimum:
+        [{"doc_id": "...", "revision": "...", "file_path": "..."}, ...]
+
+    This operation is highly controlled:
+      - Only allows adding from the register (doc_id must exist in DB project)
+      - Source file must NOT already have a _CP_N suffix
+      - Renames source to _CP_1 and copies into the batch folder
+      - Inserts new checkprint_items rows (state='active')
+    """
+    db_path = Path(db_path)
+    init_db(db_path)
+    batch_id = int(batch_id)
+
+    batch = get_checkprint_batch(db_path, batch_id)
+    if not batch:
+        return {"ok": False, "error": "batch_not_found"}
+    if batch.get("status") not in {"in_progress", "submitted", "awaiting_review"}:
+        return {"ok": False, "error": "batch_not_editable", "status": batch.get("status")}
+
+    existing = get_checkprint_items(db_path, batch_id)
+    existing_doc_ids = {str(it["doc_id"]) for it in existing}
+
+    proj_root = _project_root(db_path)
+    cp_root = _checkprint_root(db_path)
+    batch_dir = cp_root / str(batch["code"])
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    planned_ops = []
+    prepared_items: List[Dict[str, Any]] = []
+    now = datetime.now().strftime("%Y-%m-%d")
+
+    # Validate + plan file ops first
+    for snap in items:
+        doc_id = str(snap.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        if doc_id in existing_doc_ids:
+            return {"ok": False, "error": "duplicate_doc_in_batch", "doc_id": doc_id}
+
+        src = Path(str(snap.get("file_path") or "")).expanduser()
+        if not src.exists():
+            return {"ok": False, "error": "source_missing", "doc_id": doc_id, "path": str(src)}
+        if not src.is_file():
+            return {"ok": False, "error": "source_not_file", "doc_id": doc_id, "path": str(src)}
+
+        # refuse if already a CP file
+        stem = src.stem
+        if re.search(r"_CP_\d+$", stem, flags=re.IGNORECASE):
+            return {"ok": False, "error": "source_already_cp", "doc_id": doc_id, "path": str(src)}
+
+        base_name, ext = _split_basename(src.name)
+        cp_version = 1
+        cp_name = f"{base_name}_CP_{cp_version}{ext}"
+        dst_src = src.with_name(cp_name)
+        dst_cp = batch_dir / cp_name
+
+        planned_ops.append(plan_rename(src, dst_src))
+        planned_ops.append(plan_copy(dst_src, dst_cp))
+
+        prepared_items.append(
+            {
+                "doc_id": doc_id,
+                "revision": str(snap.get("revision") or ""),
+                "base_name": base_name + ext,
+                "cp_version": cp_version,
+                "status": "pending",
+                "submitter": actor or "",
+                "reviewer": "",
+                "last_submitted_on": now,
+                "last_reviewed_on": "",
+                "last_reviewer_note": "",
+                "source_path": str(dst_src.relative_to(proj_root)),
+                "cp_path": str(dst_cp.relative_to(proj_root)),
+                "state": "active",
+            }
+        )
+
+    if not prepared_items:
+        return {"ok": False, "error": "no_items"}
+
+    ok, bad_path, reason = preflight_ops(planned_ops)
+    if not ok:
+        return {"ok": False, "error": "blocked", "path": bad_path, "reason": reason}
+
+    try:
+        execute_ops(planned_ops)
+    except Exception as e:
+        return {"ok": False, "error": "file_ops_failed", "reason": str(e)}
+
+    inserted_ids = insert_checkprint_items(db_path, batch_id=batch_id, items=prepared_items)
+
+    # Log events (best-effort; do not fail the operation if event insert fails)
+    for item_id in inserted_ids:
+        try:
+            append_checkprint_event(
+                db_path,
+                item_id=int(item_id),
+                actor=actor,
+                event="added",
+                from_status=None,
+                to_status="pending",
+                note="Added to CheckPrint batch",
+            )
+        except Exception:
+            pass
+
+    return {"ok": True, "inserted": len(inserted_ids)}
+
+
+def remove_documents_from_checkprint(
+    db_path: Path,
+    batch_id: int,
+    *,
+    item_ids: List[int],
+    actor: str,
+) -> Dict[str, Any]:
+    """
+    Remove items from an existing batch (soft-remove).
+
+    - Restores source filename back to base_name
+    - Deletes CP copy from the batch folder
+    - Marks row as state='removed' (keeps audit)
+    """
+    if not item_ids:
+        return {"ok": False, "error": "no_items"}
+
+    db_path = Path(db_path)
+    init_db(db_path)
+    batch_id = int(batch_id)
+
+    batch = get_checkprint_batch(db_path, batch_id)
+    if not batch:
+        return {"ok": False, "error": "batch_not_found"}
+    if batch.get("status") not in {"in_progress", "submitted", "awaiting_review"}:
+        return {"ok": False, "error": "batch_not_editable", "status": batch.get("status")}
+
+    items = get_checkprint_items_by_ids(db_path, [int(x) for x in item_ids])
+    items = [it for it in items if int(it.get("batch_id") or 0) == batch_id and it.get("state") == "active"]
+    if not items:
+        return {"ok": False, "error": "items_not_found"}
+
+    proj_root = _project_root(db_path)
+    planned_ops = []
+
+    for it in items:
+        src_abs = proj_root / str(it["source_path"])
+        cp_abs = proj_root / str(it["cp_path"])
+
+        # Restore original name (base_name already includes extension)
+        restore_name = str(it.get("base_name") or "").strip()
+        if restore_name:
+            restore_abs = src_abs.with_name(restore_name)
+            if src_abs.exists():
+                planned_ops.append(plan_rename(src_abs, restore_abs))
+
+        if cp_abs.exists():
+            planned_ops.append(plan_delete(cp_abs))
+
+    ok, bad_path, reason = preflight_ops(planned_ops)
+    if not ok:
+        return {"ok": False, "error": "blocked", "path": bad_path, "reason": reason}
+
+    try:
+        execute_ops(planned_ops)
+    except Exception as e:
+        return {"ok": False, "error": "file_ops_failed", "reason": str(e)}
+
+    # Events first (but rows remain; safe)
+    for it in items:
+        try:
+            append_checkprint_event(
+                db_path,
+                item_id=int(it["id"]),
+                actor=actor,
+                event="removed",
+                from_status=str(it.get("status") or ""),
+                to_status="removed",
+                note="Removed from CheckPrint batch",
+            )
+        except Exception:
+            pass
+
+    mark_checkprint_items_removed(db_path, batch_id=batch_id, item_ids=[int(it["id"]) for it in items])
+    return {"ok": True, "removed": len(items)}
 
 
 def _mark_checkprint_cancelled(db_path: Path, batch_id: int, actor: str):
