@@ -713,13 +713,64 @@ class CheckPrintTab(QWidget):
             QMessageBox.critical(self, "Error", f"Resubmit failed:\n{e}")
             return
 
-        if not res.get("ok"):
+        errors = res.get("errors", {}) or {}
+
+        # Bridge newer `details` structure into legacy error buckets
+        details = res.get("details", []) or []
+        if details:
+            unmatched = errors.setdefault("unmatched", [])
+            for d in details:
+                if d.get("error") == "no_match":
+                    unmatched.append(d.get("file"))
+
+        has_errors = any(
+            errors.get(k) for k in ("unmatched", "bad_format", "duplicate")
+        )
+
+        if not res.get("ok") or has_errors:
             incoming_dir = res.get("incoming_dir", "CheckPrint/_CheckPrintIncoming")
-            details = res.get("details")
-            msg = f"Resubmit failed.\n\nIncoming folder:\n{incoming_dir}\n\nFiles must be named DOCID_REV.pdf"
-            if details:
-                msg += f"\n\nDetails:\n{details}"
-            QMessageBox.critical(self, "CheckPrint", msg)
+            register_examples = res.get("register_examples", []) or []
+
+            msg = (
+                "Resubmission failed.\n\n"
+                f"Incoming folder:\n{incoming_dir}\n\n"
+            )
+
+            def _fmt_sample(title: str, items: list, limit: int = 5) -> str:
+                if not items:
+                    return ""
+                shown = items[:limit]
+                txt = "\n".join(f"  • {x}" for x in shown)
+                more = f"\n  … and {len(items) - limit} more" if len(items) > limit else ""
+                return f"{title} ({len(items)}):\n{txt}{more}\n"
+
+            msg += _fmt_sample(
+                "Files not matching any register document",
+                errors.get("unmatched", []),
+            )
+            msg += _fmt_sample(
+                "Files with invalid naming (expected DOCID_REV.pdf)",
+                errors.get("bad_format", []),
+            )
+            msg += _fmt_sample(
+                "Duplicate submissions",
+                errors.get("duplicate", []),
+            )
+
+            if register_examples:
+                msg += (
+                        "Register expects filenames similar to:\n"
+                        + "\n".join(f"  • {x}" for x in register_examples[:5])
+                        + ("\n  …" if len(register_examples) > 5 else "")
+                        + "\n"
+                )
+
+            msg += (
+                "\nFix the issues above and try again.\n"
+                "Tip: Incoming is a transient buffer — only correctly named files should be placed here."
+            )
+
+            QMessageBox.critical(self, "CheckPrint – Resubmit failed", msg)
             return
 
         msg = (
@@ -729,6 +780,7 @@ class CheckPrintTab(QWidget):
             f"Incremented (accepted/rejected): {res.get('incremented', 0)}\n"
             f"Incoming cleaned: {res.get('deleted_incoming', 0)} file(s)"
         )
+
         cw = res.get("cleanup_warning")
         if cw:
             msg += f"\n\nCleanup warning:\n{cw}"

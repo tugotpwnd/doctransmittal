@@ -19,13 +19,14 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from ..core.settings import SettingsManager
 from ..services.db import (
     get_checkprint_items,
     list_documents_with_latest,
     get_project,
     mark_checkprint_items_removed,
 )
-from ..services.checkprint_service import add_documents_to_checkprint
+from ..services.checkprint_service import add_documents_to_checkprint, remove_documents_from_checkprint
 from ..services.snapshot_helpers import build_snapshot_items
 from ..services.autofind import suggest_mapping, find_docid_rev_matches
 
@@ -49,6 +50,7 @@ class CheckPrintEditDialog(QDialog):
         self.db_path = Path(db_path)
         self.batch_id = int(batch_id)
         self.user_name = user_name
+        self.source_dir: Optional[Path] = None
 
         proj = get_project(self.db_path) or {}
         self.project_id: Optional[int] = proj.get("id")
@@ -65,7 +67,18 @@ class CheckPrintEditDialog(QDialog):
         # ---------- LEFT: REGISTER ----------
         left = QWidget()
         lv = QVBoxLayout(left)
-        lv.addWidget(QLabel("Register (available)"))
+        hdr = QHBoxLayout()
+        hdr.addWidget(QLabel("Register (available)"))
+
+        self.lbl_source = QLabel("Source folder: <not set>")
+        self.lbl_source.setStyleSheet("color: #666;")
+        hdr.addWidget(self.lbl_source, 1)
+
+        btn_pick = QPushButton("Change…")
+        btn_pick.clicked.connect(self._pick_source_folder)
+        hdr.addWidget(btn_pick)
+
+        lv.addLayout(hdr)
 
         self.tbl_register = QTableWidget(0, 4)
         self.tbl_register.setHorizontalHeaderLabels(
@@ -112,6 +125,7 @@ class CheckPrintEditDialog(QDialog):
 
         self._reload_tables()
 
+
     # ==========================================================
     # Data loading
     # ==========================================================
@@ -157,10 +171,32 @@ class CheckPrintEditDialog(QDialog):
     # ==========================================================
     # Actions
     # ==========================================================
+
+    def _pick_source_folder(self):
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Select source folder for autofind",
+            str(self.source_dir) if self.source_dir else "",
+        )
+        if not path:
+            return
+
+        self.source_dir = Path(path).resolve()
+        self.lbl_source.setText(f"Source folder: {self.source_dir}")
+
     def _add_selected(self):
         rows = self.tbl_register.selectionModel().selectedRows()
         if not rows:
             QMessageBox.information(self, "Select", "Select register rows to add.")
+            return
+
+        if not self.source_dir or not self.source_dir.exists():
+            QMessageBox.warning(
+                self,
+                "Source folder required",
+                "Please select a source folder before adding documents.\n\n"
+                "This folder will be scanned to locate files automatically.",
+            )
             return
 
         items: List[dict] = []
@@ -173,47 +209,80 @@ class CheckPrintEditDialog(QDialog):
                 "description": self.tbl_register.item(r, 3).text(),
             })
 
-        # --- Autofind ---
         doc_ids = [it["doc_id"] for it in items]
+
+        # ----------------------------------------------------------
+        # Autofind (recursive, duplicate-aware)
+        # ----------------------------------------------------------
+        guessed = suggest_mapping(doc_ids, [self.source_dir]) or {}
         mapping: Dict[str, str] = {}
 
-        guessed = suggest_mapping(doc_ids, []) or {}
-        for did, matches in guessed.items():
-            if matches:
-                mapping[did] = str(matches[0][0])
+        ambiguous: Dict[str, List[str]] = {}
+        missing: List[str] = []
 
-        # --- Prompt for missing ---
         for it in items:
             did = it["doc_id"]
-            if did in mapping:
+            matches = guessed.get(did, [])
+
+            # Normalise to absolute paths
+            paths = [Path(p[0]).resolve() for p in matches]
+
+            if not paths:
+                missing.append(did)
                 continue
+
+            # Detect duplicates (even if filenames identical)
+            unique = list({str(p) for p in paths})
+            if len(unique) > 1:
+                ambiguous[did] = unique
+                continue
+
+            mapping[did] = unique[0]
+
+        # ----------------------------------------------------------
+        # Handle ambiguous matches (hard stop)
+        # ----------------------------------------------------------
+        if ambiguous:
+            msg = "Multiple matching files found for the following documents:\n\n"
+            for did, paths in ambiguous.items():
+                msg += f"{did}:\n"
+                for p in paths:
+                    msg += f"  - {p}\n"
+                msg += "\n"
+
+            QMessageBox.critical(
+                self,
+                "Ambiguous matches",
+                msg + "Please resolve these manually (rename or remove duplicates) and try again.",
+            )
+            return
+
+        # ----------------------------------------------------------
+        # Prompt for missing files
+        # ----------------------------------------------------------
+        for did in missing:
             path, _ = QFileDialog.getOpenFileName(
                 self,
                 f"Select file for {did}",
-                "",
-                "All Files (*.*)",
+                str(self.source_dir),
+                "PDF Files (*.pdf);;All Files (*.*)",
             )
             if not path:
                 QMessageBox.warning(self, "Cancelled", f"No file selected for {did}")
                 return
-            mapping[did] = path
+            mapping[did] = str(Path(path).resolve())
 
         # ----------------------------------------------------------
-        # Warn (but allow) if selected files are outside the common
-        # CheckPrint source folder (new-document add only)
+        # Warn (but allow) if files are outside existing CP source dir
         # ----------------------------------------------------------
         cp_items = get_checkprint_items(self.db_path, self.batch_id)
         if cp_items:
-            # Project root is two levels above DB (consistent with services)
             proj_root = self.db_path.parent.parent
-
-            # Use the first CP item's source path as the reference folder
             first_src = str(cp_items[0].get("source_path") or "").strip()
             expected_dir = (proj_root / first_src).parent if first_src else None
 
             if expected_dir and expected_dir.exists():
-                mismatched: List[tuple[str, str]] = []
-
+                mismatched = []
                 for did, p in mapping.items():
                     pp = Path(p).resolve()
                     if pp.parent.resolve() != expected_dir.resolve():
@@ -226,7 +295,7 @@ class CheckPrintEditDialog(QDialog):
                         "Non-standard location",
                         "One or more selected files are not in the same folder as the existing "
                         "CheckPrint source files.\n\n"
-                        "This is allowed, but not advised.\n\n"
+                        "This is allowed, registration is per-file, but it is not advised.\n\n"
                         f"Expected folder:\n{expected_dir}\n\n"
                         f"Mismatched files:\n{txt}\n\n"
                         "Continue anyway?",
@@ -237,7 +306,7 @@ class CheckPrintEditDialog(QDialog):
                         return
 
         # ----------------------------------------------------------
-        # Proceed with snapshot + DB mutation
+        # Commit
         # ----------------------------------------------------------
         snapshot = build_snapshot_items(items=items, mapping=mapping)
 
@@ -248,7 +317,6 @@ class CheckPrintEditDialog(QDialog):
             actor=self.user_name,
         )
 
-
         if not res.get("ok"):
             QMessageBox.critical(self, "Add failed", str(res))
             return
@@ -258,16 +326,86 @@ class CheckPrintEditDialog(QDialog):
     def _remove_selected(self):
         rows = self.tbl_cp.selectionModel().selectedRows()
         if not rows:
-            QMessageBox.information(self, "Select", "Select CheckPrint items to remove.")
+            QMessageBox.information(
+                self,
+                "Select",
+                "Select CheckPrint items to remove.",
+            )
             return
 
-        ids = [int(self.tbl_cp.item(r.row(), 0).text()) for r in rows]
+        # Extract selected checkprint_items.id values
+        try:
+            item_ids = [
+                int(self.tbl_cp.item(r.row(), 0).text())
+                for r in rows
+            ]
+        except Exception:
+            QMessageBox.critical(
+                self,
+                "Error",
+                "Failed to determine selected CheckPrint items.",
+            )
+            return
 
-        # Placeholder: DB-only removal for now
-        mark_checkprint_items_removed(
-            self.db_path,
-            batch_id=self.batch_id,
-            item_ids=ids,
+        # Prompt user for source handling decision
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Remove from CheckPrint")
+        msg.setIcon(QMessageBox.Question)
+        msg.setText(
+            "When removing the selected documents from this CheckPrint batch,\n"
+            "how should the source files be handled?"
         )
+
+        keep_btn = msg.addButton(
+            "Keep latest CheckPrint as source",
+            QMessageBox.AcceptRole,
+        )
+        revert_btn = msg.addButton(
+            "Revert source to original",
+            QMessageBox.DestructiveRole,
+        )
+        cancel_btn = msg.addButton(
+            QMessageBox.Cancel,
+        )
+
+        msg.exec_()
+
+        clicked = msg.clickedButton()
+        if clicked == cancel_btn or clicked is None:
+            return
+
+        if clicked == keep_btn:
+            mode = "keep_latest"
+        elif clicked == revert_btn:
+            mode = "revert_original"
+        else:
+            return
+
+        actor = SettingsManager().get("user.name", "") or ""
+
+        # Call service-layer removal (authoritative)
+        try:
+            res = remove_documents_from_checkprint(
+                self.db_path,
+                batch_id=self.batch_id,
+                item_ids=item_ids,
+                actor=actor,
+                mode=mode,
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Remove failed",
+                f"An unexpected error occurred:\n{e}",
+            )
+            return
+
+        if not res.get("ok"):
+            QMessageBox.critical(
+                self,
+                "Remove failed",
+                str(res),
+            )
+            return
 
         self._reload_tables()

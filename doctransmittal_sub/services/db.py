@@ -1235,9 +1235,12 @@ def mark_checkprint_items_removed(
     item_ids: List[int],
 ) -> int:
     """
-    Placeholder for "remove from checkprint" (DB-only for now).
-    Hard-deletes checkprint_items rows (events cascade).
-    File operations are intentionally NOT handled here yet.
+    Soft-remove checkprint items.
+
+    Sets:
+      state = 'removed'
+
+    Rows are preserved for audit and history.
     """
     init_db(db_path)
     ids = [int(x) for x in item_ids if int(x) > 0]
@@ -1249,7 +1252,8 @@ def mark_checkprint_items_removed(
         cur = con.cursor()
 
         q = f"""
-            DELETE FROM checkprint_items
+            UPDATE checkprint_items
+               SET state='removed'
              WHERE batch_id=?
                AND id IN ({",".join(["?"] * len(ids))})
         """
@@ -1261,6 +1265,7 @@ def mark_checkprint_items_removed(
         return int(count or 0)
 
     return _retry_write(_do)
+
 
 
 def get_latest_checkprint_versions(

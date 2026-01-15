@@ -1232,8 +1232,11 @@ def add_documents_to_checkprint(
         dst_src = src.with_name(cp_name)
         dst_cp = batch_dir / cp_name
 
+        # 1) Copy ORIGINAL source into CheckPrint folder
+        planned_ops.append(plan_copy(src, dst_cp))
+
+        # 2) Rename ORIGINAL source in-place
         planned_ops.append(plan_rename(src, dst_src))
-        planned_ops.append(plan_copy(dst_src, dst_cp))
 
         prepared_items.append(
             {
@@ -1284,6 +1287,8 @@ def add_documents_to_checkprint(
 
     return {"ok": True, "inserted": len(inserted_ids)}
 
+from typing import Literal
+from datetime import datetime
 
 def remove_documents_from_checkprint(
     db_path: Path,
@@ -1291,16 +1296,26 @@ def remove_documents_from_checkprint(
     *,
     item_ids: List[int],
     actor: str,
+    mode: Literal["keep_latest", "revert_original"],
 ) -> Dict[str, Any]:
     """
-    Remove items from an existing batch (soft-remove).
+    Remove documents from an existing CheckPrint batch.
 
-    - Restores source filename back to base_name
-    - Deletes CP copy from the batch folder
-    - Marks row as state='removed' (keeps audit)
+    Behaviour (batch-local, per doc_id):
+      - Cleans up ALL CP artefacts for the document in this batch
+      - Soft-removes DB rows (state='removed')
+      - User-selected source handling:
+          * keep_latest     → latest CP becomes the source file
+          * revert_original → original source restored
+
+    No hard deletes. Full audit preserved.
     """
+
     if not item_ids:
         return {"ok": False, "error": "no_items"}
+
+    if mode not in {"keep_latest", "revert_original"}:
+        return {"ok": False, "error": "invalid_mode"}
 
     db_path = Path(db_path)
     init_db(db_path)
@@ -1312,28 +1327,88 @@ def remove_documents_from_checkprint(
     if batch.get("status") not in {"in_progress", "submitted", "awaiting_review"}:
         return {"ok": False, "error": "batch_not_editable", "status": batch.get("status")}
 
-    items = get_checkprint_items_by_ids(db_path, [int(x) for x in item_ids])
-    items = [it for it in items if int(it.get("batch_id") or 0) == batch_id and it.get("state") == "active"]
-    if not items:
+    # Load selected items, restrict to active + this batch
+    seed_items = get_checkprint_items_by_ids(db_path, [int(x) for x in item_ids])
+    seed_items = [
+        it for it in seed_items
+        if int(it.get("batch_id") or 0) == batch_id
+        and it.get("state") == "active"
+    ]
+    if not seed_items:
         return {"ok": False, "error": "items_not_found"}
+
+    # Expand to ALL CP entries for the affected doc_ids (batch-local)
+    affected_doc_ids = {it["doc_id"] for it in seed_items}
+    all_batch_items = get_checkprint_items(db_path, batch_id)
+    per_doc: Dict[str, List[Dict[str, Any]]] = {}
+    for it in all_batch_items:
+        if it.get("state") != "active":
+            continue
+        if it["doc_id"] in affected_doc_ids:
+            per_doc.setdefault(it["doc_id"], []).append(it)
 
     proj_root = _project_root(db_path)
     planned_ops = []
+    now = datetime.now().strftime("%Y-%m-%d")
 
-    for it in items:
-        src_abs = proj_root / str(it["source_path"])
-        cp_abs = proj_root / str(it["cp_path"])
+    # ------------------------------------------------------------
+    # Plan file operations per document
+    # ------------------------------------------------------------
+    for doc_id, items in per_doc.items():
+        # sort by cp_version
+        items = sorted(items, key=lambda x: int(x.get("cp_version") or 0))
+        first = items[0]
+        last = items[-1]
 
-        # Restore original name (base_name already includes extension)
-        restore_name = str(it.get("base_name") or "").strip()
-        if restore_name:
-            restore_abs = src_abs.with_name(restore_name)
-            if src_abs.exists():
-                planned_ops.append(plan_rename(src_abs, restore_abs))
+        src_abs = proj_root / str(first["source_path"])
+        base_name = str(first.get("base_name") or "").strip()
 
-        if cp_abs.exists():
-            planned_ops.append(plan_delete(cp_abs))
+        # Collect all CP files for deletion consideration
+        cp_files = [
+            proj_root / str(it["cp_path"])
+            for it in items
+            if it.get("cp_path")
+        ]
 
+        if mode == "keep_latest":
+            # Latest CP becomes source
+            latest_cp_abs = proj_root / str(last["cp_path"])
+            if not latest_cp_abs.exists():
+                return {
+                    "ok": False,
+                    "error": "latest_cp_missing",
+                    "doc_id": doc_id,
+                    "path": str(latest_cp_abs),
+                }
+
+            if base_name:
+                new_src_abs = latest_cp_abs.with_name(base_name)
+
+                # Remove existing source (if any), then promote CP
+                if src_abs.exists():
+                    planned_ops.append(plan_delete(src_abs))
+                planned_ops.append(plan_rename(latest_cp_abs, new_src_abs))
+
+                # Delete remaining CP files (excluding promoted one)
+                for cp in cp_files:
+                    if cp != latest_cp_abs and cp.exists():
+                        planned_ops.append(plan_delete(cp))
+
+        else:  # revert_original
+            # Restore original source name if needed
+            if base_name and src_abs.exists():
+                restore_abs = src_abs.with_name(base_name)
+                if restore_abs != src_abs:
+                    planned_ops.append(plan_rename(src_abs, restore_abs))
+
+            # Delete all CP artefacts
+            for cp in cp_files:
+                if cp.exists():
+                    planned_ops.append(plan_delete(cp))
+
+    # ------------------------------------------------------------
+    # Preflight + execution
+    # ------------------------------------------------------------
     ok, bad_path, reason = preflight_ops(planned_ops)
     if not ok:
         return {"ok": False, "error": "blocked", "path": bad_path, "reason": reason}
@@ -1343,23 +1418,38 @@ def remove_documents_from_checkprint(
     except Exception as e:
         return {"ok": False, "error": "file_ops_failed", "reason": str(e)}
 
-    # Events first (but rows remain; safe)
-    for it in items:
-        try:
-            append_checkprint_event(
-                db_path,
-                item_id=int(it["id"]),
-                actor=actor,
-                event="removed",
-                from_status=str(it.get("status") or ""),
-                to_status="removed",
-                note="Removed from CheckPrint batch",
-            )
-        except Exception:
-            pass
+    # ------------------------------------------------------------
+    # DB updates + audit
+    # ------------------------------------------------------------
+    removed_ids: List[int] = []
 
-    mark_checkprint_items_removed(db_path, batch_id=batch_id, item_ids=[int(it["id"]) for it in items])
-    return {"ok": True, "removed": len(items)}
+    for doc_id, items in per_doc.items():
+        for it in items:
+            removed_ids.append(int(it["id"]))
+            try:
+                append_checkprint_event(
+                    db_path,
+                    item_id=int(it["id"]),
+                    actor=actor,
+                    event="removed",
+                    from_status=str(it.get("status") or ""),
+                    to_status="removed",
+                    note=f"Removed from CheckPrint batch ({mode})",
+                )
+            except Exception:
+                pass
+
+    mark_checkprint_items_removed(
+        db_path,
+        batch_id=batch_id,
+        item_ids=removed_ids,
+    )
+
+    return {
+        "ok": True,
+        "removed": len(removed_ids),
+        "mode": mode,
+    }
 
 
 def _mark_checkprint_cancelled(db_path: Path, batch_id: int, actor: str):
