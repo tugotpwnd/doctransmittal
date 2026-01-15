@@ -1144,28 +1144,6 @@ def cancel_checkprint(db_path: Path, *, batch_id: int, actor: str) -> dict:
     }
 
 
-def _mark_checkprint_cancelled(db_path: Path, batch_id: int, actor: str):
-    """Internal helper to update CheckPrint batch state."""
-    db_path = Path(db_path)
-
-    def _do():
-        con = _connect(db_path)
-        cur = con.cursor()
-        cur.execute("""
-            UPDATE checkprint_batches
-               SET status='cancelled',
-                   reviewer=?,
-                   reviewer_notes=COALESCE(reviewer_notes, ''),
-                   submitted_on=NULL
-             WHERE id=?
-        """, (actor, int(batch_id)))
-        con.commit()
-        con.close()
-
-    _retry_write(_do)
-
-    # No event log here — batch-level cancellation does NOT apply to item-level history.
-
 def add_documents_to_checkprint(
     db_path: Path,
     batch_id: int,
@@ -1289,6 +1267,7 @@ def add_documents_to_checkprint(
 
 from typing import Literal
 from datetime import datetime
+import re
 
 def remove_documents_from_checkprint(
     db_path: Path,
@@ -1370,6 +1349,31 @@ def remove_documents_from_checkprint(
             if it.get("cp_path")
         ]
 
+        # --------------------------------------------------------
+        # ALSO sweep filesystem for any stray CP_N files
+        # (covers legacy DB-only removals or partial failures)
+        # --------------------------------------------------------
+        try:
+            batch_dir = cp_files[0].parent if cp_files else None
+            if batch_dir and batch_dir.exists():
+                import os, re
+
+                base_stem, base_ext = os.path.splitext(base_name)
+                cp_pattern = re.compile(
+                    rf"^{re.escape(base_stem)}_CP_\d+{re.escape(base_ext)}$",
+                    re.IGNORECASE,
+                )
+
+                for p in batch_dir.iterdir():
+                    if not p.is_file():
+                        continue
+                    if cp_pattern.match(p.name) and p not in cp_files:
+                        cp_files.append(p)
+        except Exception:
+            # Never fail removal due to cleanup discovery
+            pass
+
+
         if mode == "keep_latest":
             # Latest CP becomes source
             latest_cp_abs = proj_root / str(last["cp_path"])
@@ -1383,16 +1387,38 @@ def remove_documents_from_checkprint(
 
             if base_name:
                 new_src_abs = latest_cp_abs.with_name(base_name)
+                # Promote latest CP to become the new source file (PRE-FLIGHT SAFE)
+                latest_cp_abs = proj_root / str(last["cp_path"])
+                if not latest_cp_abs.exists():
+                    return {
+                        "ok": False,
+                        "error": "latest_cp_missing",
+                        "doc_id": doc_id,
+                        "path": str(latest_cp_abs),
+                    }
 
-                # Remove existing source (if any), then promote CP
-                if src_abs.exists():
-                    planned_ops.append(plan_delete(src_abs))
-                planned_ops.append(plan_rename(latest_cp_abs, new_src_abs))
+                if not base_name:
+                    return {
+                        "ok": False,
+                        "error": "missing_base_name",
+                        "doc_id": doc_id,
+                    }
 
-                # Delete remaining CP files (excluding promoted one)
+                new_src_abs = src_abs.with_name(base_name)
+
+                # 1) Remove existing source first (if present)
+                if new_src_abs.exists():
+                    planned_ops.append(plan_delete(new_src_abs))
+
+                # 2) Copy latest CP → canonical source name
+                planned_ops.append(plan_copy(latest_cp_abs, new_src_abs))
+
+                # 3) Delete ALL CP artefacts (including the promoted one)
                 for cp in cp_files:
-                    if cp != latest_cp_abs and cp.exists():
+                    if cp.exists():
                         planned_ops.append(plan_delete(cp))
+
+
 
         else:  # revert_original
             # Restore original source name if needed
