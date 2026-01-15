@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QComboBox,
     QMenu,
-    QInputDialog,
+    QInputDialog, QCheckBox, QLineEdit,
 )
 
 from PyQt5.QtGui import QColor
@@ -37,8 +37,8 @@ try:
         overwrite_checkprint_items,
         resubmit_all_incoming,
         cancel_checkprint,
-        finalize_checkprint_to_transmittal,
         _mark_checkprint_cancelled,
+        complete_and_archive_checkprint,
     )
     from ..core.paths import resolve_company_library_path
 except ImportError:
@@ -53,8 +53,8 @@ except ImportError:
         overwrite_checkprint_items,
         resubmit_all_incoming,
         cancel_checkprint,
-        finalize_checkprint_to_transmittal,
         _mark_checkprint_cancelled,
+        complete_and_archive_checkprint,
     )
     from core.paths import resolve_company_library_path
 
@@ -139,112 +139,121 @@ class CheckPrintTab(QWidget):
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setAlignment(Qt.AlignTop)
 
-        # --- Batch selector (combo) ---
+        # ==========================================================
+        # Batch selector
+        # ==========================================================
         box_batches = QGroupBox("CheckPrint Batch")
         box_batches.setMaximumHeight(100)
         hb = QHBoxLayout(box_batches)
         hb.addWidget(QLabel("Select batch:"))
+
         self.combo_batches = QComboBox()
         self.combo_batches.currentIndexChanged.connect(self._on_batch_selected)
         hb.addWidget(self.combo_batches, 1)
+
         root.addWidget(box_batches)
 
-        # --- Mode selector (Submitter vs Reviewer) ---
+        # ==========================================================
+        # Role selector
+        # ==========================================================
         mode_box = QGroupBox("Select Role")
-        mb = QHBoxLayout(mode_box)
         mode_box.setMaximumHeight(100)
+        mb = QHBoxLayout(mode_box)
 
         self.btn_as_submitter = QPushButton("Submitter")
         self.btn_as_submitter.setFixedWidth(150)
-        self.btn_as_submitter.setEnabled(self.current_batch_id is not None)
         self.btn_as_submitter.clicked.connect(self._enter_submitter_mode)
         mb.addWidget(self.btn_as_submitter)
 
         self.btn_as_reviewer = QPushButton("Reviewer")
         self.btn_as_reviewer.setFixedWidth(150)
-        self.btn_as_reviewer.setEnabled(self.current_batch_id is not None)
         self.btn_as_reviewer.clicked.connect(self._enter_reviewer_mode)
         mb.addWidget(self.btn_as_reviewer)
 
         mb.addStretch(1)
         root.addWidget(mode_box)
 
-        # --- Submitter panel ---
+        # ==========================================================
+        # COMPLETED (HISTORY) VIEW
+        # ==========================================================
+        self.box_history = QGroupBox("CheckPrint History")
+        self.box_history.setVisible(False)
+        hv = QVBoxLayout(self.box_history)
+
+        lbl = QLabel(
+            "This CheckPrint has been completed.\n"
+            "Documents below are read-only and retained for audit."
+        )
+        lbl.setStyleSheet("color: #aaa;")
+        hv.addWidget(lbl)
+
+        self.list_history = QListWidget()
+        self.list_history.setSelectionMode(QListWidget.ExtendedSelection)
+        self._wire_list_common(self.list_history, editable=False, for_reviewer=False)
+        hv.addWidget(self.list_history, 1)
+
+        root.addWidget(self.box_history, 1)
+
+        # ==========================================================
+        # SUBMITTER VIEW
+        # ==========================================================
         self.box_submitter = QGroupBox("Submitter View")
         self.box_submitter.setVisible(False)
         sv = QVBoxLayout(self.box_submitter)
+        sv.setStretch(0, 1)
 
         sub_h = QHBoxLayout()
 
-        # Pending (submitter)
+        # ---------- Pending ----------
         grp_pend_sub = QGroupBox("Pending")
+        grp_pend_sub.setSizePolicy(grp_pend_sub.sizePolicy().horizontalPolicy(),
+                                   grp_pend_sub.sizePolicy().verticalPolicy())
         g_pend_layout = QVBoxLayout(grp_pend_sub)
+
         self.list_pending_sub = QListWidget()
-        # WINDOW SIZE ISSUES? ITS PROBABLY THIS LINE
-        self.list_pending_sub.setMinimumHeight(500)
-        # WINDOW SIZE ISSUES? ITS PROBABLY THIS LINE
         self._wire_list_common(self.list_pending_sub, editable=False, for_reviewer=False)
-        g_pend_layout.addWidget(self.list_pending_sub)
-        self.btn_resubmit_pending_sub = QPushButton("Resubmit Selected")
-        self.btn_resubmit_pending_sub.setFixedWidth(300)
-        self.btn_resubmit_pending_sub.clicked.connect(self._resubmit_from_pending)
-        g_pend_layout.addWidget(self.btn_resubmit_pending_sub)
-        sub_h.addWidget(grp_pend_sub)
+        g_pend_layout.addWidget(self.list_pending_sub, 1)
 
         self.btn_resubmit_pending_sub = QPushButton("Resubmit All Incoming")
-        self.btn_resubmit_pending_sub.setFixedWidth(300)
         self.btn_resubmit_pending_sub.clicked.connect(self._resubmit_all_incoming)
         g_pend_layout.addWidget(self.btn_resubmit_pending_sub)
-        sub_h.addWidget(grp_pend_sub)
 
-        # Rejected (submitter)
+        sub_h.addWidget(grp_pend_sub, 1)
+
+        # ---------- Rejected ----------
         grp_rej_sub = QGroupBox("Rejected")
         g_rej_layout = QVBoxLayout(grp_rej_sub)
+
         self.list_rejected_sub = QListWidget()
         self._wire_list_common(self.list_rejected_sub, editable=False, for_reviewer=False)
-        g_rej_layout.addWidget(self.list_rejected_sub)
+        g_rej_layout.addWidget(self.list_rejected_sub, 1)
 
-        btn_row_rej_sub = QHBoxLayout()
-        self.btn_resubmit_rejected_sub = QPushButton("Resubmit All Incoming")
-        self.btn_resubmit_rejected_sub.setFixedWidth(300)
-        self.btn_resubmit_rejected_sub.clicked.connect(self._resubmit_all_incoming)
-        btn_row_rej_sub.addWidget(self.btn_resubmit_rejected_sub)
+        sub_h.addWidget(grp_rej_sub, 1)
 
-        # Rejected (submitter)
-        grp_rej_sub = QGroupBox("Rejected")
-        g_rej_layout = QVBoxLayout(grp_rej_sub)
-        self.list_rejected_sub = QListWidget()
-        self._wire_list_common(self.list_rejected_sub, editable=False, for_reviewer=False)
-        g_rej_layout.addWidget(self.list_rejected_sub)
+        # ---------- Accepted (Minor) ----------
+        grp_accm_sub = QGroupBox("Accepted (Minor)")
+        g_accm_layout = QVBoxLayout(grp_accm_sub)
 
-        btn_row_rej_sub = QHBoxLayout()
-        self.btn_resubmit_rejected_sub = QPushButton("Resubmit Selected")
-        self.btn_resubmit_rejected_sub.setFixedWidth(300)
-        self.btn_resubmit_rejected_sub.clicked.connect(self._resubmit_from_rejected)
-        btn_row_rej_sub.addWidget(self.btn_resubmit_rejected_sub)
+        self.list_accepted_minor_sub = QListWidget()
+        self._wire_list_common(self.list_accepted_minor_sub, editable=False, for_reviewer=False)
+        g_accm_layout.addWidget(self.list_accepted_minor_sub, 1)
 
-        self.btn_view_comment_sub = QPushButton("View Comment")
-        self.btn_view_comment_sub.setFixedWidth(300)
-        self.btn_view_comment_sub.clicked.connect(self._view_comment_submitter)
-        btn_row_rej_sub.addStretch(1)
-        btn_row_rej_sub.addWidget(self.btn_view_comment_sub)
+        sub_h.addWidget(grp_accm_sub, 1)
 
-        g_rej_layout.addLayout(btn_row_rej_sub)
-        sub_h.addWidget(grp_rej_sub)
-
-        # Accepted (submitter)
+        # ---------- Accepted ----------
         grp_acc_sub = QGroupBox("Accepted")
         g_acc_layout = QVBoxLayout(grp_acc_sub)
+
         self.list_accepted_sub = QListWidget()
         self._wire_list_common(self.list_accepted_sub, editable=False, for_reviewer=False)
-        g_acc_layout.addWidget(self.list_accepted_sub)
-        sub_h.addWidget(grp_acc_sub)
+        g_acc_layout.addWidget(self.list_accepted_sub, 1)
+
+        sub_h.addWidget(grp_acc_sub, 1)
 
         sv.addLayout(sub_h)
 
-        # Cancel button (submitter)
+        # Bottom submitter controls
         bottom_sub = QHBoxLayout()
         bottom_sub.addStretch(1)
 
@@ -259,84 +268,119 @@ class CheckPrintTab(QWidget):
         bottom_sub.addWidget(self.btn_cancel_submitter)
 
         sv.addLayout(bottom_sub)
+        root.addWidget(self.box_submitter, 1)
 
-        root.addWidget(self.box_submitter)
-
-        # --- Reviewer panel ---
+        # ==========================================================
+        # REVIEWER VIEW
+        # ==========================================================
         self.box_reviewer = QGroupBox("Reviewer View")
         self.box_reviewer.setVisible(False)
         rv = QVBoxLayout(self.box_reviewer)
+        rv.setStretch(0, 1)
 
         rev_h = QHBoxLayout()
 
-        # Pending (reviewer)
+        # ---------- Pending ----------
         grp_pend_rev = QGroupBox("Pending")
         g_pend_rev_layout = QVBoxLayout(grp_pend_rev)
+
         self.list_pending_rev = QListWidget()
-        self.list_pending_rev.setMinimumHeight(500)
         self._wire_list_common(self.list_pending_rev, editable=True, for_reviewer=True)
-        g_pend_rev_layout.addWidget(self.list_pending_rev)
+        g_pend_rev_layout.addWidget(self.list_pending_rev, 1)
+        self.list_pending_rev.setSelectionMode(QListWidget.ExtendedSelection)
 
-        btn_row_pend_rev = QHBoxLayout()
+
+        btn_row = QHBoxLayout()
         self.btn_accept = QPushButton("Accept")
-        self.btn_accept.setFixedWidth(150)
         self.btn_accept.clicked.connect(self._reviewer_accept)
-        btn_row_pend_rev.addWidget(self.btn_accept)
 
-        self.btn_reject = QPushButton("Reject…")
-        self.btn_reject.setFixedWidth(150)
+        self.btn_accept_minor = QPushButton("Accept (Minor)")
+        self.btn_accept_minor.clicked.connect(self._reviewer_accept_minor)
+
+        self.btn_reject = QPushButton("Reject")
         self.btn_reject.clicked.connect(self._reviewer_reject)
-        btn_row_pend_rev.addWidget(self.btn_reject)
 
-        btn_row_pend_rev.addStretch(1)
-        g_pend_rev_layout.addLayout(btn_row_pend_rev)
+        # --- Row 2: reject default comment controls ---
+        comment_row = QHBoxLayout()
 
-        rev_h.addWidget(grp_pend_rev)
+        self.chk_always_comment = QCheckBox("Always comment")
+        self.chk_always_comment.setChecked(True)
 
-        # Rejected (reviewer)
+        self.le_reject_comment = QLineEdit()
+        self.le_reject_comment.setPlaceholderText("Review PDF")
+        self.le_reject_comment.setText("Review PDF")
+        self.le_reject_comment.setEnabled(True)
+
+        self.chk_always_comment.toggled.connect(
+            self.le_reject_comment.setEnabled
+        )
+
+        btn_row.addWidget(self.btn_accept)
+        btn_row.addWidget(self.btn_accept_minor)
+        btn_row.addWidget(self.btn_reject)
+
+        comment_row.addWidget(self.chk_always_comment)
+        comment_row.addWidget(self.le_reject_comment, stretch=1)
+
+        btn_row.addStretch(1)
+        comment_row.addStretch(1)
+
+        g_pend_rev_layout.addLayout(btn_row)
+        g_pend_rev_layout.addLayout(comment_row)
+        rev_h.addWidget(grp_pend_rev, 1)
+
+
+        # ---------- Rejected ----------
         grp_rej_rev = QGroupBox("Rejected")
         g_rej_rev_layout = QVBoxLayout(grp_rej_rev)
+
         self.list_rejected_rev = QListWidget()
         self._wire_list_common(self.list_rejected_rev, editable=True, for_reviewer=True)
-        g_rej_rev_layout.addWidget(self.list_rejected_rev)
+        g_rej_rev_layout.addWidget(self.list_rejected_rev, 1)
 
-        btn_row_rej_rev = QHBoxLayout()
         self.btn_open_comment_rev = QPushButton("Open Comment…")
-        self.btn_open_comment_rev.setFixedWidth(300)
         self.btn_open_comment_rev.clicked.connect(self._open_comment_reviewer_button)
-        btn_row_rej_rev.addWidget(self.btn_open_comment_rev)
-        btn_row_rej_rev.addStretch(1)
-        g_rej_rev_layout.addLayout(btn_row_rej_rev)
+        g_rej_rev_layout.addWidget(self.btn_open_comment_rev)
 
-        rev_h.addWidget(grp_rej_rev)
+        rev_h.addWidget(grp_rej_rev, 1)
 
-        # Accepted (reviewer)
+        # ---------- Accepted (Minor) ----------
+        grp_accm_rev = QGroupBox("Accepted (Minor)")
+        g_accm_rev_layout = QVBoxLayout(grp_accm_rev)
+
+        self.list_accepted_minor_rev = QListWidget()
+        self._wire_list_common(self.list_accepted_minor_rev, editable=True, for_reviewer=True)
+        g_accm_rev_layout.addWidget(self.list_accepted_minor_rev, 1)
+
+        rev_h.addWidget(grp_accm_rev, 1)
+
+        # ---------- Accepted ----------
         grp_acc_rev = QGroupBox("Accepted")
         g_acc_rev_layout = QVBoxLayout(grp_acc_rev)
+
         self.list_accepted_rev = QListWidget()
         self._wire_list_common(self.list_accepted_rev, editable=True, for_reviewer=True)
-        g_acc_rev_layout.addWidget(self.list_accepted_rev)
+        g_acc_rev_layout.addWidget(self.list_accepted_rev, 1)
 
-        self.btn_finalize = QPushButton("Finalize → Transmittal")
-        self.btn_finalize.setFixedWidth(300)
-        self.btn_finalize.clicked.connect(self._finalize_checkprint)
-        g_acc_rev_layout.addWidget(self.btn_finalize)
+        self.btn_complete = QPushButton("Complete & Archive")
+        self.btn_complete.clicked.connect(self._complete_checkprint)
+        g_acc_rev_layout.addWidget(self.btn_complete)
 
-        rev_h.addWidget(grp_acc_rev)
+        rev_h.addWidget(grp_acc_rev, 1)
 
         rv.addLayout(rev_h)
 
-        # Cancel (reviewer)
+        # Reviewer cancel
         bottom_rev = QHBoxLayout()
         bottom_rev.addStretch(1)
+
         self.btn_cancel_reviewer = QPushButton("Cancel This CheckPrint")
         self.btn_cancel_reviewer.setFixedWidth(300)
         self.btn_cancel_reviewer.clicked.connect(self._cancel_checkprint)
         bottom_rev.addWidget(self.btn_cancel_reviewer)
-        rv.addLayout(bottom_rev)
 
-        root.addWidget(self.box_reviewer)
-        root.addStretch(1)
+        rv.addLayout(bottom_rev)
+        root.addWidget(self.box_reviewer, 1)
 
     # ------------------------------------------------------------------ wiring helpers
     def _wire_list_common(self, lw: QListWidget, *, editable: bool, for_reviewer: bool):
@@ -393,6 +437,16 @@ class CheckPrintTab(QWidget):
             self.box_reviewer.setVisible(False)
             return
 
+        batch = get_checkprint_batch(self.db_path, self.current_batch_id)
+        if batch and batch["status"] == "completed":
+            self.btn_as_submitter.setEnabled(False)
+            self.btn_as_reviewer.setEnabled(False)
+            self.box_submitter.setVisible(False)
+            self.box_reviewer.setVisible(False)
+            self.box_history.setVisible(True)
+            self._load_history_view()
+            return
+
         batch_id = self.combo_batches.itemData(idx)
         self.current_batch_id = int(batch_id) if batch_id is not None else None
 
@@ -428,9 +482,49 @@ class CheckPrintTab(QWidget):
             self.btn_as_submitter.setStyleSheet("")
             self.btn_as_reviewer.setStyleSheet("")
 
+    # ------------------------------------------------------------------ History mode
+
+    def _load_history_view(self):
+        self.list_history.clear()
+
+        if not self.db_path or not self.current_batch_id:
+            return
+
+        items = get_checkprint_items(self.db_path, self.current_batch_id)
+
+        for it in items:
+            st = (it.get("status") or "").lower()
+            if st not in {"accepted", "accepted_minor"}:
+                continue
+
+            disp = (
+                f"{it['doc_id']}  "
+                f"[Rev {it['revision']}]  "
+                f"Status: {it['status']}  "
+                f"CP:{it['cp_version']}"
+            )
+            row = QListWidgetItem(disp)
+            row.setData(Qt.UserRole, it)
+
+            if st == "accepted_minor":
+                row.setForeground(QColor(180, 140, 20))
+            else:
+                row.setForeground(QColor(38, 185, 110))
+
+            self.list_history.addItem(row)
+
     # ------------------------------------------------------------------ Submitter mode
     def _enter_submitter_mode(self):
         if not self.current_batch_id or not self.db_path:
+            return
+
+        batch = get_checkprint_batch(self.db_path, self.current_batch_id)
+        if batch and batch["status"] == "completed":
+            self.box_submitter.setVisible(False)
+            self.box_reviewer.setVisible(False)
+            self.box_history.setVisible(True)
+            self._update_role_buttons(None)
+            self._load_history_view()
             return
 
         batch = get_checkprint_batch(self.db_path, self.current_batch_id)
@@ -455,15 +549,19 @@ class CheckPrintTab(QWidget):
         self.list_pending_sub.clear()
         self.list_rejected_sub.clear()
         self.list_accepted_sub.clear()
+        self.list_accepted_minor_sub.clear()
 
         if not self.db_path or not self.current_batch_id:
             return
 
         items = get_checkprint_items(self.db_path, self.current_batch_id)
-        self._populate_three_lists(items,
-                                   self.list_pending_sub,
-                                   self.list_rejected_sub,
-                                   self.list_accepted_sub)
+        self._populate_four_lists(
+            items,
+            self.list_pending_sub,
+            self.list_rejected_sub,
+            self.list_accepted_minor_sub,
+            self.list_accepted_sub,
+        )
 
     def _edit_checkprint_documents(self):
         if not self.db_path or not self.current_batch_id:
@@ -496,6 +594,15 @@ class CheckPrintTab(QWidget):
             return
 
         batch = get_checkprint_batch(self.db_path, self.current_batch_id)
+        if batch and batch["status"] == "completed":
+            self.box_submitter.setVisible(False)
+            self.box_reviewer.setVisible(False)
+            self.box_history.setVisible(True)
+            self._update_role_buttons(None)
+            self._load_history_view()
+            return
+
+        batch = get_checkprint_batch(self.db_path, self.current_batch_id)
         if batch and batch["status"] == "cancelled":
             QMessageBox.information(
                 self,
@@ -515,24 +622,33 @@ class CheckPrintTab(QWidget):
     def _load_items_for_reviewer(self):
         self.list_pending_rev.clear()
         self.list_rejected_rev.clear()
+        self.list_accepted_minor_rev.clear()
         self.list_accepted_rev.clear()
 
         if not self.db_path or not self.current_batch_id:
             return
 
         items = get_checkprint_items(self.db_path, self.current_batch_id)
-        self._populate_three_lists(items,
-                                   self.list_pending_rev,
-                                   self.list_rejected_rev,
-                                   self.list_accepted_rev)
+
+        self._populate_four_lists(
+            items,
+            self.list_pending_rev,
+            self.list_rejected_rev,
+            self.list_accepted_minor_rev,
+            self.list_accepted_rev,
+        )
 
     # ------------------------------------------------------------------ Common list population
-    def _populate_three_lists(self, items, list_pending: QListWidget,
-                              list_rejected: QListWidget,
-                              list_accepted: QListWidget):
+    def _populate_four_lists(
+            self,
+            items,
+            list_pending,
+            list_rejected,
+            list_accepted_minor,
+            list_accepted,
+    ):
         for it in items:
             st = (it.get("status") or "").lower()
-
             disp = f"{it['doc_id']}  [Rev {it['revision']}]  Status: {it['status']}  CP:{it['cp_version']}"
             row = QListWidgetItem(disp)
             row.setData(Qt.UserRole, it)
@@ -540,11 +656,13 @@ class CheckPrintTab(QWidget):
             if st == "rejected":
                 row.setForeground(Qt.red)
                 list_rejected.addItem(row)
+            elif st == "accepted_minor":
+                row.setForeground(QColor(180, 140, 20))
+                list_accepted_minor.addItem(row)
             elif st == "accepted":
                 row.setForeground(QColor(38, 185, 110))
                 list_accepted.addItem(row)
             else:
-                # pending / anything else
                 row.setForeground(QColor(210, 130, 10))
                 list_pending.addItem(row)
 
@@ -688,14 +806,6 @@ class CheckPrintTab(QWidget):
         self._open_comment_dialog(item, editable=False, for_reviewer=False)
 
     # ------------------------------------------------------------------ Submitter resubmission
-    def _resubmit_from_pending(self):
-        # legacy button path; now uses incoming folder flow
-        self._resubmit_all_incoming()
-
-    def _resubmit_from_rejected(self):
-        # legacy button path; now uses incoming folder flow
-        self._resubmit_all_incoming()
-
     def _resubmit_all_incoming(self):
         if not getattr(self, "db_path", None) or not self.current_batch_id:
             QMessageBox.information(self, "CheckPrint", "No active CheckPrint batch selected.")
@@ -793,49 +903,72 @@ class CheckPrintTab(QWidget):
 
     # ------------------------------------------------------------------ Reviewer actions
     def _reviewer_accept(self):
-        item = self.list_pending_rev.currentItem()
-        if not item:
-            QMessageBox.information(self, "Reviewer", "Select a pending document to accept.")
+        items = self.list_pending_rev.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Reviewer", "Select one or more pending documents.")
             return
-        it = item.data(Qt.UserRole)
 
-        actor = SettingsManager().get("user.name", "")
+        actor = SettingsManager().get("user.name", "") or ""
 
-        update_checkprint_item_status(
-            self.db_path,
-            item_id=it["id"],
-            status="accepted",
-            reviewer=actor,
-        )
+        for item in items:
+            it = item.data(Qt.UserRole)
+            update_checkprint_item_status(
+                self.db_path,
+                item_id=it["id"],
+                status="accepted",
+                reviewer=actor,
+            )
+
+        self._load_items_for_reviewer()
+
+    def _reviewer_accept_minor(self):
+        items = self.list_pending_rev.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Reviewer", "Select one or more pending documents.")
+            return
+
+        actor = SettingsManager().get("user.name", "") or ""
+
+        if self.chk_always_comment.isChecked():
+            comment = self.le_reject_comment.text().strip() or "Review PDF"
+        else:
+            comment = ""
+
+        for item in items:
+            it = item.data(Qt.UserRole)
+            update_checkprint_item_status(
+                self.db_path,
+                item_id=it["id"],
+                status="accepted_minor",
+                reviewer=actor,
+                note=comment,
+            )
+
         self._load_items_for_reviewer()
 
     def _reviewer_reject(self):
-        item = self.list_pending_rev.currentItem()
-        if not item:
-            QMessageBox.information(self, "Reviewer", "Select a pending document to reject.")
-            return
-        it = item.data(Qt.UserRole)
-
-        dlg = CommentEditDialog(
-            self,
-            "Reject Document",
-            "Optional: Enter rejection reason:",
-            it.get("last_reviewer_note") or "",
-        )
-        if dlg.exec_() != QDialog.Accepted:
+        items = self.list_pending_rev.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Reviewer", "Select one or more pending documents.")
             return
 
-        comment = dlg.text().strip()  # allow empty
+        actor = SettingsManager().get("user.name", "") or ""
 
-        actor = SettingsManager().get("user.name", "")
+        if self.chk_always_comment.isChecked():
+            comment = self.le_reject_comment.text().strip() or "Review PDF"
+        else:
+            comment = ""
 
-        update_checkprint_item_status(
-            self.db_path,
-            item_id=it["id"],
-            status="rejected",
-            reviewer=actor,
-            note=comment,
-        )
+        for item in items:
+            it = item.data(Qt.UserRole)
+            update_checkprint_item_status(
+                self.db_path,
+                item_id=it["id"],
+                status="rejected",
+                reviewer=actor,
+                note=comment,
+            )
+
         self._load_items_for_reviewer()
 
     def _open_comment_reviewer_button(self):
@@ -851,45 +984,30 @@ class CheckPrintTab(QWidget):
 
         self._open_comment_dialog(lw.currentItem(), editable=True, for_reviewer=True)
 
-    def _finalize_checkprint(self):
+    def _complete_checkprint(self):
         if not self.db_path or not self.current_batch_id:
+            QMessageBox.information(self, "CheckPrint", "No active CheckPrint selected.")
             return
 
-        items = get_checkprint_items(self.db_path, self.current_batch_id)
-        if any((it.get("status") or "").lower() != "accepted" for it in items):
-            QMessageBox.warning(
-                self,
-                "Cannot Finalize",
-                "All documents must be accepted before finalizing.",
-            )
-            return
-
-        r = QMessageBox.question(
-            self,
-            "Finalize CheckPrint",
-            "All documents are accepted.\n\nCreate the transmittal now?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
-        )
-        if r != QMessageBox.Yes:
-            return
+        actor = SettingsManager().get("user.name", "") or ""
 
         try:
-            trans_dir = finalize_checkprint_to_transmittal(
-                self.db_path, batch_id=self.current_batch_id, reviewer="reviewer"
+            complete_and_archive_checkprint(
+                self.db_path,
+                batch_id=int(self.current_batch_id),
+                actor=actor,
             )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to finalize:\n{e}")
+            QMessageBox.critical(self, "CheckPrint", f"Completion failed:\n{e}")
             return
 
         QMessageBox.information(
             self,
-            "CheckPrint Complete",
-            f"CheckPrint finalized.\nTransmittal created at:\n{trans_dir}",
+            "CheckPrint",
+            "CheckPrint has been completed and archived.\n\n"
+            "Source files have been updated with the approved versions.",
         )
 
-        self.box_reviewer.setVisible(False)
-        self.box_submitter.setVisible(False)
         self._reload_batches()
 
     # ------------------------------------------------------------------ Cancel CheckPrint

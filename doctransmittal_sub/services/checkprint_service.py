@@ -744,7 +744,13 @@ def resubmit_all_incoming(
         if not it:
             continue
 
-        mode = "overwrite" if str(it.get("status") or "").strip() == "pending" else "increment"
+        status = (it.get("status") or "").lower()
+
+        if status == "pending":
+            mode = "overwrite"
+        else:
+            mode = "increment"
+
         ops, meta = _plan_checkprint_update_ops(db_path, it, Path(replacement_file), mode=mode)
 
         all_ops.extend(ops)
@@ -781,8 +787,14 @@ def resubmit_all_incoming(
         rel_src = str(new_src_abs.relative_to(proj_root))
         rel_cp = str(new_cp_abs.relative_to(proj_root))
 
-        old_status = meta.get("old_status")
-        new_status = meta.get("new_status")
+        old_status = (meta.get("old_status") or "").lower()
+
+        if old_status == "accepted_minor":
+            new_status = "accepted"
+        elif mode == "increment":
+            new_status = "pending"
+        else:
+            new_status = old_status
 
         if mode == "overwrite":
             def _do_overwrite():
@@ -874,179 +886,112 @@ def resubmit_all_incoming(
         "incoming_dir": str(incoming_dir),
     }
 
-def finalize_checkprint_to_transmittal(
+def complete_and_archive_checkprint(
     db_path: Path,
     *,
     batch_id: int,
-    reviewer: str,
-    out_root: Optional[Path] = None,
-) -> Path:
+    actor: str,
+) -> None:
     """
-    FINALIZED WORKFLOW — FILE-SAFE VERSION
+    Complete a CheckPrint batch WITHOUT creating a transmittal.
 
-    ✔ Uses CP file as final approved file
-    ✔ Removes _CP_N suffix for both source & transmittal
-    ✔ Replaces source file with the approved version
-    ✔ Copies final files into Transmittals/<TRN>/Files
-    ✔ Preflights ALL file operations before touching DB
+    Behaviour:
+      • All items MUST be accepted
+      • Latest CP version replaces source files
+      • All _CP_N artefacts are removed from source folders
+      • CheckPrint batch marked as 'completed'
+      • CheckPrint folder retained as archive
     """
     db_path = Path(db_path)
     init_db(db_path)
 
-    proj = get_project(db_path)
-    if not proj:
-        raise RuntimeError("Project metadata not set in DB.")
-    project_code = proj["project_code"]
-
-    username = SettingsManager().get("user", "Maxwell Industries")
-
-    # --- Load batch ----
-    con = _connect(db_path)
-    batch = con.execute("""
-        SELECT id, project_id, code, title, client, created_by, created_on, status
-        FROM checkprint_batches
-        WHERE id=?
-    """, (int(batch_id),)).fetchone()
-    con.close()
-
+    batch = get_checkprint_batch(db_path, batch_id)
     if not batch:
         raise RuntimeError("CheckPrint batch not found.")
 
-    (_, project_id, code, title, client,
-     created_by, created_on, status) = batch
+    if batch.get("status") in {"completed", "cancelled"}:
+        raise RuntimeError(f"CheckPrint batch already {batch['status']}.")
 
-    # --- Load items ----
     items = get_checkprint_items(db_path, batch_id)
     if not items:
         raise RuntimeError("No items in CheckPrint batch.")
 
-    # Must ALL be accepted
-    if any((it.get("status") or "").lower() != "accepted" for it in items):
-        raise RuntimeError("All documents must be accepted before finalizing.")
+    # Enforce acceptance
+    not_accepted = [
+        it for it in items
+        if (it.get("status") or "").lower() != "accepted"
+    ]
+    if not_accepted:
+        raise RuntimeError("All CheckPrint items must be accepted before completion.")
 
-    # --- Prepare output root & TRN folder ----
-    out_root = out_root or _default_out_root(db_path)
-    out_root.mkdir(parents=True, exist_ok=True)
+    proj_root = _project_root(db_path)
 
-    number = next_transmittal_number(project_code, out_root)
-
-    trn_dir = out_root / f"{project_code}-TRN-{int(number.split('-')[-1]):03d}"
-    files_dir = trn_dir / "Files"
-    receipt_dir = trn_dir / "Receipt"
-    files_dir.mkdir(parents=True, exist_ok=True)
-    receipt_dir.mkdir(parents=True, exist_ok=True)
-
-    if isinstance(created_on, dict):
-        created_on_str = created_on.get("date", "")
-    else:
-        created_on_str = created_on
-
-    username = SettingsManager().get("user.name", "")
-    if not isinstance(username, str):
-        username = str(username)
-
-    # --- Header for DB + receipt ----
-    header = {
-        "project_code": project_code,
-        "number": number,
-        "title": title,
-        "client": proj.get("client_company", ""),
-        "end_user": proj.get("end_user", ""),
-        "created_by": username,
-        "created_on": created_on_str,
-    }
-
-    # --- Plan all file operations & build trans_items ----
     all_ops = []
-    trans_items: List[Dict[str, Any]] = []
 
     for it in items:
-        rel_cp = it["cp_path"]
-        proj_root = _project_root(db_path)
-        cp_abs = proj_root / rel_cp
+        cp_abs = proj_root / it["cp_path"]
+        src_abs = proj_root / it["source_path"]
+
         if not cp_abs.exists():
             raise RuntimeError(f"Approved CP file missing:\n{cp_abs}")
 
-        # final name in source dir (no _CP_N)
+        # Strip _CP_N suffix
         base, ext = _split_basename(cp_abs.name)
         final_name = base + ext
+        final_src = src_abs.with_name(final_name)
 
-        rel_source = it["source_path"]
-        src_abs = proj_root / rel_source
-        src_final = src_abs.with_name(final_name)
+        # 1) Copy CP → final source filename
+        all_ops.append(plan_copy(cp_abs, final_src))
 
-        # 1) Copy CP → final source filename (this file WILL exist after ops run)
-        all_ops.append(plan_copy(cp_abs, src_final))
-
-        # 2) Copy final source → TRN Files (this is allowed because src_final will be created)
-        dst_trn = files_dir / src_final.name
-        all_ops.append(plan_copy(cp_abs, dst_trn))  # <-- IMPORTANT: cp_abs is the real source
-
-        # 3) Delete old CP_N variants AFTER we know the new file will exist
+        # 2) Remove ALL _CP_N files from source directory
         src_dir = src_abs.parent
-        base_no_cp = base
         try:
             for f in src_dir.iterdir():
-                fn = f.name
-                if fn.startswith(base_no_cp + "_CP_"):
+                if f.name.startswith(base + "_CP_"):
                     all_ops.append(plan_delete(f))
         except Exception:
             pass
 
-        # 4) Record final source path for transmittal DB entry
-        trans_items.append({
-            "doc_id": it["doc_id"],
-            "doc_type": "",
-            "revision": it.get("revision") or "",
-            "file_path": str(src_final),
-        })
-
-    if not all_ops:
-        raise RuntimeError("No file operations planned for finalization.")
-
-    # --- Preflight entire set of operations ----
-    ok, bad_path, reason = preflight_ops(all_ops)
+    # --- Preflight ---
+    ok, bad, reason = preflight_ops(all_ops)
     if not ok:
-        raise PreflightError(bad_path, reason or "File operation preflight failed.")
+        raise PreflightError(bad, reason or "File operation preflight failed.")
 
-    # --- Execute all file ops ----
+    # --- Execute ---
     execute_ops(all_ops)
 
-    # --- Insert transmittal into DB ----
-    # Normalize all header fields into strings (bulletproof)
-    for k, v in header.items():
-        if isinstance(v, dict):
-            header[k] = json.dumps(v)  # or v.get("name", "") for created_by
-        elif v is None:
-            header[k] = ""
-        else:
-            header[k] = str(v)
+    # --- DB close-out ---
+    now = datetime.now().strftime("%Y-%m-%d")
 
-    tid = insert_transmittal(db_path, header, trans_items)
-
-    # --- Generate PDF receipt / bundle ----
-    from .transmittal_service import rebuild_transmittal_bundle
-    rebuild_transmittal_bundle(db_path, number, out_root=out_root)
-
-    # --- Mark batch completed ----
     def _do():
         con = _connect(db_path)
         cur = con.cursor()
         cur.execute("""
             UPDATE checkprint_batches
                SET status='completed',
-                   submitted_on=datetime('now'),
-                   reviewer=?,
-                   reviewer_notes=COALESCE(reviewer_notes, '')
+                   submitted_on=?,
+                   reviewer=?
              WHERE id=?
-        """, (username, int(batch_id)))
+        """, (now, actor or "", int(batch_id)))
         con.commit()
         con.close()
 
     _retry_write(_do)
 
-    return trn_dir
-
+    # --- Event log (batch-level, item-level for traceability) ---
+    for it in items:
+        try:
+            append_checkprint_event(
+                db_path,
+                item_id=int(it["id"]),
+                actor=actor or "",
+                event="completed",
+                from_status="accepted",
+                to_status="accepted",
+                note="CheckPrint completed and archived",
+            )
+        except Exception:
+            pass
 
 
 def cancel_checkprint(db_path: Path, *, batch_id: int, actor: str) -> dict:

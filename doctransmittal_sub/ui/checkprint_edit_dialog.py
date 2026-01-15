@@ -351,22 +351,27 @@ class CheckPrintEditDialog(QDialog):
         msg = QMessageBox(self)
         msg.setWindowTitle("Remove from CheckPrint")
         msg.setIcon(QMessageBox.Question)
-        msg.setText(
-            "When removing the selected documents from this CheckPrint batch,\n"
-            "how should the source files be handled?"
+
+        msg.setText("Remove selected documents from this CheckPrint?")
+
+        msg.setInformativeText(
+            "Choose how the source files should be handled:\n\n"
+            "• Keep Latest CheckPrint\n"
+            "  The most recent CP version will become the new source file.\n\n"
+            "• Revert to Original\n"
+            "  The original source file (prior to CheckPrint) will be restored.\n\n"
+            "This action affects all selected documents."
         )
 
         keep_btn = msg.addButton(
-            "Keep latest CheckPrint as source",
+            "Keep Latest CP",
             QMessageBox.AcceptRole,
         )
         revert_btn = msg.addButton(
-            "Revert source to original",
+            "Revert to Original",
             QMessageBox.DestructiveRole,
         )
-        cancel_btn = msg.addButton(
-            QMessageBox.Cancel,
-        )
+        cancel_btn = msg.addButton(QMessageBox.Cancel)
 
         msg.exec_()
 
