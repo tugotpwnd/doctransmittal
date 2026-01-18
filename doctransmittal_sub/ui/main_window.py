@@ -947,7 +947,13 @@ class MainWindow(QMainWindow):
         out_pdf = out_dir / f"{job}_Progress_{stamp}.pdf"
 
         try:
-            export_progress_report_pdf(out_pdf, header, docs)
+            export_progress_report_pdf(
+                out_pdf,
+                header,
+                docs,
+                db_path=dbp,
+                project_id=proj["id"],
+            )
         except Exception as e:
             QMessageBox.warning(self, "Progress Report", f"Failed to build PDF:\n{e}")
             return
