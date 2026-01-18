@@ -46,14 +46,14 @@ class TransmittalTab(QWidget):
         root = QVBoxLayout(self)
         root.setSpacing(10)
 
-        header = QLabel("<b>Please enter the details for the submission</b>", self)
+        header = QLabel("<b>Please enter the details for the file processing</b>", self)
         root.addWidget(header)
 
         # Header form
-        form_box = QGroupBox("Submission Details", self)
+        form_box = QGroupBox("Process Details", self)
         form = QFormLayout(form_box)
         self.le_user = QLineEdit(self);  self.le_user.setPlaceholderText("Prepared by")
-        self.le_title = QLineEdit(self); self.le_title.setPlaceholderText("Transmittal title")
+        self.le_title = QLineEdit(self); self.le_title.setPlaceholderText("Process title")
         self.le_client = QLineEdit(self); self.le_client.setPlaceholderText("Client / Recipient")
         form.addRow("Prepared by", self.le_user)
         form.addRow("Title", self.le_title)

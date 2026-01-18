@@ -12,7 +12,7 @@ DEFAULT_ROW_OPTIONS = {
     "doc_types": ["CAL", "DOC", "DWG", "ITC", "ITP", "MAN", "MDL", "PGM",
                   "REG", "REP", "RFI", "SCH", "TRN", "VAR"],
     "file_types": ["PDF", "DWG", "XLSX", "DOCX", "PTW", "PowerCAD"],
-    "statuses":  ["Not Started", "In Progress", "On Hold", "Incomplete", "For Review", "Complete", "Submitted"],
+    "statuses":  ["Not Started", "In Progress", "On Hold", "Incomplete", "For Review", "Complete", "Submitted", "Obsolete", "Rework Required"],
 }
 
 DOC_TYPE_NAMES = {

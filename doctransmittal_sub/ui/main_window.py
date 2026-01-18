@@ -512,8 +512,10 @@ class MainWindow(QMainWindow):
     def __init__(self, settings: SettingsManager, parent=None):
         super().__init__(parent)
 
+        self._workflow_active = False
+
         self.settings = settings
-        self.setWindowTitle("DocumentTransmittal"); self.resize(1400, 800)
+        self.setWindowTitle("DocumentManager"); self.resize(1400, 800)
         # ---- Lock window size (prevent annoying jumps) ----
         start = self.size()
         self.setMinimumSize(start)
@@ -545,18 +547,24 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.register_tab, "Register")
 
         self.transmittal_tab = TransmittalTab()
-        self.tabs.addTab(self.transmittal_tab, "Transmittal")
+        self.tabs.addTab(self.transmittal_tab, "Process")
 
         self.files_tab = FilesTab()
         self.tabs.addTab(self.files_tab, "Files")
 
         self.history_tab = HistoryTab()
-        self.tabs.addTab(self.history_tab, "History")
+        self.tabs.addTab(self.history_tab, "Tx History")
 
         self.checkprint_tab = CheckPrintTab(user_name=self.settings.get("username", ""))
         self.idx_checkprint = self.tabs.addTab(self.checkprint_tab, "CheckPrint")
         self.tabs.setTabEnabled(self.idx_checkprint, True)
         self.files_tab.checkprintStarted.connect(self._on_checkprint_started)
+        self.checkprint_tab.registerNeedsRefresh.connect(
+            self.register_tab._reload_rows
+        )
+
+        self.files_tab.proceedCompleted.connect(self._on_files_exit_complete)
+        self.files_tab.checkprintStarted.connect(self._on_files_exit_complete)
 
         # --- name the tab bars so we can style them differently ---
         self.mainTabs.setObjectName("MainTabs")
@@ -579,6 +587,9 @@ class MainWindow(QMainWindow):
         self.idx_files = self.tabs.indexOf(self.files_tab)
         self.idx_history = self.tabs.indexOf(self.history_tab)
 
+        self.tabs.setTabEnabled(self.idx_transmit, False)
+        self.tabs.setTabEnabled(self.idx_files, False)
+        self.tabs.currentChanged.connect(self._enforce_tab_rules)
 
         # Step navigation (Transmittal -> Files / back)
         self.transmittal_tab.backRequested.connect(self._go_back_to_register)
@@ -1054,7 +1065,6 @@ class MainWindow(QMainWindow):
                 pass
 
 
-
     def _set_user_name(self):
         cur = self.settings.get("user.name","")
         name, ok = QInputDialog.getText(self, "Your name", "Enter display name:", text=cur)
@@ -1064,7 +1074,6 @@ class MainWindow(QMainWindow):
             self._brand_user.setText(name or "—")
         except Exception:
             pass
-
 
     def finalize_mapping_to_transmittal(self):
         mapping = self.files_tab.get_mapping(); self.transmittal_tab.set_file_mapping(mapping)
@@ -1091,71 +1100,111 @@ class MainWindow(QMainWindow):
         self.settings.set("project.job_number", job_no)
         self.settings.set("project.name", project_name)
 
+    # -------------------- Navigation and enforcement --------------------
+
+    def _on_files_exit_complete(self, *args):
+        """
+        Terminal exit from Files tab:
+        - Build Transmittal
+        - Submit CheckPrint
+
+        Destructive reset back to Register.
+        """
+        self._workflow_active = False
+
+        # HARD RESET
+        self.files_tab.reset()
+        self.transmittal_tab.reset()
+
+        self.tabs.setTabEnabled(self.idx_files, False)
+        self.tabs.setTabEnabled(self.idx_transmit, False)
+
+        self.tabs.setCurrentIndex(self.idx_register)
+
     # === Register → Transmittal (no project_root) ===
     def _on_register_proceed(self, items: List[DocumentRow], db_path: Path):
-        user = self.settings.get("user.name","")
+        user = self.settings.get("user.name", "")
         if not user:
-            QMessageBox.information(self,"Who are you?","Please set your name (User → Set Name…)"); return
+            QMessageBox.information(self, "Who are you?", "Please set your name first.")
+            return
+
+        # HARD RESET first (defensive)
+        self.transmittal_tab.reset()
+        self.files_tab.reset()
+
+        self._workflow_active = True
+
         self.transmittal_tab.set_selection(items, db_path, user)
-        self.tabs.setCurrentIndex(self.idx_files)
+
+        self.tabs.setTabEnabled(self.idx_transmit, True)
+        self.tabs.setTabEnabled(self.idx_files, False)
+        self.tabs.setCurrentIndex(self.idx_transmit)
 
     def _go_back_to_register(self):
+        # FULL WORKFLOW ABORT
+        self._workflow_active = False
+
+        self.transmittal_tab.reset()
+        self.files_tab.reset()
+
+        self.tabs.setTabEnabled(self.idx_transmit, False)
+        self.tabs.setTabEnabled(self.idx_files, False)
+
         self.tabs.setCurrentIndex(self.idx_register)
-        # Optional: lock down the later steps again
 
     # === Transmittal → Files (no project_root) ===
     def _go_to_files_step(self, payload: dict):
-        try:
-            self.files_tab.set_flow_context(
-                db_path=payload.get("db_path"),
-                items=payload.get("items") or [],
-                file_mapping=payload.get("file_mapping") or {},
-                user=payload.get("user", ""),
-                title=payload.get("title", ""),
-                client=payload.get("client", ""),
-            )
-            # If a source folder was nominated in Transmittal, prime the Files tree with it
-            src = (payload.get("source_root") or "").strip()
-            if src and hasattr(self.files_tab, "set_root_folder"):
-                try:
-                    self.files_tab.set_root_folder(src)
-                except Exception:
-                    pass
+        if not self._workflow_active:
+            return  # hard guard
 
-        except Exception:
-            # Back-compat shims (older FilesTab)
-            if hasattr(self.files_tab, "set_db"):
-                self.files_tab.set_db(payload.get("db_path"))
-            if hasattr(self.files_tab, "set_items"):
-                self.files_tab.set_items(payload.get("items") or [])
+        # HARD RESET FILES before entry
+        self.files_tab.reset()
 
+        self.files_tab.set_flow_context(
+            db_path=payload.get("db_path"),
+            items=payload.get("items") or [],
+            file_mapping=payload.get("file_mapping") or {},
+            user=payload.get("user", ""),
+            title=payload.get("title", ""),
+            client=payload.get("client", ""),
+        )
+
+        src = (payload.get("source_root") or "").strip()
+        if src and hasattr(self.files_tab, "set_root_folder"):
+            self.files_tab.set_root_folder(src)
+
+        self.tabs.setTabEnabled(self.idx_files, True)
         self.tabs.setCurrentIndex(self.idx_files)
 
     def _go_back_to_transmittal(self):
-        # Ensure the transmittal tab is enabled and navigate back
-        try:
-            self.tabs.setTabEnabled(self.idx_transmit, True)
-        except Exception:
-            pass
+        if not self._workflow_active:
+            return
+
+        # DESTROY Files state
+        self.files_tab.reset()
+        self.tabs.setTabEnabled(self.idx_files, False)
+
         self.tabs.setCurrentIndex(self.idx_transmit)
 
-
     def _reset_to_register(self, trans_dir_path: str = ""):
-        """After building a transmittal, clear state and return to Register (database) tab."""
-        # Clear both workflow tabs
-        try:
-            if hasattr(self.transmittal_tab, "reset"):
-                self.transmittal_tab.reset()
-        except Exception:
-            pass
-        try:
-            if hasattr(self.files_tab, "reset"):
-                self.files_tab.reset()
-        except Exception:
-            pass
+        # END WORKFLOW
+        self._workflow_active = False
 
-        # Go back to Register/Database tab
+        self.transmittal_tab.reset()
+        self.files_tab.reset()
+
+        self.tabs.setTabEnabled(self.idx_transmit, False)
+        self.tabs.setTabEnabled(self.idx_files, False)
+
         self.tabs.setCurrentIndex(self.idx_register)
+
+    def _enforce_tab_rules(self, idx: int):
+        if idx in (self.idx_transmit, self.idx_files):
+            if not self._workflow_active:
+                self.tabs.setCurrentIndex(self.idx_register)
+
+     # --------------------
+
 
     def _on_checkprint_started(self, cp_code: str, cp_dir: str):
         """

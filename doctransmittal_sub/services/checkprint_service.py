@@ -38,8 +38,8 @@ try:
         insert_checkprint_items,
         insert_transmittal,
         mark_checkprint_items_removed,
-        update_checkprint_item_status,
-    )
+        update_checkprint_item_status, update_document_status_by_doc_id,
+)
     from .transmittal_service import _base_folder_for_output, _default_out_root, next_transmittal_number
 except Exception:
     from ..services.db import (
@@ -642,6 +642,325 @@ def resubmit_checkprint_items(
 
     return True
 
+# def resubmit_all_incoming(
+#     db_path: Path,
+#     *,
+#     batch_id: int,
+#     actor: str,
+# ) -> Dict[str, Any]:
+#     """
+#     Resubmit workflow (strict, controlled):
+#
+#     - Incoming folder is ALWAYS: <CheckPrint>/_CheckPrintIncoming
+#     - Files MUST be named: DOCID_REV.pdf (strict)
+#     - Each incoming file must match EXACTLY ONE existing checkprint_items row
+#       by (doc_id, revision) within the given batch.
+#     - Mixed-mode in one pass:
+#         - pending   -> overwrite (same CP version)
+#         - accepted/rejected -> increment (new CP_(N+1))
+#     - Atomic for file ops across the batch (preflight all, then execute all)
+#     - Incoming files are deleted ONLY AFTER successful DB write-back.
+#     """
+#     db_path = Path(db_path)
+#     init_db(db_path)
+#     batch_id = int(batch_id)
+#
+#     batch = get_checkprint_batch(db_path, batch_id)
+#     if not batch:
+#         return {"ok": False, "error": "batch_not_found"}
+#     if batch.get("status") in {"cancelled", "completed"}:
+#         return {"ok": False, "error": "batch_not_editable", "status": batch.get("status")}
+#
+#     # Resolve project_id once (needed for register status propagation)
+#     con = _connect(db_path)
+#     row = con.execute(
+#         "SELECT project_id FROM checkprint_batches WHERE id=?",
+#         (int(batch_id),),
+#     ).fetchone()
+#     con.close()
+#     if not row:
+#         return {"ok": False, "error": "batch_project_not_found"}
+#     project_id = int(row[0])
+#
+#     incoming_dir = _checkprint_incoming_dir(db_path)
+#
+#     incoming_files = sorted(
+#         [p for p in incoming_dir.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"],
+#         key=lambda p: p.name.lower(),
+#     )
+#     if not incoming_files:
+#         return {"ok": False, "error": "incoming_empty", "incoming_dir": str(incoming_dir)}
+#
+#     items = get_checkprint_items(db_path, batch_id)
+#     items_by_id: Dict[int, Dict[str, Any]] = {int(it["id"]): it for it in items}
+#
+#     # index by (doc_id, revision) -> item_id (must be unique)
+#     index: Dict[tuple[str, str], int] = {}
+#     for it in items:
+#         did = str(it.get("doc_id") or "").strip()
+#         rev = str(it.get("revision") or "").strip()
+#         if not did:
+#             continue
+#         key = (did, rev)
+#         if key in index:
+#             # This should not happen; fail safe.
+#             return {"ok": False, "error": "duplicate_item_key_in_batch", "doc_id": did, "revision": rev}
+#         index[key] = int(it["id"])
+#
+#     # Parse + match incoming files
+#     matched: Dict[int, Path] = {}
+#     match_errors: List[Dict[str, Any]] = []
+#
+#     for f in incoming_files:
+#         stem = f.stem
+#         if "_" not in stem:
+#             match_errors.append({"file": f.name, "error": "bad_name", "reason": "Expected DOCID_REV.pdf"})
+#             continue
+#
+#         doc_id, rev = stem.rsplit("_", 1)
+#         doc_id = doc_id.strip()
+#         rev = rev.strip()
+#
+#         if not doc_id or not rev:
+#             match_errors.append({"file": f.name, "error": "bad_name", "reason": "Expected DOCID_REV.pdf"})
+#             continue
+#
+#         key = (doc_id, rev)
+#         item_id = index.get(key)
+#         if not item_id:
+#             match_errors.append({"file": f.name, "error": "no_match", "doc_id": doc_id, "revision": rev})
+#             continue
+#
+#         if item_id in matched:
+#             match_errors.append({"file": f.name, "error": "duplicate_match", "item_id": item_id})
+#             continue
+#
+#         matched[item_id] = f
+#
+#     if match_errors:
+#         return {
+#             "ok": False,
+#             "error": "match_failed",
+#             "incoming_dir": str(incoming_dir),
+#             "details": match_errors,
+#         }
+#
+#     # Plan file ops (atomic across batch)
+#     all_ops: List[Any] = []
+#     per_item_meta: Dict[int, Dict[str, Any]] = {}
+#     per_item_mode: Dict[int, str] = {}
+#
+#     for item_id, replacement_file in matched.items():
+#         it = items_by_id.get(int(item_id))
+#         if not it:
+#             continue
+#
+#         status = (it.get("status") or "").lower()
+#         mode = "overwrite" if status == "pending" else "increment"
+#
+#         ops, meta = _plan_checkprint_update_ops(db_path, it, Path(replacement_file), mode=mode)
+#
+#         all_ops.extend(ops)
+#         per_item_meta[int(item_id)] = meta
+#         per_item_mode[int(item_id)] = mode
+#
+#     if not all_ops:
+#         return {"ok": True, "updated": 0, "overwritten": 0, "incremented": 0, "deleted_incoming": 0}
+#
+#     ok, bad_path, reason = preflight_ops(all_ops)
+#     if not ok:
+#         return {"ok": False, "error": "preflight_failed", "path": str(bad_path), "reason": reason or ""}
+#
+#     # Execute file ops first
+#     execute_ops(all_ops)
+#
+#     # DB write-back
+#     now_date = datetime.now().strftime("%Y-%m-%d")
+#     proj_root = _project_root(db_path)
+#
+#     overwritten = 0
+#     incremented = 0
+#
+#     def _set_register_status(doc_id: str, new_status: str) -> None:
+#         did = (doc_id or "").strip()
+#         if not did:
+#             return
+#
+#         def _do_reg():
+#             con2 = _connect(db_path)
+#             cur2 = con2.cursor()
+#             cur2.execute(
+#                 """
+#                 UPDATE documents
+#                    SET status=?,
+#                        updated_on=datetime('now')
+#                  WHERE project_id=?
+#                    AND doc_id=?
+#                 """,
+#                 (str(new_status), int(project_id), did),
+#             )
+#             con2.commit()
+#             con2.close()
+#
+#         _retry_write(_do_reg)
+#
+#     for item_id, src_path in matched.items():
+#         meta = per_item_meta.get(int(item_id))
+#         if not meta:
+#             continue
+#         it = items_by_id[int(item_id)]
+#         mode = per_item_mode[int(item_id)]
+#
+#         new_src_abs = meta["new_src_abs"]
+#         new_cp_abs = meta["new_cp_abs"]
+#
+#         rel_src = str(new_src_abs.relative_to(proj_root))
+#         rel_cp = str(new_cp_abs.relative_to(proj_root))
+#
+#         old_status = (meta.get("old_status") or "").lower()
+#
+#         if old_status == "accepted_minor":
+#             new_status = "accepted"
+#         elif mode == "increment":
+#             new_status = "pending"
+#         else:
+#             new_status = old_status
+#
+#         if mode == "overwrite":
+#
+#             def _do_overwrite():
+#                 con3 = _connect(db_path)
+#                 cur3 = con3.cursor()
+#                 cur3.execute(
+#                     """
+#                     UPDATE checkprint_items
+#                        SET source_path=?,
+#                            cp_path=?,
+#                            submitter=?,
+#                            last_submitted_on=?
+#                      WHERE id=?
+#                     """,
+#                     (rel_src, rel_cp, actor or "", now_date, int(it["id"])),
+#                 )
+#                 con3.commit()
+#                 con3.close()
+#
+#             _retry_write(_do_overwrite)
+#             overwritten += 1
+#
+#         else:
+#             new_version = int(meta.get("new_version") or it.get("cp_version") or 1)
+#
+#             if old_status == "accepted_minor" and new_status == "accepted":
+#                 # Promote to accepted WITHOUT clearing reviewer info
+#                 def _do_increment_accept():
+#                     con3 = _connect(db_path)
+#                     cur3 = con3.cursor()
+#                     cur3.execute(
+#                         """
+#                         UPDATE checkprint_items
+#                            SET source_path=?,
+#                                cp_path=?,
+#                                submitter=?,
+#                                cp_version=?,
+#                                status=?,
+#                                last_submitted_on=?
+#                          WHERE id=?
+#                         """,
+#                         (
+#                             rel_src,
+#                             rel_cp,
+#                             actor or "",
+#                             new_version,
+#                             "accepted",
+#                             now_date,
+#                             int(it["id"]),
+#                         ),
+#                     )
+#                     con3.commit()
+#                     con3.close()
+#
+#                 _retry_write(_do_increment_accept)
+#
+#             else:
+#                 # Normal resubmission → reset review state
+#                 def _do_increment_reset():
+#                     con3 = _connect(db_path)
+#                     cur3 = con3.cursor()
+#                     cur3.execute(
+#                         """
+#                         UPDATE checkprint_items
+#                            SET source_path=?,
+#                                cp_path=?,
+#                                submitter=?,
+#                                cp_version=?,
+#                                status=?,
+#                                reviewer=NULL,
+#                                last_reviewer_note=NULL,
+#                                last_submitted_on=?,
+#                                last_reviewed_on=NULL
+#                          WHERE id=?
+#                         """,
+#                         (
+#                             rel_src,
+#                             rel_cp,
+#                             actor or "",
+#                             new_version,
+#                             str(new_status or "pending"),
+#                             now_date,
+#                             int(it["id"]),
+#                         ),
+#                     )
+#                     con3.commit()
+#                     con3.close()
+#
+#                 _retry_write(_do_increment_reset)
+#
+#             incremented += 1
+#
+#         # Register status propagation: any resubmission => For Review
+#         doc_status = "Complete" if old_status == "accepted_minor" else "For Review"
+#         _set_register_status(str(it.get("doc_id") or ""), doc_status)
+#
+#         # Event log (best-effort)
+#         try:
+#             append_checkprint_event(
+#                 db_path,
+#                 item_id=int(it["id"]),
+#                 actor=actor or "",
+#                 event="resubmitted",
+#                 from_status=old_status,
+#                 to_status=new_status,
+#                 note=f"Resubmitted via _CheckPrintIncoming ({Path(src_path).name})",
+#             )
+#         except Exception:
+#             pass
+#
+#     # Delete incoming files ONLY after DB success
+#     delete_ops = [plan_delete(p) for p in incoming_files]
+#     ok2, bad2, reason2 = preflight_ops(delete_ops)
+#     if not ok2:
+#         # We do NOT roll back the resubmission; just report the cleanup issue.
+#         return {
+#             "ok": True,
+#             "updated": overwritten + incremented,
+#             "overwritten": overwritten,
+#             "incremented": incremented,
+#             "deleted_incoming": 0,
+#             "cleanup_warning": {"path": str(bad2), "reason": reason2 or ""},
+#         }
+#
+#     execute_ops(delete_ops)
+#
+#     return {
+#         "ok": True,
+#         "updated": overwritten + incremented,
+#         "overwritten": overwritten,
+#         "incremented": incremented,
+#         "deleted_incoming": len(incoming_files),
+#         "incoming_dir": str(incoming_dir),
+#     }
+
 def resubmit_all_incoming(
     db_path: Path,
     *,
@@ -671,6 +990,17 @@ def resubmit_all_incoming(
     if batch.get("status") in {"cancelled", "completed"}:
         return {"ok": False, "error": "batch_not_editable", "status": batch.get("status")}
 
+    # Resolve project_id once (needed for register status propagation)
+    con = _connect(db_path)
+    row = con.execute(
+        "SELECT project_id FROM checkprint_batches WHERE id=?",
+        (int(batch_id),),
+    ).fetchone()
+    con.close()
+    if not row:
+        return {"ok": False, "error": "batch_project_not_found"}
+    project_id = int(row[0])
+
     incoming_dir = _checkprint_incoming_dir(db_path)
 
     incoming_files = sorted(
@@ -680,6 +1010,9 @@ def resubmit_all_incoming(
     if not incoming_files:
         return {"ok": False, "error": "incoming_empty", "incoming_dir": str(incoming_dir)}
 
+    # ------------------------------------------------------------------
+    # Preload maps once
+    # ------------------------------------------------------------------
     items = get_checkprint_items(db_path, batch_id)
     items_by_id: Dict[int, Dict[str, Any]] = {int(it["id"]): it for it in items}
 
@@ -734,7 +1067,9 @@ def resubmit_all_incoming(
             "details": match_errors,
         }
 
+    # ------------------------------------------------------------------
     # Plan file ops (atomic across batch)
+    # ------------------------------------------------------------------
     all_ops: List[Any] = []
     per_item_meta: Dict[int, Dict[str, Any]] = {}
     per_item_mode: Dict[int, str] = {}
@@ -745,11 +1080,7 @@ def resubmit_all_incoming(
             continue
 
         status = (it.get("status") or "").lower()
-
-        if status == "pending":
-            mode = "overwrite"
-        else:
-            mode = "increment"
+        mode = "overwrite" if status == "pending" else "increment"
 
         ops, meta = _plan_checkprint_update_ops(db_path, it, Path(replacement_file), mode=mode)
 
@@ -764,15 +1095,24 @@ def resubmit_all_incoming(
     if not ok:
         return {"ok": False, "error": "preflight_failed", "path": str(bad_path), "reason": reason or ""}
 
-    # Execute file ops first
+    # Execute file ops first (REQUIRED by your workflow)
     execute_ops(all_ops)
 
-    # DB write-back
+    # ------------------------------------------------------------------
+    # DB write-back (single transaction) + deferred events
+    # ------------------------------------------------------------------
     now_date = datetime.now().strftime("%Y-%m-%d")
     proj_root = _project_root(db_path)
 
     overwritten = 0
     incremented = 0
+
+    # Batch buffers
+    overwrite_rows: List[tuple[str, str, str, str, int]] = []
+    incr_accept_rows: List[tuple[str, str, str, int, str, int]] = []
+    incr_reset_rows: List[tuple[str, str, str, int, str, str, int]] = []
+    doc_status_by_doc_id: Dict[str, str] = {}  # dedup: doc_id -> status
+    event_rows: List[tuple[int, str, str, str, str, str]] = []  # deferred insert
 
     for item_id, src_path in matched.items():
         meta = per_item_meta.get(int(item_id))
@@ -797,67 +1137,131 @@ def resubmit_all_incoming(
             new_status = old_status
 
         if mode == "overwrite":
-            def _do_overwrite():
-                con = _connect(db_path)
-                cur = con.cursor()
-                cur.execute("""
-                    UPDATE checkprint_items
-                       SET source_path=?,
-                           cp_path=?,
-                           submitter=?,
-                           last_submitted_on=?
-                     WHERE id=?
-                """, (rel_src, rel_cp, actor or "", now_date, int(it["id"])))
-                con.commit()
-                con.close()
-
-            _retry_write(_do_overwrite)
+            overwrite_rows.append(
+                (rel_src, rel_cp, actor or "", now_date, int(it["id"]))
+            )
             overwritten += 1
-
         else:
             new_version = int(meta.get("new_version") or it.get("cp_version") or 1)
 
-            def _do_increment():
-                con = _connect(db_path)
-                cur = con.cursor()
-                cur.execute("""
-                    UPDATE checkprint_items
-                       SET source_path=?,
-                           cp_path=?,
-                           submitter=?,
-                           cp_version=?,
-                           status=?,
-                           reviewer=NULL,
-                           last_reviewer_note=NULL,
-                           last_submitted_on=?,
-                           last_reviewed_on=NULL
-                     WHERE id=?
-                """, (
-                    rel_src,
-                    rel_cp,
-                    actor or "",
-                    new_version,
-                    str(new_status or "pending"),
-                    now_date,
-                    int(it["id"]),
-                ))
-                con.commit()
-                con.close()
+            if old_status == "accepted_minor" and new_status == "accepted":
+                # Promote to accepted WITHOUT clearing reviewer info
+                incr_accept_rows.append(
+                    (rel_src, rel_cp, actor or "", new_version, now_date, int(it["id"]))
+                )
+            else:
+                # Normal resubmission → reset review state
+                incr_reset_rows.append(
+                    (rel_src, rel_cp, actor or "", new_version, str(new_status or "pending"), now_date, int(it["id"]))
+                )
 
-            _retry_write(_do_increment)
             incremented += 1
 
-        # Event log (best-effort)
-        try:
-            append_checkprint_event(
-                db_path,
-                item_id=int(it["id"]),
-                actor=actor or "",
-                event="resubmitted",
-                from_status=old_status,
-                to_status=new_status,
-                note=f"Resubmitted via _CheckPrintIncoming ({Path(src_path).name})",
+        # Register status propagation: any resubmission => For Review
+        did = str(it.get("doc_id") or "").strip()
+        if did:
+            doc_status_by_doc_id[did] = "Complete" if old_status == "accepted_minor" else "For Review"
+
+        # Deferred event log row (best-effort insert after commit)
+        event_rows.append(
+            (
+                int(it["id"]),
+                actor or "",
+                "resubmitted",
+                old_status,
+                new_status,
+                f"Resubmitted via _CheckPrintIncoming ({Path(src_path).name})",
             )
+        )
+
+    def _do_db_writeback() -> None:
+        con2 = _connect(db_path)
+        cur2 = con2.cursor()
+
+        # 1) checkprint_items updates
+        if overwrite_rows:
+            cur2.executemany(
+                """
+                UPDATE checkprint_items
+                   SET source_path=?,
+                       cp_path=?,
+                       submitter=?,
+                       last_submitted_on=?
+                 WHERE id=?
+                """,
+                overwrite_rows,
+            )
+
+        if incr_accept_rows:
+            cur2.executemany(
+                """
+                UPDATE checkprint_items
+                   SET source_path=?,
+                       cp_path=?,
+                       submitter=?,
+                       cp_version=?,
+                       status='accepted',
+                       last_submitted_on=?
+                 WHERE id=?
+                """,
+                incr_accept_rows,
+            )
+
+        if incr_reset_rows:
+            cur2.executemany(
+                """
+                UPDATE checkprint_items
+                   SET source_path=?,
+                       cp_path=?,
+                       submitter=?,
+                       cp_version=?,
+                       status=?,
+                       reviewer=NULL,
+                       last_reviewer_note=NULL,
+                       last_submitted_on=?,
+                       last_reviewed_on=NULL
+                 WHERE id=?
+                """,
+                incr_reset_rows,
+            )
+
+        # 2) documents status propagation (deduped)
+        if doc_status_by_doc_id:
+            cur2.executemany(
+                """
+                UPDATE documents
+                   SET status=?,
+                       updated_on=datetime('now')
+                 WHERE project_id=?
+                   AND doc_id=?
+                """,
+                [(st, int(project_id), did) for did, st in doc_status_by_doc_id.items()],
+            )
+
+        con2.commit()
+        con2.close()
+
+    # single transaction with retry wrapper (same resilience as before, but not per-item)
+    _retry_write(_do_db_writeback)
+
+    # Deferred event logging (best-effort, bulk)
+    if event_rows:
+        try:
+            def _do_events() -> None:
+                con3 = _connect(db_path)
+                cur3 = con3.cursor()
+                cur3.executemany(
+                    """
+                    INSERT INTO checkprint_events(
+                        item_id, happened_on, actor, event, from_status, to_status, note
+                    ) VALUES (?, datetime('now'), ?, ?, ?, ?, ?)
+                    """,
+                    [(iid, act, ev, frm, to, note) for (iid, act, ev, frm, to, note) in event_rows],
+                )
+                con3.commit()
+                con3.close()
+
+            _retry_write(_do_events)
         except Exception:
             pass
 
@@ -885,6 +1289,7 @@ def resubmit_all_incoming(
         "deleted_incoming": len(incoming_files),
         "incoming_dir": str(incoming_dir),
     }
+
 
 def complete_and_archive_checkprint(
     db_path: Path,
@@ -915,6 +1320,17 @@ def complete_and_archive_checkprint(
     items = get_checkprint_items(db_path, batch_id)
     if not items:
         raise RuntimeError("No items in CheckPrint batch.")
+
+    # Resolve project_id for register status propagation
+    con = _connect(db_path)
+    row = con.execute(
+        "SELECT project_id FROM checkprint_batches WHERE id=?",
+        (int(batch_id),),
+    ).fetchone()
+    con.close()
+    if not row:
+        raise RuntimeError("CheckPrint batch project not found.")
+    project_id = int(row[0])
 
     # Enforce acceptance
     not_accepted = [
@@ -977,6 +1393,24 @@ def complete_and_archive_checkprint(
         con.close()
 
     _retry_write(_do)
+
+    # --- Register status propagation: completion => Complete ---
+    doc_ids = sorted({str(it.get("doc_id") or "").strip() for it in items if (it.get("doc_id") or "").strip()})
+
+    def _do_docs_complete():
+        con = _connect(db_path)
+        cur = con.cursor()
+        for did in doc_ids:
+            cur.execute(
+                "UPDATE documents SET status=?, updated_on=datetime('now') "
+                "WHERE project_id=? AND doc_id=?",
+                ("Complete", int(project_id), did),
+            )
+        con.commit()
+        con.close()
+
+    _retry_write(_do_docs_complete)
+
 
     # --- Event log (batch-level, item-level for traceability) ---
     for it in items:
@@ -1444,3 +1878,26 @@ def _mark_checkprint_cancelled(db_path: Path, batch_id: int, actor: str):
     _retry_write(_do)
 
     # No event log here — batch-level cancellation does NOT apply to item-level history.
+
+def _propagate_register_status(
+    db_path: Path,
+    *,
+    project_id: int,
+    doc_id: str,
+    cp_status: str,
+):
+    if cp_status == "accepted":
+        new_status = "Complete"
+    elif cp_status in {"accepted_minor", "rejected"}:
+        new_status = "Reworks Required"
+    elif cp_status == "pending":
+        new_status = "For Review"
+    else:
+        return
+
+    update_document_status_by_doc_id(
+        db_path,
+        project_id=project_id,
+        doc_id=doc_id,
+        status=new_status,
+    )

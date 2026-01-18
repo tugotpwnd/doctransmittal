@@ -4,7 +4,7 @@ import os
 import sys
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal
 from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -125,6 +125,7 @@ class CheckPrintTab(QWidget):
       • Submitter view: horizontal panes (Pending, Rejected, Accepted)
       • Reviewer view: horizontal panes (Pending, Rejected, Accepted)
     """
+    registerNeedsRefresh = pyqtSignal()
 
     def __init__(self, parent=None, *, user_name: str = ""):
         super().__init__(parent)
@@ -132,10 +133,10 @@ class CheckPrintTab(QWidget):
         self.db_path: Path | None = None
         self.current_batch_id: int | None = None
         self._batch_rows = []
+        self._active_role: str | None = None  # "submitter" | "reviewer" | None
 
         self.setObjectName("CheckPrintTab")
         self._build_ui()
-
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -157,9 +158,9 @@ class CheckPrintTab(QWidget):
         # ==========================================================
         # Role selector
         # ==========================================================
-        mode_box = QGroupBox("Select Role")
-        mode_box.setMaximumHeight(100)
-        mb = QHBoxLayout(mode_box)
+        self.box_role = QGroupBox("Select Role")
+        self.box_role.setMaximumHeight(100)
+        mb = QHBoxLayout(self.box_role)
 
         self.btn_as_submitter = QPushButton("Submitter")
         self.btn_as_submitter.setFixedWidth(150)
@@ -172,7 +173,7 @@ class CheckPrintTab(QWidget):
         mb.addWidget(self.btn_as_reviewer)
 
         mb.addStretch(1)
-        root.addWidget(mode_box)
+        root.addWidget(self.box_role)
 
         # ==========================================================
         # COMPLETED (HISTORY) VIEW
@@ -338,10 +339,6 @@ class CheckPrintTab(QWidget):
         self._wire_list_common(self.list_rejected_rev, editable=True, for_reviewer=True)
         g_rej_rev_layout.addWidget(self.list_rejected_rev, 1)
 
-        self.btn_open_comment_rev = QPushButton("Open Comment…")
-        self.btn_open_comment_rev.clicked.connect(self._open_comment_reviewer_button)
-        g_rej_rev_layout.addWidget(self.btn_open_comment_rev)
-
         rev_h.addWidget(grp_rej_rev, 1)
 
         # ---------- Accepted (Minor) ----------
@@ -429,36 +426,68 @@ class CheckPrintTab(QWidget):
             self.box_reviewer.setVisible(False)
 
     def _on_batch_selected(self, idx: int):
-        if idx < 0 or not self._batch_rows:
+        # Always reset the view state first (prevents "sticky"/frozen history state).
+        self.box_history.setVisible(False)
+        self.box_submitter.setVisible(False)
+        self.box_reviewer.setVisible(False)
+
+        if idx < 0 or not self._batch_rows or not self.db_path:
             self.current_batch_id = None
+            self._active_role = None
             self.btn_as_submitter.setEnabled(False)
             self.btn_as_reviewer.setEnabled(False)
-            self.box_submitter.setVisible(False)
-            self.box_reviewer.setVisible(False)
+            self._update_role_buttons(None)
+            if hasattr(self, "box_role"):
+                self.box_role.setVisible(True)
+            return
+
+        # Resolve the selected batch id FIRST (this was the freeze bug).
+        batch_id = self.combo_batches.itemData(idx)
+        self.current_batch_id = int(batch_id) if batch_id is not None else None
+
+        if not self.current_batch_id:
+            self._active_role = None
+            self.btn_as_submitter.setEnabled(False)
+            self.btn_as_reviewer.setEnabled(False)
+            self._update_role_buttons(None)
+            if hasattr(self, "box_role"):
+                self.box_role.setVisible(True)
             return
 
         batch = get_checkprint_batch(self.db_path, self.current_batch_id)
-        if batch and batch["status"] == "completed":
+
+        # Completed batches: show history immediately, no role selection.
+        if batch and (batch.get("status") == "completed"):
+            self._active_role = None
+            self._update_role_buttons(None)
+
             self.btn_as_submitter.setEnabled(False)
             self.btn_as_reviewer.setEnabled(False)
+            if hasattr(self, "box_role"):
+                self.box_role.setVisible(False)
+
             self.box_submitter.setVisible(False)
             self.box_reviewer.setVisible(False)
             self.box_history.setVisible(True)
             self._load_history_view()
             return
 
-        batch_id = self.combo_batches.itemData(idx)
-        self.current_batch_id = int(batch_id) if batch_id is not None else None
+        # Non-completed: role selector applies.
+        if hasattr(self, "box_role"):
+            self.box_role.setVisible(True)
 
-        self._update_role_buttons(None)
-
-        # Enable role buttons now that batch is valid
         self.btn_as_submitter.setEnabled(True)
         self.btn_as_reviewer.setEnabled(True)
 
-        # Hide both role views until a role is chosen
-        self.box_submitter.setVisible(False)
-        self.box_reviewer.setVisible(False)
+        # If user already picked a role earlier, keep them in that role when switching batches.
+        if self._active_role == "submitter":
+            self._enter_submitter_mode()
+        elif self._active_role == "reviewer":
+            self._enter_reviewer_mode()
+        else:
+            self._update_role_buttons(None)
+            self.box_submitter.setVisible(False)
+            self.box_reviewer.setVisible(False)
 
     # ------------------------------------------------------------------ UX
     def _update_role_buttons(self, role: str):
@@ -520,6 +549,9 @@ class CheckPrintTab(QWidget):
 
         batch = get_checkprint_batch(self.db_path, self.current_batch_id)
         if batch and batch["status"] == "completed":
+            self._active_role = None
+            if hasattr(self, "box_role"):
+                self.box_role.setVisible(False)
             self.box_submitter.setVisible(False)
             self.box_reviewer.setVisible(False)
             self.box_history.setVisible(True)
@@ -536,6 +568,11 @@ class CheckPrintTab(QWidget):
             )
             return
 
+        self._active_role = "submitter"
+        if hasattr(self, "box_role"):
+            self.box_role.setVisible(True)
+
+        self.box_history.setVisible(False)
         self.box_reviewer.setVisible(False)
         self.box_submitter.setVisible(True)
         self._update_role_buttons("submitter")
@@ -544,6 +581,7 @@ class CheckPrintTab(QWidget):
         editable = batch["status"] in {"in_progress", "submitted", "awaiting_review"}
         self.btn_edit_docs_submitter.setEnabled(editable)
         self.btn_cancel_submitter.setEnabled(batch["status"] != "cancelled")
+
 
     def _load_items_for_submitter(self):
         self.list_pending_sub.clear()
@@ -595,6 +633,9 @@ class CheckPrintTab(QWidget):
 
         batch = get_checkprint_batch(self.db_path, self.current_batch_id)
         if batch and batch["status"] == "completed":
+            self._active_role = None
+            if hasattr(self, "box_role"):
+                self.box_role.setVisible(False)
             self.box_submitter.setVisible(False)
             self.box_reviewer.setVisible(False)
             self.box_history.setVisible(True)
@@ -611,11 +652,15 @@ class CheckPrintTab(QWidget):
             )
             return
 
+        self._active_role = "reviewer"
+        if hasattr(self, "box_role"):
+            self.box_role.setVisible(True)
+
+        self.box_history.setVisible(False)
         self.box_submitter.setVisible(False)
         self.box_reviewer.setVisible(True)
         self._update_role_buttons("reviewer")
         self._load_items_for_reviewer()
-
 
         self.btn_cancel_reviewer.setEnabled(batch["status"] != "cancelled")
 
@@ -898,6 +943,7 @@ class CheckPrintTab(QWidget):
         QMessageBox.information(self, "CheckPrint", msg)
 
         # Reload both views in case user flips roles
+        self.registerNeedsRefresh.emit()
         self._load_items_for_submitter()
         self._load_items_for_reviewer()
 
@@ -919,6 +965,7 @@ class CheckPrintTab(QWidget):
                 reviewer=actor,
             )
 
+        self.registerNeedsRefresh.emit()
         self._load_items_for_reviewer()
 
     def _reviewer_accept_minor(self):
@@ -944,6 +991,7 @@ class CheckPrintTab(QWidget):
                 note=comment,
             )
 
+        self.registerNeedsRefresh.emit()
         self._load_items_for_reviewer()
 
     def _reviewer_reject(self):
@@ -969,20 +1017,8 @@ class CheckPrintTab(QWidget):
                 note=comment,
             )
 
+        self.registerNeedsRefresh.emit()
         self._load_items_for_reviewer()
-
-    def _open_comment_reviewer_button(self):
-        # Try current selection from any reviewer list
-        lw = None
-        for candidate in (self.list_pending_rev, self.list_rejected_rev, self.list_accepted_rev):
-            if candidate.currentItem():
-                lw = candidate
-                break
-        if not lw:
-            QMessageBox.information(self, "Comment", "Select a document first.")
-            return
-
-        self._open_comment_dialog(lw.currentItem(), editable=True, for_reviewer=True)
 
     def _complete_checkprint(self):
         if not self.db_path or not self.current_batch_id:

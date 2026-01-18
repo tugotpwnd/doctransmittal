@@ -407,15 +407,20 @@ class RegisterTab(QWidget):
 
         sel = self.table.selectionModel().selectedRows(COL_DOC_ID)
         if not sel:
-            QMessageBox.information(self, "Select rows", "Single-click to highlight one or more rows, then try again.")
+            QMessageBox.information(
+                self,
+                "Select rows",
+                "Single-click to highlight one or more rows, then try again.",
+            )
             return
 
-        rows = getattr(self.model, '_rows', [])
-        doc_ids = []
+        rows = getattr(self.model, "_rows", [])
+        doc_ids: list[str] = []
+
         for vix in sel:
             srow = self.proxy.mapToSource(vix).row()
             if 0 <= srow < len(rows):
-                did = getattr(rows[srow], 'doc_id', '').strip()
+                did = getattr(rows[srow], "doc_id", "").strip()
                 if did:
                     doc_ids.append(did)
 
@@ -424,9 +429,41 @@ class RegisterTab(QWidget):
             QMessageBox.information(self, "Nothing selected", "No valid rows selected.")
             return
 
-        n = len(doc_ids)
+        # ---- NEW: block deletion if doc is in an active CheckPrint ----
+        try:
+            from doctransmittal_sub.services.db import documents_in_active_checkprints
 
-        # Updated confirmation dialog
+            blocked = documents_in_active_checkprints(
+                self.db_path,
+                self.project_id,
+                doc_ids,
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Delete Error",
+                f"Failed to validate CheckPrint state:\n{e}",
+            )
+            return
+
+        if blocked:
+            lines = []
+            for did, batches in blocked.items():
+                codes = ", ".join(sorted(set(batches)))
+                lines.append(f"• {did}  (CheckPrint: {codes})")
+
+            QMessageBox.warning(
+                self,
+                "Deletion blocked",
+                "The following documents are part of an active CheckPrint and "
+                "cannot be deleted:\n\n"
+                + "\n".join(lines)
+                + "\n\nRemove them from the active CheckPrint first.",
+            )
+            return
+
+        # ---- Confirmation ----
+        n = len(doc_ids)
         resp = QMessageBox.question(
             self,
             "Delete Documents",
@@ -438,18 +475,17 @@ class RegisterTab(QWidget):
                 "This action cannot be undone."
             ),
             QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            QMessageBox.No,
         )
         if resp != QMessageBox.Yes:
             return
 
-        # ---- HARD DELETE (new) ----
+        # ---- HARD DELETE ----
         try:
             from doctransmittal_sub.services.db import bulk_delete_documents
 
             count = bulk_delete_documents(self.db_path, self.project_id, doc_ids)
 
-            # Reload UI
             self._reload_rows()
             self.proxy.invalidateFilter()
             self._recount()
@@ -457,8 +493,11 @@ class RegisterTab(QWidget):
             QMessageBox.information(self, "Deleted", f"Deleted {count} document(s).")
 
         except Exception as e:
-            QMessageBox.critical(self, "Delete Error", f"An error occurred while deleting documents:\n{e}")
-
+            QMessageBox.critical(
+                self,
+                "Delete Error",
+                f"An error occurred while deleting documents:\n{e}",
+            )
 
     # ----------------- Helper for setting default col widths ---------------
     def _apply_default_column_widths(self):

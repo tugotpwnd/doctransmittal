@@ -56,7 +56,8 @@ class CheckPrintEditDialog(QDialog):
         self.project_id: Optional[int] = proj.get("id")
 
         self.setWindowTitle("Edit CheckPrint Documents")
-        self.resize(1100, 650)
+        self.resize(1400, 800)
+        self.setMinimumSize(1400, 800)
 
         root = QVBoxLayout(self)
         root.addWidget(QLabel(f"CheckPrint Batch ID: {self.batch_id}"))
@@ -100,10 +101,11 @@ class CheckPrintEditDialog(QDialog):
         rv = QVBoxLayout(right)
         rv.addWidget(QLabel("CheckPrint Items"))
 
-        self.tbl_cp = QTableWidget(0, 5)
+        self.tbl_cp = QTableWidget(0, 4)
         self.tbl_cp.setHorizontalHeaderLabels(
-            ["Item ID", "Doc ID", "Revision", "CP Ver", "Status"]
+            ["Doc ID", "Revision", "CP Ver", "Status"]
         )
+
         self.tbl_cp.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.tbl_cp.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.tbl_cp.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -138,11 +140,10 @@ class CheckPrintEditDialog(QDialog):
         for it in cp_items:
             r = self.tbl_cp.rowCount()
             self.tbl_cp.insertRow(r)
-            self.tbl_cp.setItem(r, 0, QTableWidgetItem(str(it["id"])))
-            self.tbl_cp.setItem(r, 1, QTableWidgetItem(it["doc_id"]))
-            self.tbl_cp.setItem(r, 2, QTableWidgetItem(it.get("revision", "")))
-            self.tbl_cp.setItem(r, 3, QTableWidgetItem(str(it.get("cp_version", ""))))
-            self.tbl_cp.setItem(r, 4, QTableWidgetItem(it.get("status", "")))
+            self.tbl_cp.setItem(r, 0, QTableWidgetItem(it["doc_id"]))
+            self.tbl_cp.setItem(r, 1, QTableWidgetItem(it.get("revision", "")))
+            self.tbl_cp.setItem(r, 2, QTableWidgetItem(str(it.get("cp_version", ""))))
+            self.tbl_cp.setItem(r, 3, QTableWidgetItem(it.get("status", "")))
 
         # Left table
         self.tbl_register.setRowCount(0)
@@ -335,10 +336,15 @@ class CheckPrintEditDialog(QDialog):
 
         # Extract selected checkprint_items.id values
         try:
+            cp_items = get_checkprint_items(self.db_path, self.batch_id)
+            row_to_id = {idx: it["id"] for idx, it in enumerate(cp_items)}
+
             item_ids = [
-                int(self.tbl_cp.item(r.row(), 0).text())
+                row_to_id.get(r.row())
                 for r in rows
+                if row_to_id.get(r.row()) is not None
             ]
+
         except Exception:
             QMessageBox.critical(
                 self,

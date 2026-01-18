@@ -1026,7 +1026,8 @@ def create_checkprint_batch(
     init_db(db_path)
 
     def _do():
-        con = _connect(db_path); cur = con.cursor()
+        con = _connect(db_path);
+        cur = con.cursor()
         cur.execute("""
             INSERT INTO checkprint_batches(
                 project_id, code, title, client,
@@ -1036,10 +1037,13 @@ def create_checkprint_batch(
         batch_id = cur.lastrowid
 
         rows = []
+        doc_ids_for_status: List[str] = []
         for it in items:
+            did = str(it["doc_id"]).strip()
+            doc_ids_for_status.append(did)
             rows.append((
                 batch_id,
-                it["doc_id"],
+                did,
                 it.get("revision") or "",
                 it["base_name"],
                 int(it.get("cp_version", 1)),
@@ -1061,7 +1065,16 @@ def create_checkprint_batch(
             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, rows)
 
-        con.commit(); con.close()
+        # --- Register status propagation: items added to CP => For Review ---
+        for did in sorted(set(doc_ids_for_status)):
+            cur.execute(
+                "UPDATE documents SET status=?, updated_on=datetime('now') "
+                "WHERE project_id=? AND doc_id=?",
+                ("For Review", int(project_id), did),
+            )
+
+        con.commit();
+        con.close()
         return batch_id
 
     return _retry_write(_do)
@@ -1190,8 +1203,18 @@ def insert_checkprint_items(
         con = _connect(db_path)
         cur = con.cursor()
 
+        # We need project_id so we can update register status.
+        row = cur.execute(
+            "SELECT project_id FROM checkprint_batches WHERE id=?",
+            (int(batch_id),),
+        ).fetchone()
+        project_id = int(row[0]) if row else None
+
         inserted: List[int] = []
+        inserted_doc_ids: List[str] = []
+
         for it in items:
+            did = str(it["doc_id"]).strip()
             cur.execute(
                 """
                 INSERT INTO checkprint_items(
@@ -1204,7 +1227,7 @@ def insert_checkprint_items(
                 """,
                 (
                     int(batch_id),
-                    str(it["doc_id"]),
+                    did,
                     str(it.get("revision") or ""),
                     str(it["base_name"]),
                     int(it.get("cp_version") or 1),
@@ -1220,6 +1243,16 @@ def insert_checkprint_items(
                 ),
             )
             inserted.append(int(cur.lastrowid))
+            inserted_doc_ids.append(did)
+
+        # --- Register status propagation: items added to CP => For Review ---
+        if project_id is not None:
+            for did in sorted(set(inserted_doc_ids)):
+                cur.execute(
+                    "UPDATE documents SET status=?, updated_on=datetime('now') "
+                    "WHERE project_id=? AND doc_id=?",
+                    ("For Review", int(project_id), did),
+                )
 
         con.commit()
         con.close()
@@ -1301,40 +1334,103 @@ def update_checkprint_item_status(
     note: Optional[str] = None,
 ) -> None:
     """
-    Update status / reviewer / note for a single item.
+    Update status / reviewer / note for a single checkprint item
+    AND propagate register document status where required.
     """
-    fields: Dict[str, Any] = {}
-    if status is not None:
-        fields["status"] = status
-        fields["last_reviewed_on"] = "datetime('now')"  # special
-    if reviewer is not None:
-        fields["reviewer"] = reviewer
-    if note is not None:
-        fields["last_reviewer_note"] = note
+    init_db(db_path)
 
-    if not fields:
-        return
-
-    sets_sql = []
-    vals: List[Any] = []
-    for k,v in fields.items():
-        if v == "datetime('now')":
-            sets_sql.append(f"{k}=datetime('now')")
-        else:
-            sets_sql.append(f"{k}=?"); vals.append(v)
-    vals.append(int(item_id))
+    # capture for event logging
+    event_old_status: Optional[str] = None
+    event_doc_status: Optional[str] = None
 
     def _do():
-        con = _connect(db_path); cur = con.cursor()
-        cur.execute(f"""
-            UPDATE checkprint_items
-               SET {", ".join(sets_sql)}
-             WHERE id=?
-        """, vals)
-        con.commit(); con.close()
+        nonlocal event_old_status, event_doc_status
 
+        con = _connect(db_path)
+        cur = con.cursor()
+
+        row = cur.execute(
+            """
+            SELECT ci.status, ci.doc_id, cb.project_id
+              FROM checkprint_items ci
+              JOIN checkprint_batches cb ON cb.id = ci.batch_id
+             WHERE ci.id=?
+            """,
+            (int(item_id),),
+        ).fetchone()
+
+        if not row:
+            con.close()
+            return
+
+        old_status, doc_id, project_id = row
+        event_old_status = old_status
+
+        sets = []
+        vals: list[Any] = []
+
+        if status is not None:
+            sets.append("status=?")
+            vals.append(status)
+            sets.append("last_reviewed_on=datetime('now')")
+
+        if reviewer is not None:
+            sets.append("reviewer=?")
+            vals.append(reviewer)
+
+        if note is not None:
+            sets.append("last_reviewer_note=?")
+            vals.append(note)
+
+        if sets:
+            cur.execute(
+                f"""
+                UPDATE checkprint_items
+                   SET {", ".join(sets)}
+                 WHERE id=?
+                """,
+                (*vals, int(item_id)),
+            )
+
+        # --- Register status propagation ---
+        if status == "accepted":
+            event_doc_status = "Complete"
+        elif status in {"accepted_minor", "rejected"}:
+            event_doc_status = "Reworks Required"
+        else:
+            event_doc_status = None
+
+        if event_doc_status:
+            cur.execute(
+                """
+                UPDATE documents
+                   SET status=?,
+                       updated_on=datetime('now')
+                 WHERE project_id=?
+                   AND doc_id=?
+                """,
+                (event_doc_status, int(project_id), doc_id),
+            )
+
+        con.commit()
+        con.close()
+
+    # ONE retry wrapper — nothing inside _do calls it again
     _retry_write(_do)
 
+    # --- Event log (best-effort, outside transaction) ---
+    try:
+        append_checkprint_event(
+            db_path,
+            item_id=int(item_id),
+            actor=reviewer or "",
+            event="status_changed",
+            from_status=event_old_status,
+            to_status=status,
+            note=note or "",
+        )
+    except Exception:
+        pass
 
 def append_checkprint_event(
     db_path: Path,
@@ -1431,4 +1527,28 @@ def cancel_checkprint_batch(db_path: Path, batch_id: int):
 
     con.commit()
     con.close()
+
+def update_document_status_by_doc_id(
+    db_path: Path,
+    project_id: int,
+    doc_id: str,
+    status: str,
+) -> None:
+    def _do():
+        con = _connect(db_path)
+        cur = con.cursor()
+        cur.execute(
+            """
+            UPDATE documents
+               SET status=?,
+                   updated_on=datetime('now')
+             WHERE project_id=?
+               AND doc_id=?
+            """,
+            (status, int(project_id), doc_id.strip()),
+        )
+        con.commit()
+        con.close()
+
+    _retry_write(_do)
 

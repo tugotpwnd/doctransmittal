@@ -141,26 +141,37 @@ class _MapHighlightDelegate(QStyledItemDelegate):
             if not model.isDir(index):
                 fp = model.filePath(index)
                 if fp:
-                    # If this exact path is manually mapped, show manual green (overrides duplicate amber)
-                    if self._tab._is_manual_mapped_path(fp):
+                    np = self._tab._normpath(fp)
+                    name = Path(np).name.lower()
+
+                    # Manual mapping (highest priority)
+                    if np in self._tab._cache_manual_paths:
                         opt = QStyleOptionViewItem(option)
-                        opt.palette.setColor(QPalette.Text, getattr(self._tab, "_green_manual", QColor(38, 185, 110)))
+                        opt.palette.setColor(
+                            QPalette.Text,
+                            getattr(self._tab, "_green_manual", QColor(38, 185, 110)),
+                        )
                         return super().paint(painter, opt, index)
 
-                    # Duplicates (only if not manually chosen)
-                    if self._tab._is_duplicate_basename(fp):
+                    # Duplicate (amber)
+                    if name in self._tab._cache_dup_names:
                         opt = QStyleOptionViewItem(option)
                         opt.palette.setColor(QPalette.Text, self._amber)
                         return super().paint(painter, opt, index)
 
-                    # Auto/normal mapped
-                    if fp in self._tab._used_paths_set():
+                    # Auto-mapped
+                    if np in self._tab._cache_used_paths:
                         opt = QStyleOptionViewItem(option)
-                        opt.palette.setColor(QPalette.Text, getattr(self._tab, "_green_auto", QColor(46, 160, 67)))
+                        opt.palette.setColor(
+                            QPalette.Text,
+                            getattr(self._tab, "_green_auto", QColor(46, 160, 67)),
+                        )
                         return super().paint(painter, opt, index)
         except Exception:
             pass
+
         return super().paint(painter, option, index)
+
 
 
 # ===================== Main Tab =====================
@@ -192,6 +203,10 @@ class FilesTab(QWidget):
         self._dup_paths: set[str] = set()
         # --- NEW: track manual mappings so we can tint them differently ---
         self._manual_mapped_docids: set[str] = set()
+        # === HOT-PATH CACHES (delegate reads ONLY these) ===
+        self._cache_used_paths: set[str] = set()
+        self._cache_manual_paths: set[str] = set()
+        self._cache_dup_names: set[str] = set()
         # --- NEW: greens ---
         self._green_auto = QColor(46, 160, 67)  # existing
         self._green_manual = QColor(38, 185, 110)  # slightly different shade
@@ -211,11 +226,20 @@ class FilesTab(QWidget):
         self.tree = QTreeView(self)
         self.tree.setModel(self.model)
         self.tree.setHeaderHidden(False)
+        from PyQt5.QtWidgets import QHeaderView
+        header = self.tree.header()
+        # Make filename column dominant
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.resizeSection(0, header.sectionSize(0) * 5)
+        # Keep other columns sensible
+        for col in range(1, header.count()):
+            header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         self.tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self.tree.setDragEnabled(True)
         self.tree.setDragDropMode(QAbstractItemView.DragOnly)
         self.tree.setDefaultDropAction(Qt.CopyAction)
         self.tree.setItemDelegate(_MapHighlightDelegate(self, self.tree))
+        self.tree.setUniformRowHeights(True)
 
         # Root picker + duplicate banner
         self.btn_choose_root = QPushButton("Choose Root Folder…", self)
@@ -241,7 +265,7 @@ class FilesTab(QWidget):
         splitter.addWidget(left_box)
 
         # MIDDLE: Doc IDs (drop target)
-        mid_box = QGroupBox("Files for transmittal", self)
+        mid_box = QGroupBox("Files for process", self)
         mid_v = QVBoxLayout(mid_box)
         self.list_docs = DragDocListWidget(self)
         self.list_docs.mappingRequested.connect(self._on_drop_map_to_doc)
@@ -333,7 +357,7 @@ class FilesTab(QWidget):
             self.tree.setRootIndex(self.model.index(self.model.rootPath()))
         except Exception:
             pass
-        self.tree.viewport().update()
+
 
     # ===== Public API =====
     def set_flow_context(self, *, db_path: Path, items: List[dict],
@@ -409,9 +433,35 @@ class FilesTab(QWidget):
             self.tree.setRootIndex(self.model.index(self.model.rootPath()))
         except Exception:
             pass
-        self.tree.viewport().update()
 
     # ===== Internals =====
+
+    # --- cache helpers ---
+    def _rebuild_delegate_caches(self) -> None:
+        """
+        Rebuild all sets used by the tree delegate.
+        MUST be called whenever mapping / manual mapping / duplicates change.
+        """
+        # Used paths (all mapped)
+        self._cache_used_paths = {
+            self._normpath(p)
+            for p in self.mapping.values()
+            if p
+        }
+
+        # Manual mappings (subset)
+        self._cache_manual_paths = {
+            self._normpath(self.mapping[d])
+            for d in self._manual_mapped_docids
+            if d in self.mapping
+        }
+
+        # Duplicate basenames (already computed by _scan_duplicates)
+        # Stored lower-case for fast compare
+        self._cache_dup_names = {
+            n.lower() for n in getattr(self, "_dup_names", set())
+        }
+
     def _normpath(self, p: str) -> str:
         try:
             return str(Path(p).resolve())
@@ -425,24 +475,9 @@ class FilesTab(QWidget):
             r = r[3:].strip()
         return r
 
-    def _used_paths_set(self) -> set:
-        return {self._normpath(v) for v in self.mapping.values() if v}
-
-    # --- NEW: helpers for manual tinting ---
-    def _manual_paths_set(self) -> set:
-        out = set()
-        try:
-            for d in self._manual_mapped_docids:
-                p = self.mapping.get(d)
-                if p:
-                    out.add(self._normpath(p))
-        except Exception:
-            pass
-        return out
-
     def _is_manual_mapped_path(self, p: str) -> bool:
         try:
-            return self._normpath(p) in self._manual_paths_set()
+            return self._normpath(p) in self._cache_manual_paths
         except Exception:
             return False
 
@@ -501,6 +536,7 @@ class FilesTab(QWidget):
         self._apply_colors()
 
     def _refresh_map_list(self):
+        self._rebuild_delegate_caches()
         self.list_map.clear()
         for d in self.doc_ids:
             p = self.mapping.get(d)
@@ -553,7 +589,6 @@ class FilesTab(QWidget):
                 else:
                     it_right.setForeground(red)
 
-        self.tree.viewport().update()
 
     # --- NEW: only flag duplicates for the *selected* DocID+Rev pairs ---
     def _scan_duplicates(self):
@@ -570,13 +605,15 @@ class FilesTab(QWidget):
 
         if not self.root_dir:
             self._update_dup_banner(0)
-            self.tree.viewport().update()
+            self._rebuild_delegate_caches()
+            self._refresh_map_list()
             return
 
         pairs = self._doc_rev_pairs()
         if not pairs:
             self._update_dup_banner(0)
-            self.tree.viewport().update()
+            self._rebuild_delegate_caches()
+            self._refresh_map_list()
             return
 
         # Compile per-DocID target regexes
@@ -613,8 +650,8 @@ class FilesTab(QWidget):
 
         # Banner shows number of DocIDs with duplicates
         self._update_dup_banner(len(self._dup_for_selection))
+        self._rebuild_delegate_caches()
         self._refresh_map_list()
-        self.tree.viewport().update()
 
     def _is_duplicate_basename(self, p: str) -> bool:
         """True only if this file is part of a duplicate set for one of the selected DocIDs."""
@@ -668,18 +705,6 @@ class FilesTab(QWidget):
                 return
             np = self._normpath(str(p))
             doc_id = self.doc_ids[row]
-            # Duplicate basename warning (manual mapping allowed)
-            if self._is_duplicate_basename(np):
-                r = QMessageBox.warning(
-                    self, "Duplicate filename",
-                    "This filename appears multiple times under the root for the current submission.\n\n"
-                    "• It will be flagged amber.\n"
-                    "• It is excluded from auto-matching rules.\n\n"
-                    "Proceed with manual mapping?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-                )
-                if r != QMessageBox.Yes:
-                    return
             # Conflict check
             current_owner = self._find_doc_for_path(np)
             if current_owner and current_owner != doc_id:
@@ -697,9 +722,8 @@ class FilesTab(QWidget):
                 except Exception: pass
             # Assign
             self.mapping[doc_id] = np
-            # mark this doc as manual; if we stole it from someone else, clear theirs
-            self._manual_mapped_docids.discard(self._find_doc_for_path(np) or "")  # just in case
             self._manual_mapped_docids.add(doc_id)
+            self._rebuild_delegate_caches()
             self._refresh_map_list()
             try: self._apply_colors()
             except Exception: pass
@@ -717,6 +741,7 @@ class FilesTab(QWidget):
     def _clear_all(self):
         self.mapping.clear()
         self._manual_mapped_docids.clear()
+        self._rebuild_delegate_caches()
         self._refresh_map_list()
 
     # NEW: helper to find <DocID>_latestRev.* under root (case-insensitive)
@@ -753,7 +778,7 @@ class FilesTab(QWidget):
         assigned = 0
         skipped_conflict = 0
         skipped_dups = 0
-        used = self._used_paths_set()
+        used = set(self._cache_used_paths)
         for d in self.doc_ids:
             p = found.get(d)
             if not p:
@@ -776,6 +801,7 @@ class FilesTab(QWidget):
                 assigned += 1
             else:
                 skipped_conflict += 1
+        self._rebuild_delegate_caches()
         self._refresh_map_list()
         try:
             toast(self, f"Exact: {assigned} assigned, {skipped_conflict} conflicts, {skipped_dups} duplicates")
@@ -800,7 +826,7 @@ class FilesTab(QWidget):
         assigned = 0
         skipped_conflict = 0
         skipped_dups = 0
-        used = self._used_paths_set()
+        used = set(self._cache_used_paths)
         for d in self.doc_ids:
             lst = guessed.get(d) or []
             if not lst:
@@ -823,6 +849,7 @@ class FilesTab(QWidget):
                 assigned += 1
             else:
                 skipped_conflict += 1
+        self._rebuild_delegate_caches()
         self._refresh_map_list()
         try:
             toast(self, f"Fuzzy: {assigned} assigned, {skipped_conflict} conflicts, {skipped_dups} duplicates")
