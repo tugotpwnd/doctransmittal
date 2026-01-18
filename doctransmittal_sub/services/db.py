@@ -222,6 +222,11 @@ def init_db(db_path: Path) -> None:
 def bulk_delete_documents(db_path: Path, project_id: int, doc_ids: list[str]) -> int:
     """
     Hard delete documents + their revisions.
+
+    SAFETY:
+    - Deletion is blocked if any document is part of an active CheckPrint
+      (i.e. batch status NOT IN ('completed', 'cancelled')).
+
     Transmittal snapshots remain intact.
     Returns number of deleted rows.
     """
@@ -232,6 +237,25 @@ def bulk_delete_documents(db_path: Path, project_id: int, doc_ids: list[str]) ->
     if not doc_ids:
         return 0
 
+    # ---- HARD GUARD: active CheckPrint protection ----
+    blocked = documents_in_active_checkprints(
+        db_path=db_path,
+        project_id=project_id,
+        doc_ids=doc_ids,
+    )
+
+    if blocked:
+        details = []
+        for did, batches in blocked.items():
+            codes = ", ".join(sorted(set(batches)))
+            details.append(f"{did} (CheckPrint: {codes})")
+
+        raise RuntimeError(
+            "Cannot delete document(s) that are part of an active CheckPrint:\n"
+            + "\n".join(details)
+        )
+
+    # ---- DELETE ----
     def _do():
         con = _connect(db_path)
         cur = con.cursor()
@@ -1552,3 +1576,40 @@ def update_document_status_by_doc_id(
 
     _retry_write(_do)
 
+def documents_in_active_checkprints(
+    db_path: Path,
+    project_id: int,
+    doc_ids: List[str],
+) -> Dict[str, List[str]]:
+    """
+    Returns {doc_id: [checkprint_code, ...]} for docs that are
+    currently part of an active CheckPrint batch.
+    """
+    if not doc_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in doc_ids)
+
+    sql = f"""
+        SELECT
+            i.doc_id,
+            b.code
+        FROM checkprint_items i
+        JOIN checkprint_batches b ON b.id = i.batch_id
+        WHERE
+            b.project_id = ?
+            AND b.status NOT IN ('completed', 'cancelled')
+            AND i.state != 'removed'
+            AND i.doc_id IN ({placeholders})
+    """
+
+    blocked: Dict[str, List[str]] = {}
+
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        cur = con.execute(sql, [project_id, *doc_ids])
+
+        for row in cur.fetchall():
+            blocked.setdefault(row["doc_id"], []).append(row["code"])
+
+    return blocked
