@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import warnings
 from pathlib import Path
 from typing import List
@@ -895,6 +896,7 @@ class MainWindow(QMainWindow):
             "header_title": "DOCUMENT REGISTER",
             "db_path": str(db_path),  # lets receipt_pdf gather client logos
             "_pdf_out_path": str(out_pdf),  # also helps logo fallback near output
+            "report_code": Path(db_path).stem,
         }
 
         from ..services.receipt_pdf import export_register_report_pdf
@@ -937,6 +939,7 @@ class MainWindow(QMainWindow):
             "created_on": datetime.now().strftime("%Y-%m-%d"),
             "register_path": str(dbp),
             "db_path": str(dbp),  # for logo discovery
+            "report_code": Path(dbp).stem,  # <-- THIS is the key line
         }
 
         # Save next to the DB in a clear folder

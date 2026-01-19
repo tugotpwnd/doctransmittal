@@ -97,9 +97,11 @@ FONT_BI  = "Arial-BoldItalic"
 
 COL_PRIMARY = colors.HexColor("#215096")   # blue
 COL_ACCENT  = colors.HexColor("#007F4D")   # green
+COL_TABLE_HEADER = colors.HexColor("#007F4D")
 COL_TEXT    = colors.black
 COL_MUTED   = colors.HexColor("#8A8A8A")
 COL_LINE    = colors.HexColor("#D0D6DF")
+
 
 # ------------------------------------------------------------------
 # Paragraph styles
@@ -193,9 +195,10 @@ def draw_header(
     doc_id: Optional[str] = None,
 ):
     """
-    Matches Simple Report header.
+    Page-orientation-safe header.
+    Works for A4/A3, portrait/landscape.
     """
-    w, h = A4
+    w, h = canvas._pagesize
     y = h - 18 * mm
 
     canvas.saveState()
@@ -211,12 +214,13 @@ def draw_header(
     canvas.setFillColor(COL_ACCENT)
     canvas.drawString(12 * mm + lw + 2, y, project or "")
 
-    # Right: Doc ID (optional)
+    # Right: Doc ID
     if doc_id:
         label = "Doc ID:"
         canvas.setFont(FONT_B, 10)
         lw = canvas.stringWidth(label, FONT_B, 10)
         vw = canvas.stringWidth(doc_id, FONT, 10)
+
         x = w - 12 * mm - (lw + vw + 2)
 
         canvas.setFillColor(COL_PRIMARY)
@@ -237,30 +241,27 @@ def draw_footer(
     mini_logo: Optional[Path] = None,
 ):
     """
-    Subtle footer consistent with Simple Report, with optional centred mini logo.
+    Page-orientation-safe footer.
     """
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import mm
-
-    w, _ = A4
+    w, _ = canvas._pagesize
     y = 12 * mm
 
     canvas.saveState()
     canvas.setFont(FONT, 8)
     canvas.setFillColor(COL_MUTED)
 
-    # ---- Left text ----
+    # Left text
     canvas.drawString(12 * mm, y, left_text)
 
-    # ---- Right text ----
+    # Right text
     if right_text:
         rw = canvas.stringWidth(right_text, FONT, 8)
         canvas.drawString(w - 12 * mm - rw, y, right_text)
 
-    # ---- Centre mini logo (optional) ----
+    # Centre logo (optional)
     if mini_logo and Path(mini_logo).exists():
         try:
-            max_h = 7 * mm   # intentionally small
+            max_h = 7 * mm
             max_w = 30 * mm
 
             if mini_logo.suffix.lower() == ".svg":
@@ -271,8 +272,6 @@ def draw_footer(
                 if drawing and drawing.width and drawing.height:
                     scale = min(max_w / drawing.width, max_h / drawing.height)
                     drawing.scale(scale, scale)
-
-                    # Critical: update reported size
                     drawing.width *= scale
                     drawing.height *= scale
 
@@ -297,11 +296,11 @@ def draw_footer(
                     preserveAspectRatio=True,
                     mask="auto",
                 )
-
         except Exception:
-            pass  # footer branding is optional by design
+            pass
 
     canvas.restoreState()
+
 
 # ------------------------------------------------------------------
 # Key / Value block (used heavily by receipts)
@@ -346,7 +345,7 @@ def standard_table(
     headers: List[str],
     rows: List[List[str]],
     *,
-    header_fill=COL_PRIMARY,
+    header_fill=COL_TABLE_HEADER,
     grid_color=COL_LINE,
 ):
     data = [[Paragraph(h, LABEL) for h in headers]]
@@ -383,7 +382,7 @@ def table_with_headers_and_widths(
     rows: Sequence[Sequence[Any]],
     *,
     col_widths: Sequence[float],
-    header_fill=COL_PRIMARY,
+    header_fill=COL_TABLE_HEADER,
     grid_color=COL_LINE,
 ) -> Table:
     """

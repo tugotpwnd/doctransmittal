@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A4,A3, landscape
 from reportlab.lib.units import mm
 from reportlab.platypus import (
     BaseDocTemplate,
@@ -302,7 +302,6 @@ def export_transmittal_pdf(out_pdf: Path, header: Dict[str, Any], items: List[Di
     doc.build(flow)
     return out_pdf
 
-
 def export_progress_report_pdf(
     out_pdf: Path,
     header: Dict[str, Any],
@@ -329,7 +328,7 @@ def export_progress_report_pdf(
         raise RuntimeError("Project metadata missing")
 
     project_title = proj["project_name"]
-    doc_id = _safe_str(header.get("created_on")) or "Progress"
+    doc_id = _safe_str(header.get("report_code")) or "00-REG-001"
 
     # ---- Load documents if not supplied ----
     if docs is None and project_id is not None:
@@ -358,7 +357,10 @@ def export_progress_report_pdf(
     )
 
     flow: List[Any] = []
-    # --- Title + logo row (match Transmittal styling) ---
+
+    # ------------------------------------------------------------------
+    # Title + logo row (matches Transmittal styling)
+    # ------------------------------------------------------------------
     title_para = Paragraph("Progress Tracker", TITLE)
 
     logo_elem = None
@@ -370,7 +372,6 @@ def export_progress_report_pdf(
 
         if logo_path.lower().endswith(".svg"):
             from svglib.svglib import svg2rlg
-
             drawing = svg2rlg(logo_path)
             if drawing and drawing.width and drawing.height:
                 scale = min(
@@ -383,7 +384,6 @@ def export_progress_report_pdf(
                 logo_elem = drawing
         else:
             from reportlab.platypus import Image as RLImage
-
             img = RLImage(logo_path)
             scale = min(
                 logo_col_w / img.imageWidth,
@@ -392,7 +392,6 @@ def export_progress_report_pdf(
             img.drawWidth = img.imageWidth * scale
             img.drawHeight = img.imageHeight * scale
             logo_elem = img
-
     except Exception:
         logo_elem = None
 
@@ -402,7 +401,6 @@ def export_progress_report_pdf(
         rowHeights=[logo_max_h],
         hAlign="LEFT",
     )
-
     title_row.setStyle(
         TableStyle(
             [
@@ -419,28 +417,42 @@ def export_progress_report_pdf(
     flow.append(title_row)
     flow.append(Spacer(1, 8))
 
-    # ---- Summary table ----
+    # ------------------------------------------------------------------
+    # Summary table (Status / Count / %)
+    # ------------------------------------------------------------------
     from collections import Counter
+
     counts = Counter((_safe_str(r.get("status")) or "—").upper() for r in docs)
+    total = sum(counts.values()) or 1  # guard against divide-by-zero
+
+    summary_rows: List[List[Any]] = []
+    for status, count in counts.items():
+        pct = round((count / total) * 100)
+        summary_rows.append([status, str(count), f"{pct}%"])
 
     flow.append(Paragraph("<b>Overall Progress</b>", BODY))
     flow.append(Spacer(1, 4))
 
-    summary_rows = [[k, str(v)] for k, v in counts.items()] or [["—", "0"]]
-
     flow.append(
         table_with_headers_and_widths(
-            headers=["Status", "Count"],
-            rows=summary_rows,
-            col_widths=[120 * mm, doc.width - 120 * mm],
+            headers=["Status", "Count", "%"],
+            rows=summary_rows or [["—", "0", "0%"]],
+            col_widths=[
+                90 * mm,                      # Status
+                30 * mm,                      # Count
+                doc.width - (90 + 30) * mm,   # %
+            ],
         )
     )
 
     flow.append(Spacer(1, 10))
 
-    # ---- Full document table ----
+    # ------------------------------------------------------------------
+    # Full document table
+    # ------------------------------------------------------------------
     flow.append(Paragraph("<b>All Documents</b>", BODY))
     flow.append(Spacer(1, 2))
+
     rows: List[List[Any]] = []
     for r in docs:
         rows.append(
@@ -453,10 +465,10 @@ def export_progress_report_pdf(
         )
 
     col_w = [
-        46 * mm,  # Document No.
-        105 * mm,  # Description
-        30 * mm,  # Status
-        15 * mm,  # Rev (explicit, visible)
+        46 * mm,   # Document No.
+        95 * mm,   # Description (slightly reduced)
+        30 * mm,   # Status
+        15 * mm,   # Rev (explicit, visible)
     ]
 
     flow.append(
@@ -480,6 +492,7 @@ def export_register_report_pdf(
     """
     Document Register (A4 landscape).
     Enforces pdf_layout styling and DB-backed project metadata.
+    Safe against unwrappable content (ReportLab LayoutError).
     """
     _ensure_fonts()
 
@@ -492,7 +505,7 @@ def export_register_report_pdf(
         raise RuntimeError("Project metadata missing")
 
     project_title = proj["project_name"]
-    doc_id = _safe_str(header.get("report_code")) or "Register"
+    doc_id = _safe_str(header.get("report_code")) or "00-REG-001"
 
     # ---- Load register rows ----
     try:
@@ -533,31 +546,97 @@ def export_register_report_pdf(
             canvas,
             left_text="Maxwell Industries Pty Ltd • ABN 95 654 787 210",
             right_text=f"Page {doc.page}",
-            mini_logo=Path(
-                _resource_path("resources/_MI_Logo_Small_SVG.svg")
-            ),
+            mini_logo=Path(_resource_path("resources/_MI_Logo_Small_SVG.svg")),
         )
 
     doc, _ = _build_doc(
         out_pdf,
-        pagesize=landscape(A4),
-        top_margin=28 * mm,
-        bottom_margin=18 * mm,
+        pagesize=landscape(A3),
+        top_margin=30 * mm,
+        bottom_margin=20 * mm,
         on_page=_on_page,
     )
 
     # ---- Flow ----
+    # ---- Flow ----
     flow: List[Any] = []
-    flow.append(Paragraph("Document Register", TITLE))
+
+    # ------------------------------------------------------------------
+    # Title + logo row (matches Progress / Transmittal styling)
+    # ------------------------------------------------------------------
+    title_para = Paragraph("Document Register", TITLE)
+
+    logo_elem = None
+    logo_max_h = 18 * mm
+    logo_col_w = 60 * mm
+
+    try:
+        logo_path = _resource_path("resources/_MI_Logo_SVG.svg")
+
+        if logo_path.lower().endswith(".svg"):
+            from svglib.svglib import svg2rlg
+            drawing = svg2rlg(logo_path)
+            if drawing and drawing.width and drawing.height:
+                scale = min(
+                    logo_col_w / drawing.width,
+                    logo_max_h / drawing.height,
+                )
+                drawing.scale(scale, scale)
+                drawing.width *= scale
+                drawing.height *= scale
+                logo_elem = drawing
+        else:
+            from reportlab.platypus import Image as RLImage
+            img = RLImage(logo_path)
+            scale = min(
+                logo_col_w / img.imageWidth,
+                logo_max_h / img.imageHeight,
+            )
+            img.drawWidth = img.imageWidth * scale
+            img.drawHeight = img.imageHeight * scale
+            logo_elem = img
+    except Exception:
+        logo_elem = None
+
+    title_row = Table(
+        [[title_para, logo_elem or ""]],
+        colWidths=[doc.width - logo_col_w, logo_col_w],
+        rowHeights=[logo_max_h],
+        hAlign="LEFT",
+    )
+
+    title_row.setStyle(
+        TableStyle(
+            [
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]
+        )
+    )
+
+    flow.append(title_row)
     flow.append(Spacer(1, 8))
 
-    # ---- Table rows ----
+    # ---- Build table rows (DEFENSIVELY WRAPPED) ----
     body_rows: List[List[Any]] = []
+
+    # Optional diagnostics (prints once per abnormal value)
+    def _dbg(label: str, val: str):
+        if len(val) > 120:
+            print(f"[PDF][WARN] Long {label} ({len(val)} chars): {val[:120]}…")
+
     for r in rows:
         did = _safe_str(r.get("doc_id")) or "—"
         dtype = _safe_str(r.get("doc_type")) or "—"
         ftyp = _safe_str(r.get("file_type")) or "—"
         desc = _safe_str(r.get("description")) or "—"
+
+        _dbg("doc_id", did)
+        _dbg("description", desc)
 
         last_two = _last_two_submissions(did)
         latest = last_two[0] if len(last_two) > 0 else None
@@ -587,16 +666,27 @@ def export_register_report_pdf(
         "Date",
     ]
 
-    # ---- Column widths (ALL IN POINTS – no unit mixups) ----
+    # ---- Column widths (explicit, stable, sum <= doc.width) ----
+    # ---- Column widths (A3 landscape – tuned) ----
+    fixed_mm = (
+            55  # Document No.
+            + 40  # Type (wider)
+            + 28  # File Type
+            + 18  # Latest Sub.
+            + 30  # Latest Date
+            + 18  # Prev Sub.
+            + 30  # Prev Date
+    )
+
     col_w = [
-        55 * mm,
-        22 * mm,
-        22 * mm,
-        125 * mm,
-        18 * mm,
-        25 * mm,
-        18 * mm,
-        doc.width - (55 + 22 + 22 + 125 + 18 + 25 + 18) * mm,
+        55 * mm,  # Document No.
+        40 * mm,  # Type
+        28 * mm,  # File Type
+        doc.width - fixed_mm * mm,  # Description (dominant)
+        18 * mm,  # Latest Sub.
+        30 * mm,  # Latest Date
+        18 * mm,  # Prev Sub.
+        30 * mm,  # Prev Date
     ]
 
     flow.append(
