@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
-    QWidget,
+    QWidget, QInputDialog,
 )
 
 from ..core.settings import SettingsManager
@@ -232,13 +232,46 @@ class CheckPrintEditDialog(QDialog):
                 missing.append(did)
                 continue
 
-            # Detect duplicates (even if filenames identical)
-            unique = list({str(p) for p in paths})
-            if len(unique) > 1:
-                ambiguous[did] = unique
-                continue
+            # ----------------------------------------------------------
+            # Detect duplicates with smarter handling
+            # ----------------------------------------------------------
+            unique_paths = [Path(p).resolve() for p in {str(p) for p in paths}]
 
-            mapping[did] = unique[0]
+            if len(unique_paths) > 1:
+                # Treat as same doc if filenames start with doc_id
+                if all(p.stem.lower().startswith(did.lower()) for p in unique_paths):
+                    exts = sorted({p.suffix.lower() for p in unique_paths})
+
+                    chosen_ext, ok = QInputDialog.getItem(
+                        self,
+                        "Multiple file types found",
+                        f"{did} has multiple file types:\n\n"
+                        f"{', '.join(exts)}\n\n"
+                        f"Select preferred file type:",
+                        exts,
+                        0,
+                        False
+                    )
+
+                    if not ok:
+                        QMessageBox.warning(self, "Cancelled", f"No selection made for {did}")
+                        return
+
+                    selected = next((p for p in unique_paths if p.suffix.lower() == chosen_ext), None)
+                    if not selected:
+                        QMessageBox.critical(self, "Error", f"Could not resolve selection for {did}")
+                        return
+
+                    mapping[did] = str(selected)
+                    continue
+
+                else:
+                    # True ambiguity
+                    ambiguous[did] = [str(p) for p in unique_paths]
+                    continue
+
+            # Single match
+            mapping[did] = str(unique_paths[0])
 
         # ----------------------------------------------------------
         # Handle ambiguous matches (hard stop)
@@ -247,8 +280,18 @@ class CheckPrintEditDialog(QDialog):
             msg = "Multiple matching files found for the following documents:\n\n"
             for did, paths in ambiguous.items():
                 msg += f"{did}:\n"
-                for p in paths:
-                    msg += f"  - {p}\n"
+                MAX_SHOW = 3
+
+                for did, paths in ambiguous.items():
+                    msg += f"{did}:\n"
+
+                    for p in paths[:MAX_SHOW]:
+                        msg += f"  - {p}\n"
+
+                    if len(paths) > MAX_SHOW:
+                        msg += f"  ... ({len(paths) - MAX_SHOW} more not shown)\n"
+
+                    msg += "\n"
                 msg += "\n"
 
             QMessageBox.critical(
