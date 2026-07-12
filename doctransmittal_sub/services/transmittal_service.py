@@ -12,6 +12,7 @@ try:
         add_items_to_transmittal, remove_items_from_transmittal, update_transmittal_header
     )
     from .receipt_pdf import export_transmittal_pdf
+    from .file_safety import plan_copy, plan_delete_tree, preflight_ops, execute_ops
 except Exception:
     from ..services.db import (
         init_db, get_project, insert_transmittal, list_transmittals, get_transmittal_items,
@@ -19,6 +20,7 @@ except Exception:
         add_items_to_transmittal, remove_items_from_transmittal, update_transmittal_header
     )
     from ..services.receipt_pdf import export_transmittal_pdf
+    from ..services.file_safety import plan_copy, plan_delete_tree, preflight_ops, execute_ops
 
 # ---------------- helpers ----------------
 
@@ -71,6 +73,229 @@ def _base_folder_for_output(db_path: Path) -> Path:
 def _default_out_root(db_path: Path) -> Path:
     return _base_folder_for_output(db_path) / "Transmittals"
 
+
+def _native_archive_root(db_path: Path) -> Path:
+    """
+    Root folder for native/source file archives.
+
+    Layout:
+        <Doc Control>/Native Archives/<TRANSMITTAL_NUMBER>/
+    """
+    return _base_folder_for_output(db_path) / "Native Archives"
+
+
+_NATIVE_ARCHIVE_EXCLUDED_EXTENSIONS = {".pdf"}
+
+# Directory names that are generated output/history/archive locations and must
+# not be scanned for native files. This is deliberately broader than only the
+# app's current "Native Archives" folder name because users may select the
+# project root and that root may contain legacy archive folders.
+_NATIVE_ARCHIVE_SKIP_DIR_NAMES = {
+    "transmittals",
+    "transmittal",
+    "transmittal archive",
+    "transmittal archives",
+    "checkprint",
+    "check print",
+    "check prints",
+    "native archives",
+    "native archive",
+    "native_archives",
+    "native_archive",
+    "native-archives",
+    "native-archive",
+    "archive",
+    "archives",
+    "archived",
+    "_archive",
+    "_archives",
+    "document archive",
+    "document archives",
+    "issue archive",
+    "issue archives",
+    "issued archive",
+    "issued archives",
+}
+
+
+def _normalise_skip_dir_name(value: object) -> str:
+    """Normalise a folder name for skip-list comparison."""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+_NATIVE_ARCHIVE_SKIP_DIR_KEYS = {
+    _normalise_skip_dir_name(x) for x in _NATIVE_ARCHIVE_SKIP_DIR_NAMES
+}
+
+
+def _is_native_archive_skipped_dir(path: Path) -> bool:
+    """Return True when a directory should not be traversed for natives."""
+    try:
+        return _normalise_skip_dir_name(path.name) in _NATIVE_ARCHIVE_SKIP_DIR_KEYS
+    except Exception:
+        return False
+
+
+def _path_has_skipped_archive_part(path: Path) -> bool:
+    """Backward-compatible helper retained for any local references."""
+    try:
+        return any(_normalise_skip_dir_name(part) in _NATIVE_ARCHIVE_SKIP_DIR_KEYS for part in path.parts)
+    except Exception:
+        return False
+
+
+def _iter_native_source_files(source_root: Path):
+    """
+    Yield files under source_root while pruning generated/archive folders.
+
+    This avoids a common failure mode where the source folder is the project
+    root and contains previous Transmittals / Native Archives / Archive folders.
+    Using an explicit stack rather than rglob lets us skip entire subtrees.
+    """
+    stack = [Path(source_root)]
+    while stack:
+        folder = stack.pop()
+        try:
+            entries = list(folder.iterdir())
+        except Exception:
+            continue
+
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    if _is_native_archive_skipped_dir(entry):
+                        continue
+                    stack.append(entry)
+                    continue
+                if entry.is_file():
+                    yield entry
+            except Exception:
+                continue
+
+
+def _normalise_docid(value: object) -> str:
+
+    return str(value or "").strip()
+
+
+def _native_archive_dir(db_path: Path, transmittal_number: str) -> Path:
+    return _native_archive_root(db_path) / str(transmittal_number or "").strip()
+
+
+def _safe_archive_destination(dst_dir: Path, filename: str, reserved: set[str]) -> Path:
+    """Return a unique destination path, suffixing duplicate names as -N."""
+    base = Path(filename).stem
+    ext = Path(filename).suffix
+    candidate = dst_dir / f"{base}{ext}"
+    key = candidate.name.casefold()
+    if key not in reserved and not candidate.exists():
+        reserved.add(key)
+        return candidate
+
+    n = 2
+    while True:
+        candidate = dst_dir / f"{base}-{n}{ext}"
+        key = candidate.name.casefold()
+        if key not in reserved and not candidate.exists():
+            reserved.add(key)
+            return candidate
+        n += 1
+
+
+def _path_has_skipped_archive_part(path: Path) -> bool:
+    return any(part.casefold() in _NATIVE_ARCHIVE_SKIP_DIR_NAMES for part in path.parts)
+
+
+def _find_native_archive_candidates(source_root: Path, doc_ids: list[str]) -> list[Path]:
+    """
+    Find native/source files for selected documents.
+
+    Matching is intentionally strict:
+      - file stem must equal the document ID exactly, case-insensitively
+      - revision issue files such as DOCID_A.pdf or DOCID_A.dwg are not matched
+      - PDFs are excluded because issued PDFs belong in the transmittal Files folder
+      - generated/archive folders are pruned so previous archives are not re-archived
+    """
+    source_root = Path(source_root)
+    if not source_root.exists() or not source_root.is_dir():
+        return []
+
+    wanted = {d.casefold() for d in (_normalise_docid(x) for x in doc_ids) if d}
+    if not wanted:
+        return []
+
+    found: list[Path] = []
+    for p in _iter_native_source_files(source_root):
+        try:
+            if p.suffix.casefold() in _NATIVE_ARCHIVE_EXCLUDED_EXTENSIONS:
+                continue
+            if p.stem.casefold() in wanted:
+                found.append(p.resolve())
+        except Exception:
+            continue
+
+    found.sort(key=lambda x: (x.stem.casefold(), x.suffix.casefold(), x.name.casefold(), str(x.parent).casefold()))
+    return found
+
+
+def rebuild_native_archive_for_transmittal(
+
+    db_path: Path,
+    transmittal_number: str,
+    source_root: Optional[Path],
+    items: List[Dict[str, str]],
+) -> Optional[Path]:
+    """
+    Rebuild Native Archives/<transmittal_number>/ from the active source root.
+
+    This is used for new transmittals only at this stage. Remap integration is
+    intentionally not wired in until the remap workflow is confirmed.
+    """
+    if not source_root:
+        return None
+    source_root = Path(source_root)
+    if not source_root.exists() or not source_root.is_dir():
+        return None
+
+    doc_ids = [_normalise_docid(it.get("doc_id")) for it in (items or [])]
+    candidates = _find_native_archive_candidates(source_root, doc_ids)
+
+    archive_dir = _native_archive_dir(db_path, transmittal_number)
+
+    delete_ops = []
+    if archive_dir.exists():
+        delete_ops.append(plan_delete_tree(archive_dir))
+        ok, bad_path, reason = preflight_ops(delete_ops)
+        if not ok:
+            raise RuntimeError(f"Could not clear native archive folder before rebuild:\n{bad_path}\n{reason}")
+        execute_ops(delete_ops)
+
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    if not candidates:
+        try:
+            print(f"[native-archive] No native files found for {transmittal_number} under {source_root}")
+        except Exception:
+            pass
+        return archive_dir
+
+    reserved: set[str] = set()
+    copy_ops = []
+    for src in candidates:
+        dst = _safe_archive_destination(archive_dir, src.name, reserved)
+        copy_ops.append(plan_copy(src, dst))
+
+    ok, bad_path, reason = preflight_ops(copy_ops)
+    if not ok:
+        raise RuntimeError(f"Native archive preflight failed:\n{bad_path}\n{reason}")
+
+    execute_ops(copy_ops)
+    try:
+        print(f"[native-archive] Copied {len(copy_ops)} file(s) -> {archive_dir}")
+    except Exception:
+        pass
+    return archive_dir
+
 def _last_transmittal_number(project_code: str, out_root: Path) -> int:
     pat = re.compile(rf"^{re.escape(project_code)}-TRN-(\d+)$", re.IGNORECASE)
     maxn = 0
@@ -120,6 +345,7 @@ def create_transmittal(
     items: List[Dict[str, str]],
     created_on_str: Optional[str] = None,
     transmittal_number: Optional[str] = None,
+    source_root: Optional[Path] = None,
 ) -> Path:
     """
     items = [{doc_id, revision, file_path, (optional snapshot fields)}]
@@ -149,7 +375,15 @@ def create_transmittal(
         "created_on": _normalize_created_on(created_on_str),
     }
     insert_transmittal(db_path, header, items)
-    return rebuild_transmittal_bundle(db_path, number, out_root)
+    trans_dir = rebuild_transmittal_bundle(db_path, number, out_root)
+
+    # Native/source file archive is driven from the same source folder used for
+    # transmittal file matching. It is intentionally not run when no source
+    # folder is supplied, such as service-driven rebuilds.
+    if source_root:
+        rebuild_native_archive_for_transmittal(db_path, number, source_root, items)
+
+    return trans_dir
 
 
 def rebuild_transmittal_bundle(
@@ -412,22 +646,43 @@ def purge_transmittal_bundle(
     tid = find_transmittal_id_by_number(db_path, transmittal_number)
     if tid is None:
         return False
+
     out_root = out_root or _default_out_root(db_path)
     trans_dir = out_root / transmittal_number
+    native_dir = _native_archive_dir(db_path, transmittal_number)
 
-    # Force-delete the whole transmittal folder in one go.
-    dir_gone = _rmtree_force(trans_dir)
+    ops = []
+    if trans_dir.exists():
+        ops.append(plan_delete_tree(trans_dir))
+    if native_dir.exists():
+        ops.append(plan_delete_tree(native_dir))
 
-    # Delete DB record (function returns None), then verify by lookup
+    if ops:
+        ok, bad_path, reason = preflight_ops(ops)
+        if not ok:
+            try:
+                print(f"[transmittal] Purge preflight failed for {bad_path}: {reason}")
+            except Exception:
+                pass
+            return False
+        try:
+            execute_ops(ops)
+        except Exception as e:
+            try:
+                print(f"[transmittal] Purge failed: {e}")
+            except Exception:
+                pass
+            return False
+
     try:
         delete_transmittal_by_id(db_path, tid)
     except Exception:
-        # we'll still verify via lookup below
         pass
 
     db_gone = (find_transmittal_id_by_number(db_path, transmittal_number) is None)
+    dirs_gone = (not trans_dir.exists()) and (not native_dir.exists())
 
-    return bool(dir_gone) and bool(db_gone)
+    return bool(dirs_gone) and bool(db_gone)
 
 def edit_transmittal_replace_items(
     db_path: Path,

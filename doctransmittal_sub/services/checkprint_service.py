@@ -218,7 +218,11 @@ def start_checkprint_batch(
                 "base_name": base_name + ext,
                 "cp_version": cp_version,
                 "status": "pending",
+                "reviewer_status": "pending",
                 "submitter": user_name,
+                "approver": "",
+                "last_approved_on": "",
+                "last_approver_note": "",
                 "source_path": str(Path(dst_src).relative_to(proj_root)),
                 "cp_path": str(Path(dst_cp).relative_to(proj_root)),
                 "last_submitted_on": now,
@@ -343,9 +347,86 @@ def _plan_checkprint_update_ops(
         "new_status": new_status,
     }
 
+
     return ops, meta
 
 
+def _cp_status(value: object) -> str:
+    """Normalise a CheckPrint status token."""
+    return str(value or "pending").strip().lower() or "pending"
+
+
+def _resubmission_transition(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Work out reviewer and approver state after a submitter resubmission.
+
+    The workflow now has two independent review states:
+      - reviewer_status: interim reviewer recommendation
+      - status: approver/final outcome shown to the submitter
+
+    Original CheckPrint behaviour is retained for minor outcomes:
+      - reviewer accepted_minor -> reviewer accepted
+      - approver accepted_minor -> approver approved
+
+    Rejected outcomes are reset to pending and require a new action.
+    Reviewer and approver decisions are evaluated separately so one role can be
+    promoted while the other is reset.
+    """
+    old_final = _cp_status(item.get("status"))
+    old_reviewer = _cp_status(item.get("reviewer_status"))
+
+    # Reviewer/interim transition.
+    if old_reviewer == "accepted_minor":
+        new_reviewer = "accepted"
+        keep_reviewer = True
+    elif old_reviewer == "accepted":
+        new_reviewer = "accepted"
+        keep_reviewer = True
+    elif old_reviewer == "rejected":
+        new_reviewer = "pending"
+        keep_reviewer = False
+    else:
+        new_reviewer = "pending"
+        keep_reviewer = False
+
+    # Approver/final transition. accepted_minor is displayed as "Approved Minor"
+    # in the UI, but the stored token remains accepted_minor for compatibility.
+    if old_final == "accepted_minor":
+        new_final = "approved"
+        keep_approver = True
+    elif old_final in {"rejected", "accepted", "approved"}:
+        new_final = "pending"
+        # Retain the last approver initials/comment so reviewer rows can show
+        # that the previous approver outcome has been reset to pending.
+        keep_approver = True
+    else:
+        new_final = "pending"
+        keep_approver = False
+
+    requires_increment = old_final != "pending" or old_reviewer != "pending"
+
+    return {
+        "old_final": old_final,
+        "old_reviewer": old_reviewer,
+        "new_final": new_final,
+        "new_reviewer": new_reviewer,
+        "requires_increment": requires_increment,
+        "reviewer": item.get("reviewer") if keep_reviewer else None,
+        "approver": item.get("approver") if keep_approver else None,
+        "last_reviewer_note": item.get("last_reviewer_note") if keep_reviewer else None,
+        "last_approver_note": item.get("last_approver_note") if keep_approver else None,
+        "last_reviewed_on": item.get("last_reviewed_on") if keep_reviewer else None,
+        "last_approved_on": item.get("last_approved_on") if keep_approver else None,
+    }
+
+
+def _document_status_from_final(final_status: str) -> str:
+    st = _cp_status(final_status)
+    if st in {"accepted", "approved"}:
+        return "Complete"
+    if st in {"accepted_minor", "rejected"}:
+        return "Reworks Required"
+    return "For Review"
 
 
 def _apply_checkprint_update(
@@ -393,21 +474,31 @@ def _apply_checkprint_update(
     rel_cp = str(new_cp_abs.relative_to(proj_root))
     now_date = datetime.now().strftime("%Y-%m-%d")
 
+    transition = _resubmission_transition(item)
+
     def _do():
         con = _connect(db_path)
         cur = con.cursor()
         if mode == "overwrite":
-            # CP version unchanged, status unchanged
+            # CP version unchanged. Both review states are still pending.
             cur.execute("""
                 UPDATE checkprint_items
                    SET source_path=?,
                        cp_path=?,
                        submitter=?,
+                       status='pending',
+                       reviewer_status='pending',
+                       reviewer=NULL,
+                       approver=NULL,
+                       last_reviewer_note=NULL,
+                       last_approver_note=NULL,
+                       last_reviewed_on=NULL,
+                       last_approved_on=NULL,
                        last_submitted_on=?
                  WHERE id=?
             """, (rel_src, rel_cp, submitter, now_date, int(item["id"])))
         else:
-            # increment version and reset status/reviewer
+            # Increment version and update reviewer/approver states independently.
             cur.execute("""
                 UPDATE checkprint_items
                    SET source_path=?,
@@ -415,12 +506,31 @@ def _apply_checkprint_update(
                        submitter=?,
                        cp_version=?,
                        status=?,
-                       reviewer=NULL,
-                       last_reviewer_note=NULL,
+                       reviewer_status=?,
+                       reviewer=?,
+                       approver=?,
+                       last_reviewer_note=?,
+                       last_approver_note=?,
+                       last_reviewed_on=?,
+                       last_approved_on=?,
                        last_submitted_on=?
                  WHERE id=?
-            """, (rel_src, rel_cp, submitter,
-                  new_version, new_status, now_date, int(item["id"])))
+            """, (
+                rel_src,
+                rel_cp,
+                submitter,
+                new_version,
+                transition["new_final"],
+                transition["new_reviewer"],
+                transition["reviewer"],
+                transition["approver"],
+                transition["last_reviewer_note"],
+                transition["last_approver_note"],
+                transition["last_reviewed_on"],
+                transition["last_approved_on"],
+                now_date,
+                int(item["id"]),
+            ))
         con.commit()
         con.close()
 
@@ -432,8 +542,12 @@ def _apply_checkprint_update(
         item_id=int(item["id"]),
         actor=submitter,
         event="resubmitted",
-        from_status=old_status,
-        to_status=new_status if mode == "increment" else old_status,
+        from_status=f"reviewer:{transition['old_reviewer']}; approver:{transition['old_final']}",
+        to_status=(
+            f"reviewer:{transition['new_reviewer']}; approver:{transition['new_final']}"
+            if mode == "increment"
+            else f"reviewer:{transition['old_reviewer']}; approver:{transition['old_final']}"
+        ),
         note="Document resubmitted by submitter",
     )
 
@@ -509,6 +623,14 @@ def overwrite_checkprint_items(
                    SET source_path=?,
                        cp_path=?,
                        submitter=?,
+                       status='pending',
+                       reviewer_status='pending',
+                       reviewer=NULL,
+                       approver=NULL,
+                       last_reviewer_note=NULL,
+                       last_approver_note=NULL,
+                       last_reviewed_on=NULL,
+                       last_approved_on=NULL,
                        last_submitted_on=?
                  WHERE id=?
             """, (rel_src, rel_cp, submitter, now_date, int(it["id"])))
@@ -600,8 +722,7 @@ def resubmit_checkprint_items(
         new_src_abs = meta["new_src_abs"]   # actual path inside project
         new_cp_abs = meta["new_cp_abs"]     # new CP_(N+1) inside project
         new_version = meta["new_version"]
-        old_status = meta["old_status"]
-        new_status = meta["new_status"]
+        transition = _resubmission_transition(it)
 
         proj_root = _project_root(db_path)
 
@@ -619,12 +740,31 @@ def resubmit_checkprint_items(
                        submitter=?,
                        cp_version=?,
                        status=?,
-                       reviewer=NULL,
-                       last_reviewer_note=NULL,
+                       reviewer_status=?,
+                       reviewer=?,
+                       approver=?,
+                       last_reviewer_note=?,
+                       last_approver_note=?,
+                       last_reviewed_on=?,
+                       last_approved_on=?,
                        last_submitted_on=?
                  WHERE id=?
-            """, (rel_src, rel_cp, submitter,
-                  new_version, new_status, now_date, int(it["id"])))
+            """, (
+                rel_src,
+                rel_cp,
+                submitter,
+                new_version,
+                transition["new_final"],
+                transition["new_reviewer"],
+                transition["reviewer"],
+                transition["approver"],
+                transition["last_reviewer_note"],
+                transition["last_approver_note"],
+                transition["last_reviewed_on"],
+                transition["last_approved_on"],
+                now_date,
+                int(it["id"]),
+            ))
             con.commit()
             con.close()
 
@@ -635,8 +775,8 @@ def resubmit_checkprint_items(
             item_id=int(it["id"]),
             actor=submitter,
             event="resubmitted",
-            from_status=old_status,
-            to_status=new_status,
+            from_status=f"reviewer:{transition['old_reviewer']}; approver:{transition['old_final']}",
+            to_status=f"reviewer:{transition['new_reviewer']}; approver:{transition['new_final']}",
             note="Document resubmitted by submitter",
         )
 
@@ -1073,20 +1213,22 @@ def resubmit_all_incoming(
     all_ops: List[Any] = []
     per_item_meta: Dict[int, Dict[str, Any]] = {}
     per_item_mode: Dict[int, str] = {}
+    per_item_transition: Dict[int, Dict[str, Any]] = {}
 
     for item_id, replacement_file in matched.items():
         it = items_by_id.get(int(item_id))
         if not it:
             continue
 
-        status = (it.get("status") or "").lower()
-        mode = "overwrite" if status == "pending" else "increment"
+        transition = _resubmission_transition(it)
+        mode = "increment" if transition["requires_increment"] else "overwrite"
 
         ops, meta = _plan_checkprint_update_ops(db_path, it, Path(replacement_file), mode=mode)
 
         all_ops.extend(ops)
         per_item_meta[int(item_id)] = meta
         per_item_mode[int(item_id)] = mode
+        per_item_transition[int(item_id)] = transition
 
     if not all_ops:
         return {"ok": True, "updated": 0, "overwritten": 0, "incremented": 0, "deleted_incoming": 0}
@@ -1109,8 +1251,7 @@ def resubmit_all_incoming(
 
     # Batch buffers
     overwrite_rows: List[tuple[str, str, str, str, int]] = []
-    incr_accept_rows: List[tuple[str, str, str, int, str, int]] = []
-    incr_reset_rows: List[tuple[str, str, str, int, str, str, int]] = []
+    incr_transition_rows: List[tuple] = []
     doc_status_by_doc_id: Dict[str, str] = {}  # dedup: doc_id -> status
     event_rows: List[tuple[int, str, str, str, str, str]] = []  # deferred insert
 
@@ -1120,21 +1261,13 @@ def resubmit_all_incoming(
             continue
         it = items_by_id[int(item_id)]
         mode = per_item_mode[int(item_id)]
+        transition = per_item_transition[int(item_id)]
 
         new_src_abs = meta["new_src_abs"]
         new_cp_abs = meta["new_cp_abs"]
 
         rel_src = str(new_src_abs.relative_to(proj_root))
         rel_cp = str(new_cp_abs.relative_to(proj_root))
-
-        old_status = (meta.get("old_status") or "").lower()
-
-        if old_status == "accepted_minor":
-            new_status = "accepted"
-        elif mode == "increment":
-            new_status = "pending"
-        else:
-            new_status = old_status
 
         if mode == "overwrite":
             overwrite_rows.append(
@@ -1144,32 +1277,43 @@ def resubmit_all_incoming(
         else:
             new_version = int(meta.get("new_version") or it.get("cp_version") or 1)
 
-            if old_status == "accepted_minor" and new_status == "accepted":
-                # Promote to accepted WITHOUT clearing reviewer info
-                incr_accept_rows.append(
-                    (rel_src, rel_cp, actor or "", new_version, now_date, int(it["id"]))
+            # Resubmission creates a new CP version and updates reviewer and approver
+            # states independently. Minor states are promoted; rejected states return
+            # to pending.
+            incr_transition_rows.append(
+                (
+                    rel_src,
+                    rel_cp,
+                    actor or "",
+                    new_version,
+                    transition["new_final"],
+                    transition["new_reviewer"],
+                    transition["reviewer"],
+                    transition["approver"],
+                    transition["last_reviewer_note"],
+                    transition["last_approver_note"],
+                    transition["last_reviewed_on"],
+                    transition["last_approved_on"],
+                    now_date,
+                    int(it["id"]),
                 )
-            else:
-                # Normal resubmission → reset review state
-                incr_reset_rows.append(
-                    (rel_src, rel_cp, actor or "", new_version, str(new_status or "pending"), now_date, int(it["id"]))
-                )
+            )
 
             incremented += 1
 
-        # Register status propagation: any resubmission => For Review
+        # Register status propagation follows the approver/final state only.
         did = str(it.get("doc_id") or "").strip()
         if did:
-            doc_status_by_doc_id[did] = "Complete" if old_status == "accepted_minor" else "For Review"
+            doc_status_by_doc_id[did] = _document_status_from_final(transition["new_final"])
 
-        # Deferred event log row (best-effort insert after commit)
+        # Deferred event log row (best-effort insert after commit).
         event_rows.append(
             (
                 int(it["id"]),
                 actor or "",
                 "resubmitted",
-                old_status,
-                new_status,
+                f"reviewer:{transition['old_reviewer']}; approver:{transition['old_final']}",
+                f"reviewer:{transition['new_reviewer']}; approver:{transition['new_final']}",
                 f"Resubmitted via _CheckPrintIncoming ({Path(src_path).name})",
             )
         )
@@ -1186,28 +1330,21 @@ def resubmit_all_incoming(
                    SET source_path=?,
                        cp_path=?,
                        submitter=?,
+                       status='pending',
+                       reviewer_status='pending',
+                       reviewer=NULL,
+                       approver=NULL,
+                       last_reviewer_note=NULL,
+                       last_approver_note=NULL,
+                       last_reviewed_on=NULL,
+                       last_approved_on=NULL,
                        last_submitted_on=?
                  WHERE id=?
                 """,
                 overwrite_rows,
             )
 
-        if incr_accept_rows:
-            cur2.executemany(
-                """
-                UPDATE checkprint_items
-                   SET source_path=?,
-                       cp_path=?,
-                       submitter=?,
-                       cp_version=?,
-                       status='accepted',
-                       last_submitted_on=?
-                 WHERE id=?
-                """,
-                incr_accept_rows,
-            )
-
-        if incr_reset_rows:
+        if incr_transition_rows:
             cur2.executemany(
                 """
                 UPDATE checkprint_items
@@ -1216,13 +1353,17 @@ def resubmit_all_incoming(
                        submitter=?,
                        cp_version=?,
                        status=?,
-                       reviewer=NULL,
-                       last_reviewer_note=NULL,
-                       last_submitted_on=?,
-                       last_reviewed_on=NULL
+                       reviewer_status=?,
+                       reviewer=?,
+                       approver=?,
+                       last_reviewer_note=?,
+                       last_approver_note=?,
+                       last_reviewed_on=?,
+                       last_approved_on=?,
+                       last_submitted_on=?
                  WHERE id=?
                 """,
-                incr_reset_rows,
+                incr_transition_rows,
             )
 
         # 2) documents status propagation (deduped)
@@ -1332,13 +1473,13 @@ def complete_and_archive_checkprint(
         raise RuntimeError("CheckPrint batch project not found.")
     project_id = int(row[0])
 
-    # Enforce acceptance
-    not_accepted = [
+    # Enforce final approver approval.
+    not_approved = [
         it for it in items
-        if (it.get("status") or "").lower() != "accepted"
+        if (it.get("status") or "").lower() != "approved"
     ]
-    if not_accepted:
-        raise RuntimeError("All CheckPrint items must be accepted before completion.")
+    if not_approved:
+        raise RuntimeError("All CheckPrint items must be approved before completion.")
 
     proj_root = _project_root(db_path)
 
@@ -1420,8 +1561,8 @@ def complete_and_archive_checkprint(
                 item_id=int(it["id"]),
                 actor=actor or "",
                 event="completed",
-                from_status="accepted",
-                to_status="accepted",
+                from_status="approved",
+                to_status="approved",
                 note="CheckPrint completed and archived",
             )
         except Exception:
@@ -1602,11 +1743,15 @@ def add_documents_to_checkprint(
                 "base_name": base_name + ext,
                 "cp_version": cp_version,
                 "status": "pending",
+                "reviewer_status": "pending",
                 "submitter": actor or "",
                 "reviewer": "",
+                "approver": "",
                 "last_submitted_on": now,
                 "last_reviewed_on": "",
+                "last_approved_on": "",
                 "last_reviewer_note": "",
+                "last_approver_note": "",
                 "source_path": str(dst_src.relative_to(proj_root)),
                 "cp_path": str(dst_cp.relative_to(proj_root)),
                 "state": "active",
@@ -1886,7 +2031,7 @@ def _propagate_register_status(
     doc_id: str,
     cp_status: str,
 ):
-    if cp_status == "accepted":
+    if cp_status in {"accepted", "approved"}:
         new_status = "Complete"
     elif cp_status in {"accepted_minor", "rejected"}:
         new_status = "Reworks Required"

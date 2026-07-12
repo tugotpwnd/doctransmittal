@@ -514,6 +514,7 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
 
         self._workflow_active = False
+        self._remap_active = False
 
         self.settings = settings
         self.setWindowTitle("DocumentManager"); self.resize(1400, 800)
@@ -595,7 +596,7 @@ class MainWindow(QMainWindow):
         # Step navigation (Transmittal -> Files / back)
         self.transmittal_tab.backRequested.connect(self._go_back_to_register)
         self.transmittal_tab.proceedRequested.connect(self._go_to_files_step)
-        self.files_tab.backRequested.connect(self._go_back_to_transmittal)
+        self.files_tab.backRequested.connect(self._handle_files_back_requested)
         self.files_tab.proceedCompleted.connect(self._reset_to_register)
         # History ↔ Files (remap edit flow)
         self.history_tab.remapRequested.connect(self._start_remap_from_history)
@@ -1120,6 +1121,7 @@ class MainWindow(QMainWindow):
         Destructive reset back to Register.
         """
         self._workflow_active = False
+        self._remap_active = False
 
         # HARD RESET
         self.files_tab.reset()
@@ -1152,6 +1154,7 @@ class MainWindow(QMainWindow):
     def _go_back_to_register(self):
         # FULL WORKFLOW ABORT
         self._workflow_active = False
+        self._remap_active = False
 
         self.transmittal_tab.reset()
         self.files_tab.reset()
@@ -1198,6 +1201,7 @@ class MainWindow(QMainWindow):
     def _reset_to_register(self, trans_dir_path: str = ""):
         # END WORKFLOW
         self._workflow_active = False
+        self._remap_active = False
 
         self.transmittal_tab.reset()
         self.files_tab.reset()
@@ -1208,9 +1212,27 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(self.idx_register)
 
     def _enforce_tab_rules(self, idx: int):
-        if idx in (self.idx_transmit, self.idx_files):
+        if idx == self.idx_transmit:
             if not self._workflow_active:
                 self.tabs.setCurrentIndex(self.idx_register)
+                return
+        if idx == self.idx_files:
+            if not (self._workflow_active or self._remap_active):
+                self.tabs.setCurrentIndex(self.idx_register)
+                return
+
+    def _handle_files_back_requested(self):
+        if getattr(self, "_remap_active", False):
+            try:
+                if hasattr(self.files_tab, "reset"):
+                    self.files_tab.reset()
+            except Exception:
+                pass
+            self._remap_active = False
+            self.tabs.setTabEnabled(self.idx_files, False)
+            self.tabs.setCurrentIndex(self.idx_history)
+            return
+        self._go_back_to_transmittal()
 
      # --------------------
 
@@ -1242,8 +1264,11 @@ class MainWindow(QMainWindow):
         Payload from HistoryTab: { mode:'edit', transmittal_number, db_path, items, file_mapping, user/title/client }
         """
         try:
+            self._workflow_active = False
+            self._remap_active = True
             self.files_tab.set_flow_context_edit(payload)
         except Exception as e:
+            self._remap_active = False
             QMessageBox.warning(self, "Remap", f"Could not start remap:\n{e}")
             return
         self.tabs.setTabEnabled(self.idx_files, True)
@@ -1251,6 +1276,16 @@ class MainWindow(QMainWindow):
 
     def _return_to_history_after_remap(self, trans_number: str, trans_dir_path: str):
         # Refresh history and bounce user back there
+        self._remap_active = False
+        try:
+            if hasattr(self.files_tab, "reset"):
+                self.files_tab.reset()
+        except Exception:
+            pass
+        try:
+            self.tabs.setTabEnabled(self.idx_files, False)
+        except Exception:
+            pass
         try:
             if hasattr(self.history_tab, "refresh"):
                 self.history_tab.refresh()

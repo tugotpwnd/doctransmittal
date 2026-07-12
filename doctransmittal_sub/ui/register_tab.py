@@ -229,6 +229,7 @@ class RegisterTab(QWidget):
 
         self.row_options: Dict[str, List[str]] = DEFAULT_ROW_OPTIONS.copy()
         self._rev_mode_idx = 0  # 0=Alpha, 1=AlphaNumeric, 2=Numeric (used when cb_rev_mode is not present)
+        self._bulk_refresh_suspended = False
 
         lay = QVBoxLayout(self)
 
@@ -886,6 +887,123 @@ class RegisterTab(QWidget):
             "statuses": self.row_options.get("statuses", [])
         })
 
+
+    # --- Fast batch helpers (installed by register performance patch) ---------
+    def _selected_doc_ids_and_source_rows(self) -> list[tuple[str, int]]:
+        """Return highlighted document IDs with their source-model row indexes."""
+        try:
+            sel = self.table.selectionModel().selectedRows(COL_DOC_ID)
+        except Exception:
+            sel = []
+        rows = getattr(self.model, "_rows", [])
+        out: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for vix in sel:
+            try:
+                srow = self.proxy.mapToSource(vix).row()
+            except Exception:
+                continue
+            if 0 <= srow < len(rows):
+                did = (getattr(rows[srow], "doc_id", "") or "").strip()
+                key = did.upper()
+                if did and key not in seen:
+                    out.append((did, srow))
+                    seen.add(key)
+        return out
+
+    def _begin_bulk_register_update(self) -> None:
+        """Temporarily suppress expensive per-signal recount/filter work."""
+        self._bulk_refresh_suspended = True
+        self._bulk_vh_resize_mode = None
+        try:
+            self.table.setUpdatesEnabled(False)
+        except Exception:
+            pass
+        try:
+            vh = self.table.verticalHeader()
+            self._bulk_vh_resize_mode = vh.sectionResizeMode(0)
+            vh.setSectionResizeMode(QHeaderView.Fixed)
+        except Exception:
+            pass
+
+    def _end_bulk_register_update(self) -> None:
+        """Re-enable UI and run one final filter/count refresh."""
+        try:
+            self.proxy.invalidateFilter()
+        except Exception:
+            pass
+        self._bulk_refresh_suspended = False
+        try:
+            self._recount()
+        except Exception:
+            pass
+        try:
+            mode = getattr(self, "_bulk_vh_resize_mode", None)
+            if mode is not None:
+                self.table.verticalHeader().setSectionResizeMode(mode)
+        except Exception:
+            pass
+        try:
+            self.table.setUpdatesEnabled(True)
+            self.table.viewport().update()
+        except Exception:
+            pass
+
+    def _emit_register_data_changed(self, source_rows: list[int], columns: list[int]) -> None:
+        """Emit compact dataChanged ranges instead of repainting the whole register."""
+        rows = sorted({int(r) for r in (source_rows or []) if isinstance(r, int) and r >= 0})
+        cols = sorted({int(c) for c in (columns or []) if isinstance(c, int) and c >= 0})
+        if not rows or not cols:
+            return
+
+        row_groups: list[tuple[int, int]] = []
+        start = prev = rows[0]
+        for r in rows[1:]:
+            if r == prev + 1:
+                prev = r
+            else:
+                row_groups.append((start, prev))
+                start = prev = r
+        row_groups.append((start, prev))
+
+        col_groups: list[tuple[int, int]] = []
+        cstart = cprev = cols[0]
+        for c in cols[1:]:
+            if c == cprev + 1:
+                cprev = c
+            else:
+                col_groups.append((cstart, cprev))
+                cstart = cprev = c
+        col_groups.append((cstart, cprev))
+
+        for r1, r2 in row_groups:
+            for c1, c2 in col_groups:
+                try:
+                    self.model.dataChanged.emit(
+                        self.model.index(r1, c1),
+                        self.model.index(r2, c2),
+                        [Qt.DisplayRole, Qt.EditRole],
+                    )
+                except Exception:
+                    pass
+
+    def _patch_revision_rows(self, updates: dict[str, str]) -> list[int]:
+        """Patch latest revision values in the in-memory model and return affected rows."""
+        if not updates:
+            return []
+        update_by_key = {(k or "").strip().upper(): (v or "").strip().upper() for k, v in updates.items()}
+        rows = getattr(self.model, "_rows", [])
+        affected: list[int] = []
+        for r, row in enumerate(rows):
+            key = (getattr(row, "doc_id", "") or "").strip().upper()
+            if key in update_by_key:
+                rev = update_by_key[key]
+                row.latest_rev_token = rev
+                row.latest_rev_raw = rev
+                affected.append(r)
+        return affected
+    # --- End fast batch helpers ------------------------------------------------
+
     # ----------------- Bulk apply --------------------------------------------
     def _highlighted_doc_ids(self) -> List[str]:
         """Return doc_ids for the currently highlighted (selectedRows) entries."""
@@ -903,36 +1021,39 @@ class RegisterTab(QWidget):
         # dedupe, preserve order
         return list(dict.fromkeys(out))
 
+
     def apply_bulk_to_selected(self, type_text: str, file_text: str, status_text: str) -> None:
         """
-        Apply Type/File type/Status to highlighted rows.
-        Optimised to avoid expensive per-row repaints.
-        """
-        import time
-        t_total = time.perf_counter()
+        Apply Type/File Type/Status to highlighted rows.
 
+        Optimised path:
+        - one chunked DB update;
+        - in-memory row patch instead of full reload;
+        - one final filter/count refresh instead of one refresh per dataChanged signal.
+        """
         if not (self.db_path and self.project_id):
             QMessageBox.information(self, "Project", "Open a project database first.")
             return
 
-        doc_ids = self._highlighted_doc_ids()
-        if not doc_ids:
-            QMessageBox.information(self, "Nothing selected",
-                                    "Highlight one or more rows (use Shift/Ctrl), then click Apply.")
+        selected = self._selected_doc_ids_and_source_rows()
+        if not selected:
+            QMessageBox.information(
+                self,
+                "Nothing selected",
+                "Highlight one or more rows (use Shift/Ctrl), then click Apply.",
+            )
             return
 
-        # ---------------- normalize inputs ----------------
         def _norm(x: str) -> str:
             x = (x or "").strip()
             if x in ("— no change —", globals().get("KEEP_VALUE", "— no change —"), ""):
                 return ""
             return x
 
-        fields = {}
+        fields: dict[str, str] = {}
         t = _norm(type_text)
         f = _norm(file_text)
         s = _norm(status_text)
-
         if t:
             fields["doc_type"] = t.split("—", 1)[0].strip().upper()
         if f:
@@ -941,67 +1062,51 @@ class RegisterTab(QWidget):
             fields["status"] = s.strip()
 
         if not fields:
-            QMessageBox.information(self, "No values",
-                                    "Choose a Type / File type / Status (or leave as “— no change —”).")
+            QMessageBox.information(
+                self,
+                "No values",
+                "Choose a Type / File Type / Status, or leave unchanged.",
+            )
             return
 
+        doc_ids = [did for did, _ in selected]
+        row_by_doc = {did.strip().upper(): srow for did, srow in selected}
+        cols: list[int] = []
+        if "doc_type" in fields:
+            cols.append(COL_TYPE)
+        if "file_type" in fields:
+            cols.append(COL_FILETYPE)
+        if "status" in fields:
+            cols.append(COL_STATUS)
+
         try:
-            # ---------------------------------------------------
-            # STEP 1 — DB UPDATE (still the same per-row update)
-            # ---------------------------------------------------
             from doctransmittal_sub.services.db import bulk_update_documents_fields
 
-            t_db = time.perf_counter()
-            bulk_update_documents_fields(self.db_path, self.project_id, doc_ids, fields)
-            print(f"[PROFILE] bulk DB update (batched): {time.perf_counter() - t_db:.4f}s")
+            self._begin_bulk_register_update()
+            try:
+                changed = bulk_update_documents_fields(self.db_path, self.project_id, doc_ids, fields)
 
-            # ---------------------------------------------------
-            # STEP 2 — FAST MODEL PATCHING (no _reload_rows())
-            # ---------------------------------------------------
-            t_patch = time.perf_counter()
+                rows = getattr(self.model, "_rows", [])
+                affected_rows: list[int] = []
+                for row in rows:
+                    did_key = (getattr(row, "doc_id", "") or "").strip().upper()
+                    if did_key in row_by_doc:
+                        for k, v in fields.items():
+                            setattr(row, k, v)
+                        affected_rows.append(row_by_doc[did_key])
 
-            rows = getattr(self.model, "_rows", [])
-            affected_rows = []
+                self._emit_register_data_changed(affected_rows, cols)
+            finally:
+                self._end_bulk_register_update()
 
-            # update the row objects only
-            for r, row in enumerate(rows):
-                if row.doc_id in doc_ids:
-                    affected_rows.append(r)
-                    for k, v in fields.items():
-                        setattr(row, k, v)
-
-            # only repaint columns that actually changed
-            cols = []
-            if "doc_type" in fields:
-                cols.append(COL_TYPE)
-            if "file_type" in fields:
-                cols.append(COL_FILETYPE)
-            if "status" in fields:
-                cols.append(COL_STATUS)
-
-            # batch repaint for speed
-            if affected_rows and cols:
-                first = min(affected_rows)
-                last = max(affected_rows)
-                for c in cols:
-                    tl = self.model.index(first, c)
-                    br = self.model.index(last, c)
-                    self.model.dataChanged.emit(tl, br, [Qt.DisplayRole])
-
-            print(f"[PROFILE] model patching (FAST): {time.perf_counter() - t_patch:.4f}s")
-
-            # ---------------------------------------------------
-            # STEP 3 — recount and finish
-            # ---------------------------------------------------
-            t_rec = time.perf_counter()
-            self._recount()
-            print(f"[PROFILE] recount: {time.perf_counter() - t_rec:.4f}s")
-
-            print(f"[PROFILE] TOTAL apply_bulk_to_selected: {time.perf_counter() - t_total:.4f}s")
-
-            QMessageBox.information(self, "Apply", f"Updated {len(doc_ids)} document(s).")
+            QMessageBox.information(self, "Apply", f"Updated {changed or len(doc_ids)} document(s).")
 
         except Exception as e:
+            try:
+                self.table.setUpdatesEnabled(True)
+            except Exception:
+                pass
+            self._bulk_refresh_suspended = False
             QMessageBox.warning(self, "Apply failed", str(e))
 
     def current_paths(self) -> tuple[str, str]:
@@ -1062,8 +1167,12 @@ class RegisterTab(QWidget):
             br = self.index(len(rows) - 1, self.COL_SELECT)
             self.dataChanged.emit(tl, br, [Qt.CheckStateRole])
 
+
     def _on_model_changed(self, *args, **kwargs):
-        self._recount(); self.proxy.invalidateFilter()
+        if getattr(self, "_bulk_refresh_suspended", False):
+            return
+        self._recount()
+        self.proxy.invalidateFilter()
 
     def _recount(self):
         n = len(self._ticked_items())
@@ -1153,139 +1262,128 @@ class RegisterTab(QWidget):
             return _numeric_prev(raw)
         return _alphanum_prev(raw)
 
+
     def _rev_set_selected(self):
         if not (self.db_path and self.project_id is not None):
-            QMessageBox.information(self, "Project", "Open a project database first."); return
-        sel_rows = self.table.selectionModel().selectedRows(COL_DOC_ID)
-        if not sel_rows:
-            QMessageBox.information(self, "Select rows", "Single-click to highlight one or more rows, then try again."); return
-        rows = getattr(self.model, '_rows', [])
-        doc_ids = []
-        for vix in sel_rows:
-            srow = self.proxy.mapToSource(vix).row()
-            if 0 <= srow < len(rows):
-                doc_ids.append(rows[srow].doc_id)
+            QMessageBox.information(self, "Project", "Open a project database first.")
+            return
+
+        selected = self._selected_doc_ids_and_source_rows()
+        if not selected:
+            QMessageBox.information(self, "Select rows", "Single-click to highlight one or more rows, then try again.")
+            return
+
         val, ok = QInputDialog.getText(self, "Set Revision", "Enter revision (e.g. A, 1A, 3):")
-        if not ok: return
+        if not ok:
+            return
         val = (val or "").strip().upper()
         if not val:
-            QMessageBox.information(self, "Set Revision", "No value entered."); return
-        touched = 0
-        for did in doc_ids:
-            touched += add_revision_by_docid(self.db_path, self.project_id, did, val)
-        prev = set(doc_ids)
-        self._reload_rows()
-        sel_model = self.table.selectionModel(); sel_model.clearSelection()
-        rows = getattr(self.model, '_rows', [])
-        for r, row in enumerate(rows):
-            if row.doc_id in prev:
-                vix = self.proxy.mapFromSource(self.model.index(r, COL_DOC_ID))
-                sel_model.select(vix, sel_model.Select | sel_model.Rows)
-        QMessageBox.information(self, "Revisions", f"Set {touched} revision(s).")
+            QMessageBox.information(self, "Set Revision", "No value entered.")
+            return
+
+        updates = {did: val for did, _ in selected}
+        try:
+            from doctransmittal_sub.services.db import bulk_add_revisions_by_docid
+
+            self._begin_bulk_register_update()
+            try:
+                touched = bulk_add_revisions_by_docid(self.db_path, self.project_id, updates)
+                affected = self._patch_revision_rows(updates)
+                self._emit_register_data_changed(affected, [COL_LATEST_REV])
+            finally:
+                self._end_bulk_register_update()
+
+            QMessageBox.information(self, "Revisions", f"Set {touched} revision(s).")
+        except Exception as e:
+            try:
+                self.table.setUpdatesEnabled(True)
+            except Exception:
+                pass
+            self._bulk_refresh_suspended = False
+            QMessageBox.warning(self, "Revisions", str(e))
+
 
     def _rev_increment_selected(self):
         if not (self.db_path and self.project_id is not None):
             QMessageBox.information(self, "Project", "Open a project database first.")
             return
 
-        sel_rows = self.table.selectionModel().selectedRows(COL_DOC_ID)
-        if not sel_rows:
+        selected = self._selected_doc_ids_and_source_rows()
+        if not selected:
             QMessageBox.information(self, "Select rows", "Single-click to highlight one or more rows, then try again.")
             return
 
-        rows = getattr(self.model, '_rows', [])
-        doc_ids = []
-        for vix in sel_rows:
-            srow = self.proxy.mapToSource(vix).row()
-            if 0 <= srow < len(rows):
-                doc_ids.append(rows[srow].doc_id)
+        selected_keys = {did.strip().upper() for did, _ in selected}
+        curr_map: dict[str, str] = {}
+        for row in getattr(self.model, "_rows", []):
+            did = (getattr(row, "doc_id", "") or "").strip()
+            key = did.upper()
+            if key in selected_keys:
+                tok = getattr(row, "latest_rev_token", "") or _parse_latest_token(str(getattr(row, "latest_rev_raw", "") or ""))
+                curr_map[did] = tok
 
-        # ensure latest_rev_token reflects any inline edits before we compute next
-        self._reload_rows()
-        rows = getattr(self.model, '_rows', [])
-
-        # build curr token map (fallback to raw display if token missing)
-        curr_map = {}
-        for r in rows:
-            did = getattr(r, 'doc_id', '')
-            tok = getattr(r, 'latest_rev_token', '') or _parse_latest_token(str(getattr(r, 'latest_rev_raw', '') or ''))
-            curr_map[did] = tok
-
-        # debug: see the seeds we will increment from
+        updates = {did: self._compute_next(curr_map.get(did, "")) for did, _ in selected}
         try:
-            print("[rev-increment] seed:", {d: curr_map.get(d, '') for d in doc_ids})
-        except Exception:
-            pass
+            from doctransmittal_sub.services.db import bulk_add_revisions_by_docid
 
-        updates = {did: self._compute_next(curr_map.get(did, "")) for did in doc_ids}
+            self._begin_bulk_register_update()
+            try:
+                touched = bulk_add_revisions_by_docid(self.db_path, self.project_id, updates)
+                affected = self._patch_revision_rows(updates)
+                self._emit_register_data_changed(affected, [COL_LATEST_REV])
+            finally:
+                self._end_bulk_register_update()
 
-        touched = 0
-        for did, rev in updates.items():
-            touched += add_revision_by_docid(self.db_path, self.project_id, did, rev)
+            QMessageBox.information(self, "Revisions", f"Applied {touched} revision increment(s).")
+        except Exception as e:
+            try:
+                self.table.setUpdatesEnabled(True)
+            except Exception:
+                pass
+            self._bulk_refresh_suspended = False
+            QMessageBox.warning(self, "Revisions", str(e))
 
-        prev = set(doc_ids)
-        self._reload_rows()
-        sel_model = self.table.selectionModel()
-        sel_model.clearSelection()
-        rows = getattr(self.model, '_rows', [])
-        for r, row in enumerate(rows):
-            if row.doc_id in prev:
-                vix = self.proxy.mapFromSource(self.model.index(r, COL_DOC_ID))
-                sel_model.select(vix, sel_model.Select | sel_model.Rows)
-
-        QMessageBox.information(self, "Revisions", f"Applied {touched} revision increment(s).")
 
     def _rev_decrement_selected(self):
         if not (self.db_path and self.project_id is not None):
             QMessageBox.information(self, "Project", "Open a project database first.")
             return
 
-        sel_rows = self.table.selectionModel().selectedRows(COL_DOC_ID)
-        if not sel_rows:
+        selected = self._selected_doc_ids_and_source_rows()
+        if not selected:
             QMessageBox.information(self, "Select rows", "Single-click to highlight one or more rows, then try again.")
             return
 
-        rows = getattr(self.model, '_rows', [])
-        doc_ids = []
-        for vix in sel_rows:
-            srow = self.proxy.mapToSource(vix).row()
-            if 0 <= srow < len(rows):
-                doc_ids.append(rows[srow].doc_id)
+        selected_keys = {did.strip().upper() for did, _ in selected}
+        curr_map: dict[str, str] = {}
+        for row in getattr(self.model, "_rows", []):
+            did = (getattr(row, "doc_id", "") or "").strip()
+            key = did.upper()
+            if key in selected_keys:
+                tok = getattr(row, "latest_rev_token", "") or _parse_latest_token(str(getattr(row, "latest_rev_raw", "") or ""))
+                curr_map[did] = tok
 
-        # ensure tokens reflect any inline edits
-        self._reload_rows()
-        rows = getattr(self.model, '_rows', [])
-
-        curr_map = {}
-        for r in rows:
-            did = getattr(r, 'doc_id', '')
-            tok = getattr(r, 'latest_rev_token', '') or _parse_latest_token(str(getattr(r, 'latest_rev_raw', '') or ''))
-            curr_map[did] = tok
-
+        updates = {did: self._compute_prev(curr_map.get(did, "")) for did, _ in selected}
         try:
-            print("[rev-decrement] seed:", {d: curr_map.get(d, '') for d in doc_ids})
-        except Exception:
-            pass
+            from doctransmittal_sub.services.db import bulk_add_revisions_by_docid
 
-        updates = {did: self._compute_prev(curr_map.get(did, "")) for did in doc_ids}
+            self._begin_bulk_register_update()
+            try:
+                touched = bulk_add_revisions_by_docid(self.db_path, self.project_id, updates)
+                affected = self._patch_revision_rows(updates)
+                self._emit_register_data_changed(affected, [COL_LATEST_REV])
+            finally:
+                self._end_bulk_register_update()
 
-        touched = 0
-        for did, rev in updates.items():
-            touched += add_revision_by_docid(self.db_path, self.project_id, did, rev)
+            QMessageBox.information(self, "Revisions", f"Applied {touched} revision decrement(s).")
+        except Exception as e:
+            try:
+                self.table.setUpdatesEnabled(True)
+            except Exception:
+                pass
+            self._bulk_refresh_suspended = False
+            QMessageBox.warning(self, "Revisions", str(e))
 
-        prev = set(doc_ids)
-        self._reload_rows()
-        sel_model = self.table.selectionModel();
-        sel_model.clearSelection()
-        rows = getattr(self.model, '_rows', [])
-        for r, row in enumerate(rows):
-            if row.doc_id in prev:
-                vix = self.proxy.mapFromSource(self.model.index(r, COL_DOC_ID))
-                sel_model.select(vix, sel_model.Select | sel_model.Rows)
-
-        QMessageBox.information(self, "Revisions", f"Applied {touched} revision decrement(s).")
-
-    # ----------------- Areas / Batch import ----------------------------------
     def _reload_areas(self):
         if not (self.db_path and self.project_id):
             self._areas_cache = []
@@ -1673,8 +1771,11 @@ class RegisterTab(QWidget):
         return updates
 
     # ----------------- Persist when model lacks callbacks ---------------------
+
     def _on_cell_edited(self, topLeft: QModelIndex, bottomRight: QModelIndex, roles):
         try:
+            if getattr(self, "_bulk_refresh_suspended", False):
+                return
             if topLeft != bottomRight:
                 return
 
@@ -1683,7 +1784,7 @@ class RegisterTab(QWidget):
                 return
 
             src_idx = self.proxy.mapToSource(topLeft)
-            r = src_idx.row();
+            r = src_idx.row()
             c = src_idx.column()
             rows = getattr(self.model, '_rows', [])
             if not (0 <= r < len(rows)):
@@ -1692,12 +1793,6 @@ class RegisterTab(QWidget):
             did = getattr(row, 'doc_id', '')
             if not did:
                 return
-
-            # --- debug header ----------------------------------------------------
-            try:
-                print(f"[RegisterTab] dataChanged r={r} c={c} roles={list(roles) if roles else []} did={did}")
-            except Exception:
-                pass
 
             if c == COL_DESCRIPTION:
                 update_document_fields(self.db_path, self.project_id, did,
@@ -1711,16 +1806,8 @@ class RegisterTab(QWidget):
             elif c == COL_LATEST_REV:
                 raw = str(topLeft.data() or "")
                 token = _parse_latest_token(raw)
-                try:
-                    print(f"[RegisterTab] LatestRev edit: raw='{raw}' -> token='{token}' for {did}")
-                except Exception:
-                    pass
                 if token:
-                    inserted = add_revision_by_docid(self.db_path, self.project_id, did, token)
-                    try:
-                        print(f"[RegisterTab] add_revision_by_docid -> {inserted} (1=changed, 0=no-op)")
-                    except Exception:
-                        pass
+                    add_revision_by_docid(self.db_path, self.project_id, did, token)
         except Exception:
             # keep UI responsive on any failure
             pass

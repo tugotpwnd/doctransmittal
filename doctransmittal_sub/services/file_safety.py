@@ -32,9 +32,10 @@ class FileOp:
     Represents a file operation.
 
     action:
-        "copy"   - copy src → dst
-        "rename" - rename src → dst
-        "delete" - remove src
+        "copy"        - copy src → dst
+        "rename"      - rename src → dst
+        "delete"      - remove src file
+        "delete_tree" - remove src directory tree
     src: Path
     dst: Path | None
     """
@@ -67,6 +68,10 @@ def plan_delete(path: Path) -> FileOp:
     return FileOp("delete", Path(path))
 
 
+def plan_delete_tree(path: Path) -> FileOp:
+    return FileOp("delete_tree", Path(path))
+
+
 # ------------------------------------------------------------
 # Preflight: fail fast
 # ------------------------------------------------------------
@@ -87,6 +92,8 @@ def preflight_ops(ops: List[FileOp]) -> Tuple[bool, Optional[Path], Optional[str
             ok, p, r = _preflight_rename(op)
         elif op.action == "delete":
             ok, p, r = _preflight_delete(op)
+        elif op.action == "delete_tree":
+            ok, p, r = _preflight_delete_tree(op)
         else:
             return False, None, f"Unknown operation: {op.action}"
 
@@ -204,6 +211,39 @@ def _preflight_delete(op: FileOp):
     return True, None, None
 
 
+def _preflight_delete_tree(op: FileOp):
+    src = op.src
+
+    if not src.exists():
+        return True, None, None
+
+    if src.is_file():
+        return _preflight_delete(FileOp("delete", src))
+
+    if not src.is_dir():
+        return False, src, "Path is not a file or directory."
+
+    parent = src.parent
+    if not parent.exists():
+        return True, None, None
+    if not os.access(parent, os.W_OK):
+        return False, parent, "Cannot remove directory tree: parent folder is not writable."
+
+    for dirpath, dirnames, filenames in os.walk(src):
+        dpath = Path(dirpath)
+        if not os.access(dpath, os.R_OK | os.W_OK | os.X_OK):
+            return False, dpath, "Cannot remove directory tree: folder is not readable/writable."
+        for name in filenames:
+            fpath = dpath / name
+            try:
+                with open(fpath, "rb+"):
+                    pass
+            except Exception as e:
+                return False, fpath, f"Cannot remove file in directory tree: {e}"
+
+    return True, None, None
+
+
 # ------------------------------------------------------------
 # Execution and rollback (best effort)
 # ------------------------------------------------------------
@@ -241,6 +281,12 @@ def _execute_single(op: FileOp):
     elif op.action == "delete":
         if op.src.exists():
             op.src.unlink()
+    elif op.action == "delete_tree":
+        if op.src.exists():
+            if op.src.is_dir():
+                shutil.rmtree(op.src)
+            else:
+                op.src.unlink()
     else:
         raise RuntimeError(f"Unknown op type during execution: {op.action}")
 
@@ -270,6 +316,9 @@ def _attempt_rollback(applied_ops: List[FileOp]) -> List[Tuple[FileOp, str]]:
                     op.dst.rename(op.src)
             elif op.action == "delete":
                 # cannot restore a deleted file (no backup cache)
+                pass
+            elif op.action == "delete_tree":
+                # cannot restore a deleted directory tree (no backup cache)
                 pass
         except Exception as e:
             failures.append((op, str(e)))
