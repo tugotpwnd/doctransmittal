@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import os
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
@@ -17,16 +18,28 @@ from PyQt5.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 
 # --- Autofind helpers ---
 try:
-    from ..services.autofind import suggest_mapping, find_docid_rev_matches  # type: ignore
+    from ..services.autofind import suggest_mapping, find_docid_rev_matches, find_docid_rev_candidates  # type: ignore
 except Exception:
     try:
-        from services.autofind import suggest_mapping, find_docid_rev_matches  # type: ignore
+        from services.autofind import suggest_mapping, find_docid_rev_matches, find_docid_rev_candidates  # type: ignore
     except Exception:
         # Fallback stubs to avoid crashes in design-time
         def suggest_mapping(doc_ids, roots):
             return {}
         def find_docid_rev_matches(pairs, roots, extensions=None):
             return {}
+        def find_docid_rev_candidates(pairs, roots, extensions=None):
+            first = find_docid_rev_matches(pairs, roots, extensions=extensions) or {}
+            return {k: [v] for k, v in first.items() if v}
+
+try:
+    from .file_match_dialogs import select_native_exact_matches
+except Exception:
+    try:
+        from doctransmittal_sub.ui.file_match_dialogs import select_native_exact_matches
+    except Exception:
+        def select_native_exact_matches(parent, native_items, **kwargs):
+            return {str(it.get("doc_id", "")) for it in native_items or []}
 
 # --- Transmittal service ---
 try:
@@ -415,6 +428,22 @@ class FilesTab(QWidget):
             created_on=payload.get("created_on") or "",
         )
 
+        # Prime the file tree to the common folder for the existing mapped files.
+        # History remap previously opened Files with no root, which made it look
+        # as though remap had not actually entered the mapping workflow.
+        try:
+            mapped_files = []
+            for p in (payload.get("file_mapping") or {}).values():
+                pp = Path(str(p))
+                if pp.exists() and pp.is_file():
+                    mapped_files.append(pp.resolve().parent)
+            if mapped_files:
+                common = Path(os.path.commonpath([str(p) for p in mapped_files]))
+                if common.exists() and common.is_dir():
+                    self.set_root_folder(common)
+        except Exception:
+            pass
+
     def get_mapping(self) -> Dict[str, str]:
         return dict(self.mapping)
 
@@ -746,16 +775,27 @@ class FilesTab(QWidget):
 
     # NEW: helper to find <DocID>_latestRev.* under root (case-insensitive)
     def _find_latestrev_file(self, doc_id: str) -> Optional[Path]:
+        candidates = self._find_latestrev_candidates(doc_id)
+        return candidates[0] if candidates else None
+
+    def _find_latestrev_candidates(self, doc_id: str) -> List[Path]:
         if not self.root_dir or not doc_id:
-            return None
-        base_lower = f"{doc_id}_latestrev"
+            return []
+        base_lower = f"{doc_id}_latestrev".lower()
+        found: List[Path] = []
+        seen = set()
         try:
             for p in self.root_dir.rglob("*"):
-                if p.is_file() and p.suffix and p.stem.lower() == base_lower.lower():
-                    return p
+                if p.is_file() and p.suffix and p.stem.lower() == base_lower:
+                    rp = p.resolve()
+                    key = str(rp)
+                    if key not in seen:
+                        seen.add(key)
+                        found.append(rp)
         except Exception:
             pass
-        return None
+        found.sort(key=lambda p: (p.suffix.lower(), p.name.lower(), str(p.parent).lower()))
+        return found
 
     def _auto_find_exact(self):
         if not self.root_dir:
@@ -763,29 +803,61 @@ class FilesTab(QWidget):
             return
 
         pairs = self._doc_rev_pairs()
+        pair_rev = {d: rv for d, rv in pairs}
         try:
-            found = find_docid_rev_matches(pairs, [self.root_dir], extensions=None) or {}
+            candidates = find_docid_rev_candidates(pairs, [self.root_dir], extensions=None) or {}
         except Exception:
-            found = {}
+            try:
+                first = find_docid_rev_matches(pairs, [self.root_dir], extensions=None) or {}
+                candidates = {k: [v] for k, v in first.items() if v}
+            except Exception:
+                candidates = {}
 
-        # --- NEW: fallback to <DocID>_latestRev.* if no explicit DocID_Rev match was found ---
+        # Fallback to <DocID>_latestRev.* only where no explicit DocID_Rev match was found.
         for d in self.doc_ids:
-            if not found.get(d):
-                alt = self._find_latestrev_file(d)
+            if not candidates.get(d):
+                alt = self._find_latestrev_candidates(d)
                 if alt:
-                    found[d] = alt
+                    candidates[d] = alt
+
+        candidate_rows = []
+        native_items = []
+        skipped_dups = 0
+
+        for d in self.doc_ids:
+            paths = sorted({Path(p).resolve() for p in (candidates.get(d) or [])}, key=lambda p: (p.suffix.lower(), p.name.lower(), str(p.parent).lower()))
+            if not paths:
+                continue
+            if len(paths) > 1:
+                # Duplicate exact matches remain amber/manual.
+                skipped_dups += 1
+                continue
+            pth = paths[0]
+            if self._is_duplicate_basename(str(pth)):
+                skipped_dups += 1
+                continue
+            if pth.suffix.lower() != ".pdf":
+                native_items.append({"doc_id": d, "revision": pair_rev.get(d, ""), "path": pth})
+            else:
+                candidate_rows.append((d, pth, False))
+
+        selected_native = select_native_exact_matches(
+            self,
+            native_items,
+            source_root=self.root_dir,
+            title="Native exact matches found",
+        )
+        if selected_native is None:
+            return
+        for item in native_items:
+            did = item.get("doc_id")
+            if did in selected_native:
+                candidate_rows.append((did, Path(item.get("path")), True))
 
         assigned = 0
         skipped_conflict = 0
-        skipped_dups = 0
         used = set(self._cache_used_paths)
-        for d in self.doc_ids:
-            p = found.get(d)
-            if not p:
-                continue
-            if self._is_duplicate_basename(str(p)):
-                skipped_dups += 1
-                continue
+        for d, p, _is_native in candidate_rows:
             np = self._normpath(str(p))
             current_owner = self._find_doc_for_path(np)
             if current_owner and current_owner != d:
@@ -801,18 +873,21 @@ class FilesTab(QWidget):
                 assigned += 1
             else:
                 skipped_conflict += 1
+
+        skipped_native = max(0, len(native_items) - len(selected_native))
         self._rebuild_delegate_caches()
         self._refresh_map_list()
         try:
             toast(self, f"Exact: {assigned} assigned, {skipped_conflict} conflicts, {skipped_dups} duplicates")
         except Exception:
             pass
-        if skipped_conflict or skipped_dups:
+        if skipped_conflict or skipped_dups or skipped_native:
             QMessageBox.information(
                 self, "Exact Match",
                 f"Assigned: {assigned}\n"
                 f"Skipped (conflicts): {skipped_conflict}\n"
-                f"Skipped (duplicates): {skipped_dups}"
+                f"Skipped (duplicates/manual required): {skipped_dups}\n"
+                f"Native files left unmapped: {skipped_native}"
             )
 
     def _auto_find_fuzzy(self):
@@ -936,6 +1011,7 @@ class FilesTab(QWidget):
                 client=self.client or "",
                 items=snap,
                 created_on_str=(self.le_date.text().strip() if hasattr(self, "le_date") else None),
+                source_root=self.root_dir,
             )
         except Exception as e:
             QMessageBox.critical(self, "Transmittal", f"Failed to create transmittal:\n{e}")

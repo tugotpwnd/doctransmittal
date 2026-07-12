@@ -65,3 +65,55 @@ def find_docid_rev_matches(
             if stem in wanted and wanted[stem] not in found:
                 found[wanted[stem]] = p
     return found
+
+def find_docid_rev_candidates(
+    doc_revs: Iterable[Tuple[str, str]],
+    search_roots: List[Path],
+    extensions: List[str] | None = None
+) -> Dict[str, List[Path]]:
+    """
+    Return {doc_id: [Path, ...]} for files whose stem exactly matches one of:
+        <DocID>_<Revision>, <DocID>-<Revision>, <DocID> <Revision>
+    Matching is case-insensitive and recursive. Results are sorted and de-duplicated.
+    This is used when the UI needs to detect duplicate exact matches instead of
+    silently choosing the first file.
+    """
+    if extensions:
+        extensions = [e.lower() for e in extensions]
+
+    wanted: Dict[str, str] = {}
+    for doc, rev in (doc_revs or []):
+        doc = str(doc or "").strip()
+        rev = str(rev or "").strip()
+        if not doc or not rev:
+            continue
+        for sep in ("_", "-", " "):
+            wanted[f"{doc}{sep}{rev}".upper()] = doc
+
+    found: Dict[str, List[Path]] = {doc: [] for doc in set(wanted.values())}
+    seen: Dict[str, set[str]] = {doc: set() for doc in set(wanted.values())}
+
+    for root in search_roots or []:
+        if not root or not Path(root).exists():
+            continue
+        files = sorted(Path(root).rglob("*"), key=lambda p: (p.name.lower(), str(p.parent).lower()))
+        for p in files:
+            if not p.is_file():
+                continue
+            if extensions and p.suffix.lower() not in extensions:
+                continue
+            doc_id = wanted.get(p.stem.upper())
+            if not doc_id:
+                continue
+            try:
+                key = str(p.resolve())
+            except Exception:
+                key = str(p)
+            if key in seen.setdefault(doc_id, set()):
+                continue
+            seen[doc_id].add(key)
+            found.setdefault(doc_id, []).append(p)
+
+    for doc_id, paths in found.items():
+        paths.sort(key=lambda p: (p.suffix.lower(), p.name.lower(), str(p.parent).lower()))
+    return found

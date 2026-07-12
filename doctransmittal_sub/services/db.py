@@ -209,10 +209,53 @@ def init_db(db_path: Path) -> None:
     # checkprint_items...
     # Soft-remove support (keeps audit trail; prevents orphan files).
     _ensure_column(con, "checkprint_items", "state", "TEXT NOT NULL DEFAULT 'active'")
+
+    # CheckPrint approver workflow support.
+    # `status` is now the submitter-visible / approver-final status.
+    # `reviewer_status` is the interim reviewer recommendation only.
+    _ensure_column(con, "checkprint_items", "reviewer_status", "TEXT NOT NULL DEFAULT 'pending'")
+    _ensure_column(con, "checkprint_items", "approver", "TEXT")
+    _ensure_column(con, "checkprint_items", "last_approved_on", "TEXT")
+    _ensure_column(con, "checkprint_items", "last_approver_note", "TEXT")
+
+    # Existing active batches created before the approver workflow used `status`
+    # as the reviewer decision. Move those decisions into reviewer_status and
+    # reset final status to pending so an approver can make the final call.
+    cur.execute("""
+        UPDATE checkprint_items
+           SET reviewer_status = status
+         WHERE COALESCE(reviewer_status, 'pending') = 'pending'
+           AND status IN ('accepted', 'accepted_minor', 'rejected')
+           AND batch_id IN (
+                SELECT id FROM checkprint_batches
+                 WHERE status NOT IN ('completed', 'cancelled')
+           )
+    """)
+    cur.execute("""
+        UPDATE checkprint_items
+           SET status = 'pending'
+         WHERE status IN ('accepted', 'accepted_minor', 'rejected')
+           AND COALESCE(approver, '') = ''
+           AND batch_id IN (
+                SELECT id FROM checkprint_batches
+                 WHERE status NOT IN ('completed', 'cancelled')
+           )
+    """)
+
     _ensure_index(
         con,
         "idx_cp_items_batch_state",
         "CREATE INDEX idx_cp_items_batch_state ON checkprint_items(batch_id, state);",
+    )
+    _ensure_index(
+        con,
+        "idx_cp_items_batch_status",
+        "CREATE INDEX idx_cp_items_batch_status ON checkprint_items(batch_id, status);",
+    )
+    _ensure_index(
+        con,
+        "idx_cp_items_batch_reviewer_status",
+        "CREATE INDEX idx_cp_items_batch_reviewer_status ON checkprint_items(batch_id, reviewer_status);",
     )
 
 
@@ -409,6 +452,70 @@ def add_revision_by_docid(db_path: Path, project_id: int, doc_id: str, rev: str,
 
         con.commit(); con.close()
         return 1
+    return _retry_write(_do)
+
+
+
+
+def bulk_add_revisions_by_docid(db_path: Path, project_id: int, updates: Dict[str, str], notes: str = "") -> int:
+    """
+    Batch insert/update latest revisions for many documents.
+
+    This is the batch equivalent of add_revision_by_docid(). It avoids opening,
+    committing and closing SQLite once per document, which was the main DB-side
+    cost during register revision increment/decrement operations.
+    """
+    cleaned: Dict[str, str] = {}
+    for doc_id, rev in (updates or {}).items():
+        did = (doc_id or "").strip()
+        rv = (rev or "").strip()
+        if did and rv:
+            cleaned[did] = rv
+    if not cleaned:
+        return 0
+
+    def _chunks(values, size=850):
+        values = list(values)
+        for i in range(0, len(values), size):
+            yield values[i:i + size]
+
+    def _do():
+        con = _connect(db_path)
+        cur = con.cursor()
+        written = 0
+        try:
+            for chunk in _chunks(list(cleaned.keys())):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = cur.execute(
+                    f"""
+                    SELECT id, doc_id
+                      FROM documents
+                     WHERE project_id=?
+                       AND doc_id IN ({placeholders})
+                    """,
+                    [project_id] + chunk,
+                ).fetchall()
+                id_by_doc = {str(doc_id).strip(): int(doc_pk) for doc_pk, doc_id in rows}
+                payload = [
+                    (id_by_doc[did], cleaned[did], notes)
+                    for did in chunk
+                    if did in id_by_doc
+                ]
+                if not payload:
+                    continue
+                cur.executemany(
+                    """
+                    INSERT OR REPLACE INTO revisions(document_id, rev, notes, created_on)
+                    VALUES (?, ?, ?, date('now'))
+                    """,
+                    payload,
+                )
+                written += len(payload)
+            con.commit()
+            return written
+        finally:
+            con.close()
+
     return _retry_write(_do)
 
 
@@ -683,18 +790,52 @@ def update_document_fields(db_path: Path, project_id: int, doc_id: str, fields: 
         con.commit(); con.close()
     _retry_write(_do)
 
+
 def bulk_update_documents_fields(db_path: Path, project_id: int, doc_ids: List[str], fields: Dict[str, Any]) -> int:
-    allowed = {"doc_type", "file_type", "description", "comments", "status", "is_active"}  # added comments
-    kv = {k: v for k, v in fields.items() if k in allowed}
-    if not kv or not doc_ids: return 0
+    """
+    Batch update shared document fields for many document IDs.
+
+    Previous behaviour executed one UPDATE per selected document inside a single
+    transaction. This version issues chunked UPDATE ... IN (...) statements,
+    reducing Python/SQLite call overhead for large highlighted selections.
+    """
+    allowed = {"doc_type", "file_type", "description", "comments", "status", "is_active"}
+    kv = {k: v for k, v in (fields or {}).items() if k in allowed}
+    cleaned = []
+    seen = set()
+    for doc_id in (doc_ids or []):
+        did = (doc_id or "").strip()
+        key = did.upper()
+        if did and key not in seen:
+            cleaned.append(did)
+            seen.add(key)
+    if not kv or not cleaned:
+        return 0
+
     sets = ", ".join(f"{k}=?" for k in kv.keys())
+    values = list(kv.values())
+    # SQLite has a default 999 variable limit. Reserve space for set values and project_id.
+    chunk_size = max(1, 900 - len(values) - 1)
+
     def _do():
-        con = _connect(db_path); cur = con.cursor()
-        for doc_id in doc_ids:
-            cur.execute(f"UPDATE documents SET {sets} WHERE project_id=? AND doc_id=?",
-                        list(kv.values()) + [project_id, doc_id.strip()])
-        con.commit(); n = cur.rowcount; con.close()
-        return n
+        con = _connect(db_path)
+        cur = con.cursor()
+        changed = 0
+        try:
+            for i in range(0, len(cleaned), chunk_size):
+                chunk = cleaned[i:i + chunk_size]
+                placeholders = ",".join("?" for _ in chunk)
+                cur.execute(
+                    f"UPDATE documents SET {sets} WHERE project_id=? AND doc_id IN ({placeholders})",
+                    values + [project_id] + chunk,
+                )
+                if cur.rowcount and cur.rowcount > 0:
+                    changed += int(cur.rowcount)
+            con.commit()
+            return changed
+        finally:
+            con.close()
+
     return _retry_write(_do)
 
 def set_document_sp_link(db_path: Path, project_id: int, doc_id: str, sp_url: str, local_hint: str = "") -> None:
@@ -1041,16 +1182,15 @@ def create_checkprint_batch(
 ) -> int:
     """
     Create a CheckPrint batch + items.
-    items = [{
-        doc_id, revision, base_name, cp_version,
-        status, submitter, source_path, cp_path,
-        last_submitted_on
-    }, ...]
+
+    New workflow semantics:
+      - status           = approver/final status visible to submitter
+      - reviewer_status  = interim reviewer recommendation only
     """
     init_db(db_path)
 
     def _do():
-        con = _connect(db_path);
+        con = _connect(db_path)
         cur = con.cursor()
         cur.execute("""
             INSERT INTO checkprint_batches(
@@ -1072,24 +1212,29 @@ def create_checkprint_batch(
                 it["base_name"],
                 int(it.get("cp_version", 1)),
                 it.get("status", "pending"),
+                it.get("reviewer_status", "pending"),
                 it.get("submitter", created_by),
                 it.get("reviewer") or "",
+                it.get("approver") or "",
                 it.get("last_submitted_on", created_on),
                 it.get("last_reviewed_on") or "",
+                it.get("last_approved_on") or "",
                 it.get("last_reviewer_note") or "",
+                it.get("last_approver_note") or "",
                 it["source_path"],
                 it["cp_path"],
             ))
         cur.executemany("""
             INSERT INTO checkprint_items(
                 batch_id, doc_id, revision, base_name, cp_version,
-                status, submitter, reviewer, last_submitted_on,
-                last_reviewed_on, last_reviewer_note,
+                status, reviewer_status, submitter, reviewer, approver,
+                last_submitted_on, last_reviewed_on, last_approved_on,
+                last_reviewer_note, last_approver_note,
                 source_path, cp_path
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, rows)
 
-        # --- Register status propagation: items added to CP => For Review ---
+        # Register status propagation: items added to CP => For Review.
         for did in sorted(set(doc_ids_for_status)):
             cur.execute(
                 "UPDATE documents SET status=?, updated_on=datetime('now') "
@@ -1097,7 +1242,7 @@ def create_checkprint_batch(
                 ("For Review", int(project_id), did),
             )
 
-        con.commit();
+        con.commit()
         con.close()
         return batch_id
 
@@ -1123,6 +1268,30 @@ def list_checkprint_batches(db_path: Path) -> List[Dict[str, Any]]:
 
 
 
+def _checkprint_item_cols() -> List[str]:
+    return [
+        "id",
+        "batch_id",
+        "doc_id",
+        "revision",
+        "base_name",
+        "cp_version",
+        "status",
+        "reviewer_status",
+        "submitter",
+        "reviewer",
+        "approver",
+        "last_submitted_on",
+        "last_reviewed_on",
+        "last_approved_on",
+        "last_reviewer_note",
+        "last_approver_note",
+        "source_path",
+        "cp_path",
+        "state",
+    ]
+
+
 def get_checkprint_items(
     db_path: Path,
     batch_id: int,
@@ -1132,9 +1301,8 @@ def get_checkprint_items(
     """
     Fetch items for a batch.
 
-    By default, items that have been removed from the batch are hidden.
-    This enables safe 'edit batch contents' workflows while preserving
-    an audit trail (removed rows are not deleted).
+    `status` is the approver/final status shown back to the submitter.
+    `reviewer_status` is the interim reviewer recommendation shown to the approver.
     """
     init_db(db_path)
     con = _connect(db_path)
@@ -1142,8 +1310,9 @@ def get_checkprint_items(
     rows = con.execute(
         f"""
         SELECT id, batch_id, doc_id, revision, base_name, cp_version,
-               status, submitter, reviewer, last_submitted_on,
-               last_reviewed_on, last_reviewer_note,
+               status, reviewer_status, submitter, reviewer, approver,
+               last_submitted_on, last_reviewed_on, last_approved_on,
+               last_reviewer_note, last_approver_note,
                source_path, cp_path,
                state
           FROM checkprint_items
@@ -1153,24 +1322,7 @@ def get_checkprint_items(
         (int(batch_id),),
     ).fetchall()
     con.close()
-    cols = [
-        "id",
-        "batch_id",
-        "doc_id",
-        "revision",
-        "base_name",
-        "cp_version",
-        "status",
-        "submitter",
-        "reviewer",
-        "last_submitted_on",
-        "last_reviewed_on",
-        "last_reviewer_note",
-        "source_path",
-        "cp_path",
-        "state",
-    ]
-    return [dict(zip(cols, r)) for r in rows]
+    return [dict(zip(_checkprint_item_cols(), r)) for r in rows]
 
 
 def get_checkprint_items_by_ids(db_path: Path, item_ids: List[int]) -> List[Dict[str, Any]]:
@@ -1182,8 +1334,9 @@ def get_checkprint_items_by_ids(db_path: Path, item_ids: List[int]) -> List[Dict
     rows = con.execute(
         f"""
         SELECT id, batch_id, doc_id, revision, base_name, cp_version,
-               status, submitter, reviewer, last_submitted_on,
-               last_reviewed_on, last_reviewer_note,
+               status, reviewer_status, submitter, reviewer, approver,
+               last_submitted_on, last_reviewed_on, last_approved_on,
+               last_reviewer_note, last_approver_note,
                source_path, cp_path,
                state
           FROM checkprint_items
@@ -1192,24 +1345,7 @@ def get_checkprint_items_by_ids(db_path: Path, item_ids: List[int]) -> List[Dict
         tuple(int(x) for x in item_ids),
     ).fetchall()
     con.close()
-    cols = [
-        "id",
-        "batch_id",
-        "doc_id",
-        "revision",
-        "base_name",
-        "cp_version",
-        "status",
-        "submitter",
-        "reviewer",
-        "last_submitted_on",
-        "last_reviewed_on",
-        "last_reviewer_note",
-        "source_path",
-        "cp_path",
-        "state",
-    ]
-    return [dict(zip(cols, r)) for r in rows]
+    return [dict(zip(_checkprint_item_cols(), r)) for r in rows]
 
 
 def insert_checkprint_items(
@@ -1227,7 +1363,6 @@ def insert_checkprint_items(
         con = _connect(db_path)
         cur = con.cursor()
 
-        # We need project_id so we can update register status.
         row = cur.execute(
             "SELECT project_id FROM checkprint_batches WHERE id=?",
             (int(batch_id),),
@@ -1243,11 +1378,12 @@ def insert_checkprint_items(
                 """
                 INSERT INTO checkprint_items(
                     batch_id, doc_id, revision, base_name, cp_version,
-                    status, submitter, reviewer, last_submitted_on,
-                    last_reviewed_on, last_reviewer_note,
+                    status, reviewer_status, submitter, reviewer, approver,
+                    last_submitted_on, last_reviewed_on, last_approved_on,
+                    last_reviewer_note, last_approver_note,
                     source_path, cp_path,
                     state
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     int(batch_id),
@@ -1256,11 +1392,15 @@ def insert_checkprint_items(
                     str(it["base_name"]),
                     int(it.get("cp_version") or 1),
                     str(it.get("status") or "pending"),
+                    str(it.get("reviewer_status") or "pending"),
                     str(it.get("submitter") or ""),
                     str(it.get("reviewer") or ""),
+                    str(it.get("approver") or ""),
                     str(it.get("last_submitted_on") or ""),
                     str(it.get("last_reviewed_on") or ""),
+                    str(it.get("last_approved_on") or ""),
                     str(it.get("last_reviewer_note") or ""),
+                    str(it.get("last_approver_note") or ""),
                     str(it["source_path"]),
                     str(it["cp_path"]),
                     str(it.get("state") or "active"),
@@ -1269,7 +1409,6 @@ def insert_checkprint_items(
             inserted.append(int(cur.lastrowid))
             inserted_doc_ids.append(did)
 
-        # --- Register status propagation: items added to CP => For Review ---
         if project_id is not None:
             for did in sorted(set(inserted_doc_ids)):
                 cur.execute(
@@ -1356,26 +1495,54 @@ def update_checkprint_item_status(
     status: Optional[str] = None,
     reviewer: Optional[str] = None,
     note: Optional[str] = None,
+    role: str = "reviewer",
+    actor: Optional[str] = None,
 ) -> None:
     """
-    Update status / reviewer / note for a single checkprint item
-    AND propagate register document status where required.
+    Update CheckPrint item state.
+
+    role='reviewer':
+        Updates reviewer_status/reviewer/comment only. Does NOT update the
+        register and does NOT create a submitter-visible outcome.
+
+    role='approver':
+        Updates status/approver/comment. This is the final decision visible
+        to the submitter and is the only path that propagates document status.
+
+    Backwards compatibility:
+        Existing callers that pass reviewer=... without role continue to update
+        the reviewer/interim state.
     """
     init_db(db_path)
+    role = (role or "reviewer").strip().lower()
+    if role not in {"reviewer", "approver"}:
+        raise ValueError("role must be 'reviewer' or 'approver'")
 
-    # capture for event logging
+    actor_name = actor if actor is not None else reviewer
+
     event_old_status: Optional[str] = None
-    event_doc_status: Optional[str] = None
+    event_new_status: Optional[str] = status
+    event_name = f"{role}_status_changed"
+
+    def _doc_status_from_final(final_status: Optional[str]) -> Optional[str]:
+        st = (final_status or "").lower()
+        if st == "pending":
+            return "For Review"
+        if st in {"rejected", "accepted_minor"}:
+            return "Reworks Required"
+        if st in {"accepted", "approved"}:
+            return "Complete"
+        return None
 
     def _do():
-        nonlocal event_old_status, event_doc_status
+        nonlocal event_old_status
 
         con = _connect(db_path)
         cur = con.cursor()
 
         row = cur.execute(
             """
-            SELECT ci.status, ci.doc_id, cb.project_id
+            SELECT ci.status, ci.reviewer_status, ci.doc_id, cb.project_id
               FROM checkprint_items ci
               JOIN checkprint_batches cb ON cb.id = ci.batch_id
              WHERE ci.id=?
@@ -1387,24 +1554,35 @@ def update_checkprint_item_status(
             con.close()
             return
 
-        old_status, doc_id, project_id = row
-        event_old_status = old_status
+        final_status, reviewer_status, doc_id, project_id = row
+        event_old_status = reviewer_status if role == "reviewer" else final_status
 
-        sets = []
+        sets: list[str] = []
         vals: list[Any] = []
 
-        if status is not None:
-            sets.append("status=?")
-            vals.append(status)
-            sets.append("last_reviewed_on=datetime('now')")
+        if role == "reviewer":
+            if status is not None:
+                sets.append("reviewer_status=?")
+                vals.append(status)
+                sets.append("last_reviewed_on=datetime('now')")
+            if actor_name is not None:
+                sets.append("reviewer=?")
+                vals.append(actor_name)
+            if note is not None:
+                sets.append("last_reviewer_note=?")
+                vals.append(note)
 
-        if reviewer is not None:
-            sets.append("reviewer=?")
-            vals.append(reviewer)
-
-        if note is not None:
-            sets.append("last_reviewer_note=?")
-            vals.append(note)
+        else:  # approver
+            if status is not None:
+                sets.append("status=?")
+                vals.append(status)
+                sets.append("last_approved_on=datetime('now')")
+            if actor_name is not None:
+                sets.append("approver=?")
+                vals.append(actor_name)
+            if note is not None:
+                sets.append("last_approver_note=?")
+                vals.append(note)
 
         if sets:
             cur.execute(
@@ -1416,45 +1594,38 @@ def update_checkprint_item_status(
                 (*vals, int(item_id)),
             )
 
-        # --- Register status propagation ---
-        if status == "accepted":
-            event_doc_status = "Complete"
-        elif status in {"accepted_minor", "rejected"}:
-            event_doc_status = "Reworks Required"
-        else:
-            event_doc_status = None
-
-        if event_doc_status:
-            cur.execute(
-                """
-                UPDATE documents
-                   SET status=?,
-                       updated_on=datetime('now')
-                 WHERE project_id=?
-                   AND doc_id=?
-                """,
-                (event_doc_status, int(project_id), doc_id),
-            )
+        if role == "approver" and status is not None:
+            doc_status = _doc_status_from_final(status)
+            if doc_status:
+                cur.execute(
+                    """
+                    UPDATE documents
+                       SET status=?,
+                           updated_on=datetime('now')
+                     WHERE project_id=?
+                       AND doc_id=?
+                    """,
+                    (doc_status, int(project_id), doc_id),
+                )
 
         con.commit()
         con.close()
 
-    # ONE retry wrapper — nothing inside _do calls it again
     _retry_write(_do)
 
-    # --- Event log (best-effort, outside transaction) ---
     try:
         append_checkprint_event(
             db_path,
             item_id=int(item_id),
-            actor=reviewer or "",
-            event="status_changed",
+            actor=actor_name or "",
+            event=event_name,
             from_status=event_old_status,
-            to_status=status,
+            to_status=event_new_status,
             note=note or "",
         )
     except Exception:
         pass
+
 
 def append_checkprint_event(
     db_path: Path,

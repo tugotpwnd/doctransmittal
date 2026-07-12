@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
-    QWidget,
+    QWidget, QInputDialog,
 )
 
 from ..core.settings import SettingsManager
@@ -28,7 +28,11 @@ from ..services.db import (
 )
 from ..services.checkprint_service import add_documents_to_checkprint, remove_documents_from_checkprint
 from ..services.snapshot_helpers import build_snapshot_items
-from ..services.autofind import suggest_mapping, find_docid_rev_matches
+from ..services.autofind import find_docid_rev_candidates
+from .file_match_dialogs import (
+    resolve_ambiguous_file_matches,
+    select_native_exact_matches,
+)
 
 
 class CheckPrintEditDialog(QDialog):
@@ -215,58 +219,91 @@ class CheckPrintEditDialog(QDialog):
         # ----------------------------------------------------------
         # Autofind (recursive, duplicate-aware)
         # ----------------------------------------------------------
-        guessed = suggest_mapping(doc_ids, [self.source_dir]) or {}
-        mapping: Dict[str, str] = {}
+        # Use exact DocID_Revision matching. This avoids silently selecting an
+        # arbitrary native/backup file when, for example, DOC_A.pdf, DOC_A.dwg
+        # and DOC_A.bak exist in the same source folder.
+        pairs = [(it["doc_id"], it.get("revision", "")) for it in items]
+        revisions = {it["doc_id"]: it.get("revision", "") for it in items}
 
-        ambiguous: Dict[str, List[str]] = {}
+        try:
+            candidates = find_docid_rev_candidates(pairs, [self.source_dir], extensions=None) or {}
+        except Exception:
+            candidates = {}
+
+        mapping: Dict[str, str] = {}
+        ambiguous: Dict[str, List[Path]] = {}
+        native_items: List[dict] = []
         missing: List[str] = []
 
         for it in items:
             did = it["doc_id"]
-            matches = guessed.get(did, [])
-
-            # Normalise to absolute paths
-            paths = [Path(p[0]).resolve() for p in matches]
+            rev = it.get("revision", "")
+            paths = sorted({Path(p).resolve() for p in (candidates.get(did) or [])}, key=lambda p: (p.suffix.lower(), p.name.lower(), str(p.parent).lower()))
 
             if not paths:
                 missing.append(did)
                 continue
 
-            # Detect duplicates (even if filenames identical)
-            unique = list({str(p) for p in paths})
-            if len(unique) > 1:
-                ambiguous[did] = unique
+            if len(paths) > 1:
+                ambiguous[did] = paths
                 continue
 
-            mapping[did] = unique[0]
+            pth = paths[0]
+            if pth.suffix.lower() == ".pdf":
+                mapping[did] = str(pth)
+            else:
+                native_items.append({"doc_id": did, "revision": rev, "path": pth})
 
         # ----------------------------------------------------------
-        # Handle ambiguous matches (hard stop)
+        # Confirm exact single-match native files
         # ----------------------------------------------------------
-        if ambiguous:
-            msg = "Multiple matching files found for the following documents:\n\n"
-            for did, paths in ambiguous.items():
-                msg += f"{did}:\n"
-                for p in paths:
-                    msg += f"  - {p}\n"
-                msg += "\n"
-
-            QMessageBox.critical(
-                self,
-                "Ambiguous matches",
-                msg + "Please resolve these manually (rename or remove duplicates) and try again.",
-            )
+        selected_native = select_native_exact_matches(
+            self,
+            native_items,
+            source_root=self.source_dir,
+            title="Native files found for CheckPrint",
+        )
+        if selected_native is None:
             return
 
+        for native in native_items:
+            did = native.get("doc_id")
+            if did in selected_native:
+                mapping[did] = str(Path(native.get("path")).resolve())
+            else:
+                missing.append(did)
+
         # ----------------------------------------------------------
-        # Prompt for missing files
+        # Resolve multiple exact matches
+        # ----------------------------------------------------------
+        if ambiguous:
+            resolved = resolve_ambiguous_file_matches(
+                self,
+                ambiguous,
+                revisions=revisions,
+                source_root=self.source_dir,
+                title="Resolve CheckPrint file matches",
+            )
+            if resolved is None:
+                return
+            for did, selected in resolved.items():
+                if selected:
+                    mapping[did] = str(Path(selected).resolve())
+                else:
+                    missing.append(did)
+
+        # De-duplicate missing list after native/ambiguous choices.
+        missing = [did for did in dict.fromkeys(missing) if did not in mapping]
+
+        # ----------------------------------------------------------
+        # Prompt for missing/manual files
         # ----------------------------------------------------------
         for did in missing:
             path, _ = QFileDialog.getOpenFileName(
                 self,
                 f"Select file for {did}",
                 str(self.source_dir),
-                "PDF Files (*.pdf);;All Files (*.*)",
+                "All Files (*.*);;PDF Files (*.pdf);;DWG Files (*.dwg);;Excel Files (*.xlsx *.xls)",
             )
             if not path:
                 QMessageBox.warning(self, "Cancelled", f"No file selected for {did}")

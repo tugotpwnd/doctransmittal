@@ -18,12 +18,23 @@ except Exception:
 # from ..services.db import list_transmittals
 
 # We still call your existing auto-match function if available
-def _try_find_matches(pairs, roots):
+def _try_find_candidates(pairs, roots):
     try:
-        from ..services.autofind import find_docid_rev_matches  # your existing helper
-        return find_docid_rev_matches(pairs, roots, extensions=None)
+        from ..services.autofind import find_docid_rev_candidates
+        return find_docid_rev_candidates(pairs, roots, extensions=None)
     except Exception:
-        return {}
+        # Fallback for older installs: behave like the original first-match helper.
+        try:
+            from ..services.autofind import find_docid_rev_matches
+            first = find_docid_rev_matches(pairs, roots, extensions=None) or {}
+            return {k: [v] for k, v in first.items() if v}
+        except Exception:
+            return {}
+
+try:
+    from .file_match_dialogs import select_native_exact_matches
+except Exception:
+    from doctransmittal_sub.ui.file_match_dialogs import select_native_exact_matches
 
 class TransmittalTab(QWidget):
     """
@@ -199,7 +210,9 @@ class TransmittalTab(QWidget):
         if not folder:
             QMessageBox.information(self, "Match", "Pick a Source Folder first.")
             return
+
         pairs = []
+        pair_rev = {}
         for r in (self.items or []):
             if isinstance(r, dict):
                 did = r.get("doc_id", "")
@@ -207,13 +220,61 @@ class TransmittalTab(QWidget):
             else:
                 did = getattr(r, "doc_id", "")
                 rev = getattr(r, "latest_rev_token", "") or getattr(r, "latest_rev", "") or getattr(r, "rev", "")
+            did = str(did or "").strip()
+            rev = str(rev or "").strip()
             if did and rev:
                 pairs.append((did, rev))
+                pair_rev[did] = rev
 
-        mapping = _try_find_matches(pairs, [Path(folder)])
-        # Update mapping
-        for d, p in (mapping or {}).items():
-            self.file_mapping[d] = str(p)
+        candidates = _try_find_candidates(pairs, [Path(folder)]) or {}
+
+        pdf_mapping = {}
+        native_items = []
+        duplicate_count = 0
+
+        for did, rev in pairs:
+            paths = sorted({Path(p).resolve() for p in (candidates.get(did) or [])}, key=lambda p: (p.suffix.lower(), p.name.lower(), str(p.parent).lower()))
+            if not paths:
+                continue
+            if len(paths) > 1:
+                # Leave duplicate exact matches unmapped. Files tab will flag them amber and allow manual drag/drop selection.
+                duplicate_count += 1
+                continue
+            pth = paths[0]
+            if pth.suffix.lower() == ".pdf":
+                pdf_mapping[did] = str(pth)
+            else:
+                native_items.append({"doc_id": did, "revision": rev, "path": pth})
+
+        selected_native = select_native_exact_matches(
+            self,
+            native_items,
+            source_root=Path(folder),
+            title="Native exact matches found",
+        )
+        if selected_native is None:
+            return
+
+        # Update mapping. Unticked native files and duplicates are deliberately left unmapped for Files tab manual mapping.
+        for d, pth in pdf_mapping.items():
+            self.file_mapping[d] = str(pth)
+        for item in native_items:
+            did = item.get("doc_id")
+            if did in selected_native:
+                self.file_mapping[did] = str(Path(item.get("path")))
+
+        skipped_native = max(0, len(native_items) - len(selected_native))
+        if duplicate_count or skipped_native:
+            QMessageBox.information(
+                self,
+                "Match results",
+                f"Exact PDF matches assigned: {len(pdf_mapping)}\n"
+                f"Native matches assigned: {len(selected_native)}\n"
+                f"Native matches left for manual mapping: {skipped_native}\n"
+                f"Duplicate exact matches left for manual mapping: {duplicate_count}\n\n"
+                "The Files tab will show duplicate exact matches in amber. "
+                "Drag the intended file onto the document row to map it manually.",
+            )
 
         # Advance
         self._emit_proceed()
