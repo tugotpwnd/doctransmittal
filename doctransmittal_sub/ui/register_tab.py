@@ -781,7 +781,12 @@ class RegisterTab(QWidget):
             from ..services.db import create_db_backup
         except Exception:
             create_db_backup = None
-        if create_db_backup:
+        try:
+            from ..services.edit_lock_service import is_read_only_context as _edit_lock_is_read_only_context
+        except Exception:
+            _edit_lock_is_read_only_context = lambda _p: False
+
+        if create_db_backup and not _edit_lock_is_read_only_context(p):
             try:
                 snap = create_db_backup(p, history_dir_name="DB History", keep=50)
                 if snap:

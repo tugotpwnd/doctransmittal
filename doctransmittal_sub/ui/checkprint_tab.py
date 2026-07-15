@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from datetime import datetime
 
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -949,12 +950,23 @@ class CheckPrintTab(QWidget):
         return st
 
     def _approver_differs_from_reviewer(self, it: dict) -> bool:
-        """Return True when an approver outcome conflicts with reviewer advice."""
+        """Return True only when an actioned approver outcome conflicts with reviewer advice."""
         final_status = (it.get("status") or "pending").lower()
         reviewer_status = (it.get("reviewer_status") or "pending").lower()
 
+        # Pending is not an approver decision. Do not flag a difference while the
+        # item is merely awaiting approver action.
+        if final_status == "pending":
+            return False
+
+        # Only final/actioned approver outcomes should be compared.
+        if final_status not in {"rejected", "accepted_minor", "accepted", "approved"}:
+            return False
+
+        # If the reviewer has moved their own item back to Pending, that is a
+        # valid reviewer state. Do not flag the old approver/final result as a
+        # reviewer/approver conflict until the reviewer gives a new recommendation.
         if reviewer_status == "pending":
-            # No reviewer recommendation was made, so there is nothing to conflict with.
             return False
 
         return self._status_compare_key(final_status) != self._status_compare_key(reviewer_status)
@@ -962,19 +974,30 @@ class CheckPrintTab(QWidget):
     def _approver_status_marker(self, it: dict, *, compare_to_reviewer: bool = False) -> str:
         """Return compact final approver action text for list rows."""
         st = (it.get("status") or "pending").lower()
-        reviewer_status = (it.get("reviewer_status") or "pending").lower()
-        if st == "pending" and not (compare_to_reviewer and reviewer_status != "pending"):
+
+        # Pending means the approver has not actioned the item yet. It should not
+        # show as an approver decision or as a reviewer/approver difference.
+        if st == "pending":
             return ""
 
         prefix = "⚑ " if compare_to_reviewer and self._approver_differs_from_reviewer(it) else ""
         return f"{prefix}A:{self._initials(it.get('approver'))} - {self._final_status_label(st)}"
 
     def _apply_approver_divergence_cue(self, row: QListWidgetItem, it: dict) -> None:
-        """Add a visual cue to reviewer rows where approver and reviewer diverge."""
+        """Cue reviewer rows where the actioned approver outcome differs."""
         if not self._approver_differs_from_reviewer(it):
             return
 
-        row.setBackground(QColor(235, 230, 255))
+        # Do not set a background colour here. The previous full-row highlight
+        # made text unreadable under some Windows/Qt themes. Keep only the inline
+        # flag marker and make the row bold.
+        try:
+            font = row.font()
+            font.setBold(True)
+            row.setFont(font)
+        except Exception:
+            pass
+
         row.setToolTip(
             "Approver decision differs from reviewer recommendation.\n"
             f"Reviewer: {self._status_label(it.get('reviewer_status'))}\n"
@@ -1037,8 +1060,17 @@ class CheckPrintTab(QWidget):
                 self.list_pending_sub.addItem(row)
 
     def _populate_reviewer_lists(self, items):
+        """Populate reviewer lists using reviewer_status only.
+
+        The approver/final status is intentionally display-only in the Reviewer
+        view. This keeps the roles mutually independent, so a document rejected
+        by the approver can still be moved back to the Reviewer's Pending list.
+        """
         for it in items:
             st = (it.get("reviewer_status") or "pending").lower()
+            if st not in {"pending", "rejected", "accepted_minor", "accepted"}:
+                st = "pending"
+
             row = self._make_item_row(
                 it,
                 status_key="reviewer_status",
@@ -1377,8 +1409,124 @@ class CheckPrintTab(QWidget):
             self.list_approved_app,
         )
 
+    def _debug_checkprint_log_path(self) -> Path | None:
+        try:
+            if getattr(self, "db_path", None):
+                return Path(self.db_path).parent / "checkprint_debug.log"
+        except Exception:
+            pass
+        return None
+
+    def _debug_checkprint_log(self, message: str) -> None:
+        """Print and persist CheckPrint move diagnostics for intermittent selection issues."""
+        try:
+            line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {message}"
+            print(line, flush=True)
+            log_path = self._debug_checkprint_log_path()
+            if log_path:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+        except Exception:
+            # Diagnostics must never interrupt CheckPrint actions.
+            pass
+
+    def _debug_role_selection_snapshot(self, role: str) -> list[dict]:
+        if role == "reviewer":
+            source_lists = [
+                ("reviewer.pending", self.list_pending_rev),
+                ("reviewer.rejected", self.list_rejected_rev),
+                ("reviewer.accepted_minor", self.list_accepted_minor_rev),
+                ("reviewer.accepted", self.list_accepted_rev),
+            ]
+        else:
+            source_lists = [
+                ("approver.pending", self.list_pending_app),
+                ("approver.rejected", self.list_rejected_app),
+                ("approver.approved_minor", self.list_accepted_minor_app),
+                ("approver.approved", self.list_approved_app),
+            ]
+
+        snapshot: list[dict] = []
+        for list_name, lw in source_lists:
+            try:
+                for item in lw.selectedItems():
+                    it = item.data(Qt.UserRole) or {}
+                    snapshot.append({
+                        "list": list_name,
+                        "item_id": it.get("id"),
+                        "doc_id": it.get("doc_id"),
+                        "revision": it.get("revision"),
+                        "final_status": it.get("status"),
+                        "reviewer_status": it.get("reviewer_status"),
+                        "cp_version": it.get("cp_version"),
+                    })
+            except Exception as exc:
+                snapshot.append({"list": list_name, "error": repr(exc)})
+        return snapshot
+
+    def _debug_checkprint_action_start(self, role: str, status: str, items: list[QListWidgetItem]) -> None:
+        snapshot = self._debug_role_selection_snapshot(role)
+        selected_ids = []
+        for item in items:
+            it = item.data(Qt.UserRole) or {}
+            selected_ids.append(it.get("id"))
+        self._debug_checkprint_log(
+            f"UI_ACTION_START role={role} requested_status={status!r} "
+            f"selected_count={len(items)} selected_ids={selected_ids} snapshot={snapshot}"
+        )
+
+    def _debug_checkprint_action_item(self, role: str, status: str, item: QListWidgetItem) -> None:
+        it = item.data(Qt.UserRole) or {}
+        self._debug_checkprint_log(
+            f"UI_ACTION_ITEM role={role} requested_status={status!r} "
+            f"item_id={it.get('id')} doc_id={it.get('doc_id')!r} rev={it.get('revision')!r} "
+            f"old_final={it.get('status')!r} old_reviewer={it.get('reviewer_status')!r} "
+            f"cp_version={it.get('cp_version')!r}"
+        )
+
+    def _debug_checkprint_post_reload(self, role: str, item_ids: list[int]) -> None:
+        """Log the post-reload DB state and the UI list each changed item should occupy."""
+        try:
+            if not item_ids or not self.db_path or not self.current_batch_id:
+                return
+            ids = {int(x) for x in item_ids if x is not None}
+            batch_items = get_checkprint_items(self.db_path, self.current_batch_id)
+            for it in batch_items:
+                try:
+                    item_id = int(it.get("id"))
+                except Exception:
+                    continue
+                if item_id not in ids:
+                    continue
+
+                final_status = (it.get("status") or "pending").lower()
+                reviewer_status = (it.get("reviewer_status") or "pending").lower()
+
+                if role == "reviewer":
+                    route = reviewer_status if reviewer_status in {"rejected", "accepted_minor", "accepted"} else "pending"
+                    route_list = f"reviewer.{route}"
+                else:
+                    if final_status == "rejected":
+                        route_list = "approver.rejected"
+                    elif final_status == "accepted_minor":
+                        route_list = "approver.approved_minor"
+                    elif final_status in {"accepted", "approved"}:
+                        route_list = "approver.approved"
+                    else:
+                        route_list = "approver.pending"
+
+                self._debug_checkprint_log(
+                    f"UI_ACTION_POST_RELOAD_ITEM role={role} item_id={item_id} "
+                    f"doc_id={it.get('doc_id')!r} final_status={final_status!r} "
+                    f"reviewer_status={reviewer_status!r} route_list={route_list!r}"
+                )
+        except Exception as exc:
+            self._debug_checkprint_log(f"UI_ACTION_POST_RELOAD_ERROR role={role} error={exc!r}")
+
     def _reviewer_action(self, status: str):
         items = self._reviewer_selected_items()
+        self._debug_checkprint_action_start("reviewer", status, items)
         if not items:
             QMessageBox.information(self, "Reviewer", "Select one or more documents.")
             return
@@ -1388,18 +1536,24 @@ class CheckPrintTab(QWidget):
         if status in {"accepted_minor", "rejected"} and self.chk_always_comment.isChecked():
             comment = self.le_reject_comment.text().strip() or "Review PDF"
 
+        changed_ids: list[int] = []
         for item in items:
-            it = item.data(Qt.UserRole)
+            self._debug_checkprint_action_item("reviewer", status, item)
+            it = item.data(Qt.UserRole) or {}
+            item_id = int(it["id"])
+            changed_ids.append(item_id)
             update_checkprint_item_status(
                 self.db_path,
-                item_id=it["id"],
+                item_id=item_id,
                 status=status,
                 actor=actor,
                 note=comment if comment else None,
                 role="reviewer",
             )
 
+        self._debug_checkprint_log(f"UI_ACTION_RELOAD role=reviewer requested_status={status!r}")
         self._load_items_for_reviewer()
+        self._debug_checkprint_post_reload("reviewer", changed_ids)
         self._load_items_for_approver()
 
     def _reviewer_accept(self):
@@ -1416,6 +1570,7 @@ class CheckPrintTab(QWidget):
 
     def _approver_action(self, status: str):
         items = self._approver_selected_items()
+        self._debug_checkprint_action_start("approver", status, items)
         if not items:
             QMessageBox.information(self, "Approver", "Select one or more documents.")
             return
@@ -1425,21 +1580,27 @@ class CheckPrintTab(QWidget):
         if status in {"accepted_minor", "rejected"} and self.chk_app_always_comment.isChecked():
             comment = self.le_app_comment.text().strip() or "Approval PDF"
 
+        changed_ids: list[int] = []
         for item in items:
-            it = item.data(Qt.UserRole)
+            self._debug_checkprint_action_item("approver", status, item)
+            it = item.data(Qt.UserRole) or {}
+            item_id = int(it["id"])
+            changed_ids.append(item_id)
             update_checkprint_item_status(
                 self.db_path,
-                item_id=it["id"],
+                item_id=item_id,
                 status=status,
                 actor=actor,
                 note=comment if comment else None,
                 role="approver",
             )
 
+        self._debug_checkprint_log(f"UI_ACTION_RELOAD role=approver requested_status={status!r}")
         self.registerNeedsRefresh.emit()
         self._load_items_for_submitter()
         self._load_items_for_reviewer()
         self._load_items_for_approver()
+        self._debug_checkprint_post_reload("approver", changed_ids)
 
     def _approver_reject(self):
         self._approver_action("rejected")

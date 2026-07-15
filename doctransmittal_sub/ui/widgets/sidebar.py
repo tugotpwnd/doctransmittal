@@ -9,7 +9,7 @@ from PyQt5.QtGui import QPainter, QPen, QColor, QFont, QPalette
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QLineEdit, QToolButton, QMenu,
     QAction, QHBoxLayout, QPushButton, QGroupBox, QListWidget, QListWidgetItem,
-    QComboBox, QFormLayout, QGridLayout, QSizePolicy
+    QComboBox, QFormLayout, QGridLayout, QSizePolicy, QCheckBox
 )
 
 # --- Small helper for collapsible sections -----------------------------------
@@ -148,7 +148,14 @@ class SidebarWidget(QWidget):
     templatesRequested = pyqtSignal()
     printProgressRequested = pyqtSignal()
     printRegisterRequested = pyqtSignal()
+    exportDrawingIndexRequested = pyqtSignal()
+    exportRegisterExcelRequested = pyqtSignal()
     migrateExcelRequested = pyqtSignal()
+    editLockRequestAccessRequested = pyqtSignal()
+    editLockReleaseAccessRequested = pyqtSignal()
+    editLockTakeoverRequested = pyqtSignal()
+    editLockForceTakeoverRequested = pyqtSignal()
+    editLockHistoryRequested = pyqtSignal()
 
 
     def __init__(self, parent=None):
@@ -158,6 +165,7 @@ class SidebarWidget(QWidget):
 
         self._db_path: Optional[Path] = None
         self._highlighted_docs: List[str] = []
+        self._progress_scope_doc_ids: set[str] = set()
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
@@ -348,6 +356,16 @@ class SidebarWidget(QWidget):
         self.btn_print_register.clicked.connect(self.printRegisterRequested.emit)
         vb_prog.addWidget(self.btn_print_register)
 
+        self.btn_export_drawing_index = QPushButton("Export Drawing Index...", gb_prog)
+        self.btn_export_drawing_index.setToolTip("Export Doc ID + Description for drawing/DWG rows")
+        self.btn_export_drawing_index.clicked.connect(self.exportDrawingIndexRequested.emit)
+        vb_prog.addWidget(self.btn_export_drawing_index)
+
+        self.btn_export_register_excel = QPushButton("Export Register Excel...", gb_prog)
+        self.btn_export_register_excel.setToolTip("Export the full register using template MI-DT-PJ-007")
+        self.btn_export_register_excel.clicked.connect(self.exportRegisterExcelRequested.emit)
+        vb_prog.addWidget(self.btn_export_register_excel)
+
         # Project box (kept expanded)
         gb_proj = QGroupBox("Project")
         vb_p = QVBoxLayout(gb_proj)
@@ -366,10 +384,64 @@ class SidebarWidget(QWidget):
 
         root.addWidget(gb_proj)
 
+        # Edit lock status / handover controls.
+        gb_lock = QGroupBox("Edit Lock")
+        vb_lock = QVBoxLayout(gb_lock)
+        self.lbl_lock_mode = QLabel("Mode: -")
+        self.lbl_lock_owner = QLabel("Owner: -")
+        self.lbl_lock_detail = QLabel("No project database open.")
+        self.lbl_lock_detail.setWordWrap(True)
+        vb_lock.addWidget(self.lbl_lock_mode)
+        vb_lock.addWidget(self.lbl_lock_owner)
+        vb_lock.addWidget(self.lbl_lock_detail)
+
+        self.btn_lock_request = QPushButton("Request Editing Access")
+        self.btn_lock_request.setObjectName("EditLockRequestButton")
+        self.btn_lock_request.clicked.connect(self.editLockRequestAccessRequested.emit)
+        vb_lock.addWidget(self.btn_lock_request)
+
+        self.btn_lock_takeover = QPushButton("Take Over Stale Lock")
+        self.btn_lock_takeover.setObjectName("EditLockTakeoverButton")
+        self.btn_lock_takeover.clicked.connect(self.editLockTakeoverRequested.emit)
+        vb_lock.addWidget(self.btn_lock_takeover)
+
+        self.chk_lock_force = QCheckBox("Enable force takeover")
+        self.chk_lock_force.setObjectName("EditLockForceSwitch")
+        self.chk_lock_force.setToolTip("Unlocks the force-takeover button for operational recovery only.")
+        self.chk_lock_force.toggled.connect(self._on_force_takeover_toggled)
+        vb_lock.addWidget(self.chk_lock_force)
+
+        self.btn_lock_force = QPushButton("FORCE TAKEOVER")
+        self.btn_lock_force.setObjectName("EditLockForceTakeoverButton")
+        self.btn_lock_force.setToolTip("Purge the current lock and assign edit access to this session. Use only when you are certain it is safe.")
+        self.btn_lock_force.setEnabled(False)
+        self.btn_lock_force.setStyleSheet("font-weight:700; color:#B91C1C;")
+        self.btn_lock_force.clicked.connect(self.editLockForceTakeoverRequested.emit)
+        vb_lock.addWidget(self.btn_lock_force)
+
+        self.btn_lock_release = QPushButton("Release Editing Access")
+        self.btn_lock_release.setObjectName("EditLockReleaseButton")
+        self.btn_lock_release.clicked.connect(self.editLockReleaseAccessRequested.emit)
+        vb_lock.addWidget(self.btn_lock_release)
+
+        self.btn_lock_history = QPushButton("Lock History...")
+        self.btn_lock_history.setObjectName("EditLockHistoryButton")
+        self.btn_lock_history.clicked.connect(self.editLockHistoryRequested.emit)
+        vb_lock.addWidget(self.btn_lock_history)
+
+        root.addWidget(gb_lock)
+
         self.lst_presets.itemDoubleClicked.connect(lambda _: self._on_load_clicked())
         self.set_loaded_preset_hint("")
 
     # --- setters / helpers ---
+
+    def _on_force_takeover_toggled(self, checked: bool):
+        try:
+            can_force = bool(getattr(self, "_can_force_takeover", False))
+            self.btn_lock_force.setEnabled(bool(checked and can_force))
+        except Exception:
+            pass
 
     def set_project_info(self, job_no: str, project_name: str):
         self.lbl_job.setText(f"Job No: {job_no or '—'}")
@@ -378,6 +450,17 @@ class SidebarWidget(QWidget):
     def set_selected_count(self, n: int):
         self._selected_count = max(0, int(n))
         self.lbl_selected.setText(f"{self._selected_count} selected")
+
+    def set_progress_scope_doc_ids(self, doc_ids):
+        """Set the live progress chart scope from ticked register document IDs."""
+        try:
+            new_scope = {str(d).strip().upper() for d in (doc_ids or []) if str(d).strip()}
+        except Exception:
+            new_scope = set()
+        if new_scope == getattr(self, "_progress_scope_doc_ids", set()):
+            return
+        self._progress_scope_doc_ids = new_scope
+        self.refresh_progress()
 
     def set_preset_names(self, names):
         self.lst_presets.clear()
@@ -429,6 +512,7 @@ class SidebarWidget(QWidget):
     # called by MainWindow when a DB is opened
     def set_db_path(self, db_path: Path):
         self._db_path = Path(db_path) if db_path else None
+        self._progress_scope_doc_ids = set()
         self._refresh_doc_history()
         self.refresh_progress()
 
@@ -494,9 +578,98 @@ class SidebarWidget(QWidget):
         except Exception as e:
             self.lbl_history.setText(f"History error: {e}")
 
+
+    def set_edit_lock_status(self, status: dict):
+        status = status or {}
+        mode = status.get("mode") or "none"
+        owner = status.get("owner") or "-"
+        machine = status.get("machine") or ""
+        detail = status.get("detail") or ""
+        request_sent = bool(status.get("request_sent"))
+        locked = bool(status.get("locked"))
+        can_force = bool(status.get("can_force_takeover"))
+
+        try:
+            if mode == "edit":
+                self.lbl_lock_mode.setText("Mode: EDIT")
+                self.lbl_lock_mode.setStyleSheet("font-weight:700; color:#22C55E;")
+            elif mode == "read_only":
+                self.lbl_lock_mode.setText("Mode: READ ONLY")
+                self.lbl_lock_mode.setStyleSheet("font-weight:700; color:#F59E0B;")
+            else:
+                self.lbl_lock_mode.setText("Mode: -")
+                self.lbl_lock_mode.setStyleSheet("")
+            suffix = f" on {machine}" if machine else ""
+            self.lbl_lock_owner.setText(f"Owner: {owner}{suffix}")
+            self.lbl_lock_detail.setText(detail or "-")
+
+            self.btn_lock_request.setVisible(bool(status.get("can_request")))
+            self.btn_lock_release.setVisible(bool(status.get("can_release")))
+            self.btn_lock_takeover.setVisible(bool(status.get("can_takeover")))
+            self.chk_lock_force.setVisible(can_force)
+            self.btn_lock_force.setVisible(can_force)
+            self.chk_lock_force.setEnabled(can_force)
+            self._can_force_takeover = can_force
+            if not can_force:
+                self.chk_lock_force.setChecked(False)
+                self.btn_lock_force.setEnabled(False)
+            else:
+                self.btn_lock_force.setEnabled(bool(self.chk_lock_force.isChecked()))
+            self.btn_lock_history.setVisible(True)
+            if request_sent:
+                self.btn_lock_request.setText("Access Requested")
+                self.btn_lock_request.setEnabled(False)
+            elif mode == "read_only" and not locked:
+                self.btn_lock_request.setText("Acquire Editing")
+                self.btn_lock_request.setEnabled(True)
+            else:
+                self.btn_lock_request.setText("Request Editing Access")
+                self.btn_lock_request.setEnabled(bool(status.get("can_request")))
+        except Exception:
+            pass
+
+    def set_read_only_mode(self, read_only: bool):
+        danger = (
+            "save", "overwrite", "delete", "rename", "apply", "revision", "import",
+            "migrate", "project settings", "templates", "new", "edit", "purge",
+        )
+        safe = (
+            "select", "clear", "show", "load", "unload", "print", "history",
+            "request editing", "release editing", "take over", "force takeover", "acquire editing",
+        )
+        for btn in self.findChildren((QPushButton, QToolButton)):
+            try:
+                text = (btn.text() or "").replace("&", "").lower()
+                if (btn.objectName() or "").startswith("EditLock"):
+                    continue
+                if any(s in text for s in safe):
+                    continue
+                if any(d in text for d in danger):
+                    btn.setEnabled(not read_only)
+            except Exception:
+                pass
+        for action in self.findChildren(QAction):
+            try:
+                text = (action.text() or "").replace("&", "").lower()
+                if any(s in text for s in safe):
+                    continue
+                if any(d in text for d in danger):
+                    action.setEnabled(not read_only)
+            except Exception:
+                pass
+        for cb_name in ("cb_apply_type", "cb_apply_file", "cb_apply_status"):
+            try:
+                getattr(self, cb_name).setEnabled(not read_only)
+            except Exception:
+                pass
+
     # === NEW: progress (status breakdown) ====================================
     def refresh_progress(self):
-        """Recompute and redraw the pie + legend for active documents."""
+        """Recompute and redraw the pie + legend for active documents.
+
+        If register rows are ticked, the live progress chart is scoped to those
+        ticked documents. If nothing is ticked, it shows all active documents.
+        """
         if not self._db_path:
             self.pie.set_data([])
             self._set_legend([])
@@ -510,14 +683,28 @@ class SidebarWidget(QWidget):
             proj = get_project(self._db_path)
             if not proj:
                 self.pie.set_data([]); self._set_legend([]); self.lbl_prog.setText("—"); return
-            rows = list_documents_with_latest(self._db_path, proj["id"], state="active") or []
+            all_rows = list_documents_with_latest(self._db_path, proj["id"], state="active") or []
         except Exception:
-            rows = []
+            all_rows = []
+
+        scope_ids = getattr(self, "_progress_scope_doc_ids", set()) or set()
+        if scope_ids:
+            rows = [
+                r for r in all_rows
+                if str(r.get("doc_id", "")).strip().upper() in scope_ids
+            ]
+            scoped = True
+        else:
+            rows = all_rows
+            scoped = False
 
         counts = Counter((r.get("status") or "—").strip() for r in rows)
         items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
         total = sum(c for _, c in items)
-        self.lbl_prog.setText(f"{total} active documents")
+        if scoped:
+            self.lbl_prog.setText(f"{total} selected documents ({len(all_rows)} active total)")
+        else:
+            self.lbl_prog.setText(f"{total} active documents")
         self.pie.set_data(items)
         self._set_legend(items)
 

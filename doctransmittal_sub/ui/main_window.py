@@ -8,7 +8,7 @@ from typing import List
 import pandas as pd
 from PyQt5.QtWidgets import QMainWindow, QTabWidget, QAction, QMessageBox, QInputDialog, QDockWidget, QSizePolicy, \
     QApplication, QActionGroup, QFileDialog, QDialog
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from doctransmittal_sub.core.settings import SettingsManager
 from doctransmittal_sub.core.excepthook import install_excepthook
 from .register_tab import RegisterTab
@@ -50,6 +50,36 @@ def _res(*parts):
     else:
         base = Path(__file__).resolve().parent.parent / "resources"
     return str((base.joinpath(*parts)).resolve())
+
+
+# todo: fix to be specific path
+def _app_icon_path():
+    """
+    Returns the preferred application icon path.
+
+    Priority:
+      1. resources/app.ico   - user/project override
+      2. resources/logo.ico  - bundled default Windows icon
+      3. resources/logo.png  - bundled default image icon
+    """
+    for name in ("logo_small.ico", "logo.ico", "logo.png"):
+        try:
+            p = Path(_res(name))
+            if p.exists():
+                return str(p)
+        except Exception:
+            pass
+    return ""
+
+
+def _close_pyinstaller_splash():
+    """Close PyInstaller's splash screen once the Qt window is visible."""
+    try:
+        import pyi_splash  # type: ignore
+        pyi_splash.close()
+    except Exception:
+        # Not running from a PyInstaller build with Splash enabled, or already closed.
+        pass
 
 
 
@@ -639,6 +669,14 @@ class MainWindow(QMainWindow):
         self.sidebar.clearSelectionRequested.connect(self.register_tab.clear_selection_in_view)
         self.sidebar.clearAllRequested.connect(self.register_tab.clear_selection_all)
         self.register_tab.selectionCountChanged.connect(self.sidebar.set_selected_count)
+        # >>> progress_scope_live_patch
+        try:
+            self.register_tab.selectionCountChanged.connect(
+                lambda _n: self.sidebar.set_progress_scope_doc_ids(self._checked_register_doc_ids())
+            )
+        except Exception:
+            pass
+        # <<< progress_scope_live_patch
 
         # Preset wires
         self.register_tab.presetsReady.connect(self.sidebar.set_preset_names)
@@ -666,6 +704,12 @@ class MainWindow(QMainWindow):
         self.sidebar.printProgressRequested.connect(self._print_progress_report)
         # Register report
         self.sidebar.printRegisterRequested.connect(self._on_print_register)
+        # Excel exports
+        try:
+            self.sidebar.exportDrawingIndexRequested.connect(self._on_export_drawing_index_excel)
+            self.sidebar.exportRegisterExcelRequested.connect(self._on_export_register_excel)
+        except Exception:
+            pass
         # Migrate Excel
         self.sidebar.migrateExcelRequested.connect(self._on_migrate_excel_clicked)
 
@@ -674,6 +718,14 @@ class MainWindow(QMainWindow):
         # Sidebar → Project Settings
         self.sidebar.projectSettingsRequested.connect(self._open_project_settings)
         self.sidebar.templatesRequested.connect(self._open_templates_viewer)
+
+        # Edit lock controller: owns read-only mode, heartbeat and handover UI.
+        try:
+            from .edit_lock_controller import EditLockController
+            self.edit_lock_controller = EditLockController(self)
+        except Exception as e:
+            self.edit_lock_controller = None
+            print(f"[EditLock] controller failed to initialise: {e}", flush=True)
 
         # Auto-refresh progress donut when the register table changes
         try:
@@ -684,7 +736,9 @@ class MainWindow(QMainWindow):
 
         # Window icon + theme
         try:
-            self.setWindowIcon(QIcon(_res("logo.png")))
+            icon_path = _app_icon_path()
+            if icon_path:
+                self.setWindowIcon(QIcon(icon_path))
         except Exception:
             pass
 
@@ -910,7 +964,28 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    # add this method on MainWindow
+    # >>> progress_excel_exports_patch
+    def _reports_dir_for_db(self, db_path: Path) -> Path:
+        base = Path(db_path).parent
+        if base.name.startswith("."):
+            base = base.parent
+        out_dir = base / "Reports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir
+
+    def _checked_register_doc_ids(self) -> set[str]:
+        try:
+            items = self.register_tab._ticked_items()
+        except Exception:
+            items = []
+        out: set[str] = set()
+        for item in items or []:
+            did = getattr(item, "doc_id", "") or ""
+            did = str(did).strip()
+            if did:
+                out.add(did.upper())
+        return out
+
     def _print_progress_report(self):
         try:
             db_s, root_s = self.register_tab.current_paths()
@@ -926,10 +1001,17 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Progress Report", "Project metadata not found in this DB.")
             return
 
-        # Fetch documents (active) for chart + table
-        docs = list_documents_with_latest(dbp, proj["id"], state="active")
+        all_docs = list_documents_with_latest(dbp, proj["id"], state="active") or []
+        checked_ids = self._checked_register_doc_ids()
+        if checked_ids:
+            docs = [r for r in all_docs if str(r.get("doc_id", "")).strip().upper() in checked_ids]
+            scope_note = f"Scope: selected register documents only ({len(docs)} of {len(all_docs)} active documents)."
+            table_title = "Selected Documents"
+        else:
+            docs = all_docs
+            scope_note = "Scope: all active register documents."
+            table_title = "All Documents"
 
-        # Header/meta for PDF (client logos are auto-discovered same as receipts)
         header = {
             "header_title": "PROGRESS TRACKER",
             "project_code": proj.get("project_code", ""),
@@ -939,16 +1021,17 @@ class MainWindow(QMainWindow):
             "created_by": self.settings.get("user.name", ""),
             "created_on": datetime.now().strftime("%Y-%m-%d"),
             "register_path": str(dbp),
-            "db_path": str(dbp),  # for logo discovery
-            "report_code": Path(dbp).stem,  # <-- THIS is the key line
+            "db_path": str(dbp),
+            "report_code": Path(dbp).stem,
+            "scope_note": scope_note,
+            "document_table_title": table_title,
         }
 
-        # Save next to the DB in a clear folder
-        out_dir = dbp.parent / "Reports"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir = self._reports_dir_for_db(dbp)
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
         job = proj.get("project_code") or "PROJECT"
-        out_pdf = out_dir / f"{job}_Progress_{stamp}.pdf"
+        suffix = "_Selected" if checked_ids else ""
+        out_pdf = out_dir / f"{job}_Progress{suffix}_{stamp}.pdf"
 
         try:
             export_progress_report_pdf(
@@ -968,6 +1051,64 @@ class MainWindow(QMainWindow):
             webbrowser.open_new(str(out_pdf))
         except Exception:
             pass
+
+    def _on_export_drawing_index_excel(self):
+        db_path = getattr(self.register_tab, "db_path", None)
+        project_id = getattr(self.register_tab, "project_id", None)
+        if not (db_path and project_id):
+            QMessageBox.information(self, "Export Excel", "Open a project database first.")
+            return
+
+        dbp = Path(db_path)
+        default_dir = self._reports_dir_for_db(dbp)
+        default_path = default_dir / f"{dbp.stem}_Drawing_Index_Data_Link.xlsx"
+        out_s, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Drawing Set Index Data Link",
+            str(default_path),
+            "Excel Workbook (*.xlsx)",
+        )
+        if not out_s:
+            return
+        if not out_s.lower().endswith(".xlsx"):
+            out_s += ".xlsx"
+
+        try:
+            from ..services.excel_exports import export_drawing_index_data_link_xlsx
+            out_path = export_drawing_index_data_link_xlsx(dbp, int(project_id), Path(out_s))
+        except Exception as e:
+            QMessageBox.warning(self, "Export Excel", f"Failed to export drawing index data link:\n{e}")
+            return
+
+        QMessageBox.information(self, "Export Excel", f"Saved:\n{out_path}")
+        try:
+            import webbrowser
+            webbrowser.open_new(str(out_path))
+        except Exception:
+            pass
+
+    def _on_export_register_excel(self):
+        db_path = getattr(self.register_tab, "db_path", None)
+        project_id = getattr(self.register_tab, "project_id", None)
+        if not (db_path and project_id):
+            QMessageBox.information(self, "Export Excel", "Open a project database first.")
+            return
+
+        dbp = Path(db_path)
+        try:
+            from ..services.excel_exports import export_native_register_xlsx
+            out_path = export_native_register_xlsx(dbp, int(project_id))
+        except Exception as e:
+            QMessageBox.warning(self, "Export Excel", f"Failed to export native register Excel:\n{e}")
+            return
+
+        QMessageBox.information(self, "Export Excel", f"Saved:\n{out_path}")
+        try:
+            import webbrowser
+            webbrowser.open_new(str(out_path))
+        except Exception:
+            pass
+    # <<< progress_excel_exports_patch
 
     def _open_appearance_dialog(self):
         # Lazy import to avoid circulars if any
@@ -1073,6 +1214,13 @@ class MainWindow(QMainWindow):
                 self._brand_project.setText(f"{job_no or '—'} — {project_name or '—'}")
             except Exception:
                 pass
+
+            try:
+                ctrl = getattr(self, "edit_lock_controller", None)
+                if ctrl is not None:
+                    ctrl.activate_for_db(db_path)
+            except Exception as e:
+                print(f"[EditLock] activation failed: {e}", flush=True)
 
 
     def _set_user_name(self):
@@ -1298,9 +1446,25 @@ class MainWindow(QMainWindow):
                 f"Updated {trans_number} and rebuilt.\n\n{trans_dir_path}"
             )
 
+
+    def _release_edit_lock_before_db_switch(self):
+        try:
+            ctrl = getattr(self, "edit_lock_controller", None)
+            if ctrl is not None:
+                ctrl.release_current(silent=True, reason="switch_database")
+        except Exception:
+            pass
+
     def _apply_db_path(self, path: Path):
         if not path:
             return
+        self._release_edit_lock_before_db_switch()
+        try:
+            ctrl = getattr(self, "edit_lock_controller", None)
+            if ctrl is not None:
+                ctrl.activate_for_db(path)
+        except Exception as e:
+            print(f"[EditLock] pre-load activation failed: {e}", flush=True)
         self.le_db_global.setText(str(path))
         self.register_tab.load_db_from_path(str(path))
 
@@ -1367,6 +1531,19 @@ class MainWindow(QMainWindow):
         # Now load the DB we just created
         self._apply_db_path(p)
 
+
+    def closeEvent(self, event):
+        try:
+            ctrl = getattr(self, "edit_lock_controller", None)
+            if ctrl is not None:
+                ctrl.close()
+        except Exception:
+            pass
+        try:
+            super().closeEvent(event)
+        except Exception:
+            event.accept()
+
 # ======== APPLICATION ENTRY POINT FOR PYINSTALLER ========
 
 def main_window_entry():
@@ -1380,6 +1557,12 @@ def main_window_entry():
 
     # Create Qt application
     app = QApplication(sys.argv)
+    try:
+        icon_path = _app_icon_path()
+        if icon_path:
+            app.setWindowIcon(QIcon(icon_path))
+    except Exception:
+        pass
 
     # Settings manager
     settings = SettingsManager()
@@ -1388,5 +1571,13 @@ def main_window_entry():
     win = MainWindow(settings)
     win.show()
 
+    # Let Qt process the first paint event before closing the PyInstaller splash.
+    try:
+        app.processEvents()
+    except Exception:
+        pass
+    _close_pyinstaller_splash()
+
     # Start event loop
     sys.exit(app.exec_())
+

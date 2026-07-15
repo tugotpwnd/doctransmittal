@@ -1,20 +1,121 @@
 # services/db.py  — MERGED file (keeps your existing API + adds transmittal snapshots & edit/soft-delete)
 from __future__ import annotations
 import json
+import datetime
 import sqlite3, time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
 # -------------------------------- connection --------------------------------
 
+
+# -------------------------- edit-lock write guard --------------------------
+try:
+    from .edit_lock_service import (
+        ReadOnlyLockError,
+        LockConflictError,
+        bypass_write_guard as _edit_lock_bypass_write_guard,
+        ensure_lock_schema as _ensure_edit_lock_schema,
+        is_mutating_sql as _edit_lock_is_mutating_sql,
+        is_read_only_context as _edit_lock_is_read_only_context,
+        record_db_write as _edit_lock_record_db_write,
+        require_write_access as _edit_lock_require_write_access,
+    )
+except Exception:  # pragma: no cover - keeps legacy command-line scripts alive if import fails
+    class ReadOnlyLockError(RuntimeError):
+        pass
+    class LockConflictError(RuntimeError):
+        pass
+    def _edit_lock_bypass_write_guard():
+        from contextlib import nullcontext
+        return nullcontext()
+    def _ensure_edit_lock_schema(db_path):
+        return None
+    def _edit_lock_is_mutating_sql(sql):
+        return False
+    def _edit_lock_is_read_only_context(db_path):
+        return False
+    def _edit_lock_record_db_write(db_path):
+        return None
+    def _edit_lock_require_write_access(db_path, operation="database write"):
+        return None
+
+
+class _GuardedCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=()):
+        if _edit_lock_is_mutating_sql(sql):
+            _edit_lock_require_write_access(getattr(self.connection, "_guard_db_path", ""), "database write")
+            try:
+                self.connection._guard_mutated = True
+            except Exception:
+                pass
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters):
+        if _edit_lock_is_mutating_sql(sql):
+            _edit_lock_require_write_access(getattr(self.connection, "_guard_db_path", ""), "database write")
+            try:
+                self.connection._guard_mutated = True
+            except Exception:
+                pass
+        return super().executemany(sql, seq_of_parameters)
+
+
+class _GuardedConnection(sqlite3.Connection):
+    def cursor(self, *args, **kwargs):
+        kwargs.setdefault("factory", _GuardedCursor)
+        return super().cursor(*args, **kwargs)
+
+    def execute(self, sql, parameters=()):
+        if _edit_lock_is_mutating_sql(sql):
+            _edit_lock_require_write_access(getattr(self, "_guard_db_path", ""), "database write")
+            self._guard_mutated = True
+        return super().execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters):
+        if _edit_lock_is_mutating_sql(sql):
+            _edit_lock_require_write_access(getattr(self, "_guard_db_path", ""), "database write")
+            self._guard_mutated = True
+        return super().executemany(sql, seq_of_parameters)
+
+    def executescript(self, sql_script):
+        if _edit_lock_is_mutating_sql(sql_script):
+            _edit_lock_require_write_access(getattr(self, "_guard_db_path", ""), "database write")
+            self._guard_mutated = True
+        return super().executescript(sql_script)
+
+    def commit(self):
+        result = super().commit()
+        if getattr(self, "_guard_mutated", False):
+            try:
+                _edit_lock_record_db_write(getattr(self, "_guard_db_path", ""))
+            except Exception:
+                pass
+            self._guard_mutated = False
+        return result
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path = Path(db_path)
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(db_path), timeout=30.0)
+    con = sqlite3.connect(str(db_path), timeout=30.0, factory=_GuardedConnection)
+    try:
+        con._guard_db_path = db_path.resolve()
+        con._guard_mutated = False
+    except Exception:
+        pass
     con.execute("PRAGMA foreign_keys = ON;")
-    con.execute("PRAGMA journal_mode = WAL;")
-    con.execute("PRAGMA synchronous = NORMAL;")
     con.execute("PRAGMA busy_timeout = 5000;")
+    if _edit_lock_is_read_only_context(db_path):
+        # Prevent accidental writes on read-only connections. This also avoids
+        # re-applying WAL mode during read-only viewing.
+        try:
+            con.execute("PRAGMA query_only = ON;")
+        except Exception:
+            pass
+    else:
+        con.execute("PRAGMA journal_mode = WAL;")
+        con.execute("PRAGMA synchronous = NORMAL;")
     return con
 
 def _retry_write(fn, retries: int = 5, base_delay: float = 0.15):
@@ -170,6 +271,12 @@ DDL = [
 ]
 
 def init_db(db_path: Path) -> None:
+    try:
+        _ensure_edit_lock_schema(db_path)
+    except Exception:
+        pass
+    if _edit_lock_is_read_only_context(db_path):
+        return
     con = _connect(db_path); cur = con.cursor()
     for ddl in DDL:
         cur.execute(ddl)
@@ -226,6 +333,10 @@ def init_db(db_path: Path) -> None:
            SET reviewer_status = status
          WHERE COALESCE(reviewer_status, 'pending') = 'pending'
            AND status IN ('accepted', 'accepted_minor', 'rejected')
+           -- Legacy migration guard: do not copy approver/final status back into reviewer_status.
+           -- If approver is populated, status is already the final approver state and must remain
+           -- independent from the reviewer/interim state.
+           AND COALESCE(approver, '') = ''
            AND batch_id IN (
                 SELECT id FROM checkprint_batches
                  WHERE status NOT IN ('completed', 'cancelled')
@@ -920,6 +1031,7 @@ def list_areas(db_path: str, project_id: int):
     return rows
 
 def upsert_area(db_path: str, project_id: int, code: str, description: str):
+    _edit_lock_require_write_access(db_path, "update project areas")
     code = (code or "").strip().upper()
     description = (description or "").strip()
     if not code: return
@@ -932,6 +1044,7 @@ def upsert_area(db_path: str, project_id: int, code: str, description: str):
     con.commit(); con.close()
 
 def delete_area(db_path: str, project_id: int, code: str):
+    _edit_lock_require_write_access(db_path, "delete project area")
     con = sqlite3.connect(db_path); cur = con.cursor()
     cur.execute("DELETE FROM project_areas WHERE project_id=? AND code=?;", (project_id, code))
     con.commit(); con.close()
@@ -1109,6 +1222,7 @@ def create_db_backup(db_path: Path, *, history_dir_name: str = "DB History", kee
 
 
 def rename_document_id(db_path: Path, project_id: int, old_id: str, new_id: str) -> bool:
+    _edit_lock_require_write_access(db_path, "rename document")
     """
     Rename a document's ID within a project.
     - Case-insensitive uniqueness enforced: (project_id, doc_id COLLATE NOCASE) must be unique.
@@ -1488,6 +1602,20 @@ def get_latest_checkprint_versions(
     return {str(r[0]): int(r[1]) for r in rows}
 
 
+
+def _checkprint_debug_write(db_path: Path, message: str) -> None:
+    """Best-effort CheckPrint diagnostics. Never blocks register operation."""
+    try:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        line = f"[{ts}] {message}"
+        print(line, flush=True)
+        log_path = Path(db_path).parent / "checkprint_debug.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
 def update_checkprint_item_status(
     db_path: Path,
     item_id: int,
@@ -1557,6 +1685,13 @@ def update_checkprint_item_status(
         final_status, reviewer_status, doc_id, project_id = row
         event_old_status = reviewer_status if role == "reviewer" else final_status
 
+        _checkprint_debug_write(
+            db_path,
+            f"DB_UPDATE_REQUEST role={role} item_id={int(item_id)} doc_id={doc_id!r} "
+            f"actor={actor_name!r} requested_status={status!r} "
+            f"old_final={final_status!r} old_reviewer={reviewer_status!r}",
+        )
+
         sets: list[str] = []
         vals: list[Any] = []
 
@@ -1608,8 +1743,20 @@ def update_checkprint_item_status(
                     (doc_status, int(project_id), doc_id),
                 )
 
+        new_row = cur.execute(
+            "SELECT status, reviewer_status, reviewer, approver FROM checkprint_items WHERE id=?",
+            (int(item_id),),
+        ).fetchone()
         con.commit()
         con.close()
+
+        if new_row:
+            _checkprint_debug_write(
+                db_path,
+                f"DB_UPDATE_COMMIT role={role} item_id={int(item_id)} doc_id={doc_id!r} "
+                f"requested_status={status!r} new_final={new_row[0]!r} "
+                f"new_reviewer={new_row[1]!r} reviewer={new_row[2]!r} approver={new_row[3]!r}",
+            )
 
     _retry_write(_do)
 

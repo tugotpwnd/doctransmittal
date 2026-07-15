@@ -86,6 +86,78 @@ def _to_dt(s: str) -> datetime:
     return datetime.min
 
 
+
+# >>> progress_excel_exports_patch
+_PROGRESS_PIE_PALETTE = [
+    "#4F7DFF", "#22C55E", "#F59E0B", "#E11D48", "#14B8A6",
+    "#A78BFA", "#F97316", "#06B6D4", "#84CC16", "#EC4899",
+]
+
+
+def _pdf_escape_text(value: Any) -> str:
+    s = _safe_str(value)
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+    )
+
+
+def _progress_colour(label: str):
+    import hashlib
+    idx = int(hashlib.md5((label or "-").encode("utf-8", "ignore")).hexdigest(), 16) % len(_PROGRESS_PIE_PALETTE)
+    return colors.HexColor(_PROGRESS_PIE_PALETTE[idx])
+
+
+def _progress_pie_drawing(counts: Dict[str, int], available_width: float):
+    from reportlab.graphics.charts.piecharts import Pie
+    from reportlab.graphics.shapes import Drawing, Rect, String
+
+    items = [(str(k or "-"), int(v or 0)) for k, v in (counts or {}).items() if int(v or 0) > 0]
+    items.sort(key=lambda kv: (-kv[1], kv[0]))
+
+    height = 58 * mm
+    drawing = Drawing(available_width, height)
+
+    total = sum(v for _, v in items)
+    if total <= 0:
+        drawing.add(String(0, height / 2, "No documents", fontName=FONT_B, fontSize=10, fillColor=COL_MUTED))
+        return drawing
+
+    pie_size = 45 * mm
+    pie = Pie()
+    pie.x = 0
+    pie.y = 6 * mm
+    pie.width = pie_size
+    pie.height = pie_size
+    pie.data = [v for _, v in items]
+    pie.labels = [f"{round((v / total) * 100)}%" for _, v in items]
+    pie.startAngle = 90
+    pie.sideLabels = False
+    pie.simpleLabels = True
+    pie.slices.strokeColor = colors.white
+    pie.slices.strokeWidth = 0.7
+    for i, (label, _count) in enumerate(items):
+        pie.slices[i].fillColor = _progress_colour(label)
+    drawing.add(pie)
+
+    legend_x = 55 * mm
+    legend_y = height - 10 * mm
+    line_h = 8.5 * mm
+    max_left = 5
+    col_gap = 70 * mm
+    for idx, (label, count) in enumerate(items[:10]):
+        col = 0 if idx < max_left else 1
+        row = idx if idx < max_left else idx - max_left
+        x = legend_x + col * col_gap
+        y = legend_y - row * line_h
+        pct = round((count / total) * 100)
+        drawing.add(Rect(x, y - 3.2 * mm, 4.3 * mm, 4.3 * mm, fillColor=_progress_colour(label), strokeColor=None))
+        drawing.add(String(x + 6 * mm, y - 2.2 * mm, f"{label} - {count} ({pct}%)", fontName=FONT, fontSize=7.5, fillColor=colors.black))
+
+    return drawing
+# <<< progress_excel_exports_patch
+
 def _footer_left_text(header: Dict[str, Any]) -> str:
     # If you want this configurable later, put it in settings and pass in header.
     return _safe_str(header.get("footer_left")) or "Maxwell Industries Pty Ltd • ABN 95 654 787 210"
@@ -417,6 +489,11 @@ def export_progress_report_pdf(
     flow.append(title_row)
     flow.append(Spacer(1, 8))
 
+    scope_note = _safe_str(header.get("scope_note"))
+    if scope_note:
+        flow.append(Paragraph(_pdf_escape_text(scope_note), BODY_SMALL))
+        flow.append(Spacer(1, 4))
+
     # ------------------------------------------------------------------
     # Summary table (Status / Count / %)
     # ------------------------------------------------------------------
@@ -432,6 +509,9 @@ def export_progress_report_pdf(
 
     flow.append(Paragraph("<b>Overall Progress</b>", BODY))
     flow.append(Spacer(1, 4))
+
+    flow.append(_progress_pie_drawing(counts, doc.width))
+    flow.append(Spacer(1, 6))
 
     flow.append(
         table_with_headers_and_widths(
@@ -450,7 +530,8 @@ def export_progress_report_pdf(
     # ------------------------------------------------------------------
     # Full document table
     # ------------------------------------------------------------------
-    flow.append(Paragraph("<b>All Documents</b>", BODY))
+    document_table_title = _safe_str(header.get("document_table_title")) or "All Documents"
+    flow.append(Paragraph(f"<b>{_pdf_escape_text(document_table_title)}</b>", BODY))
     flow.append(Spacer(1, 2))
 
     rows: List[List[Any]] = []
