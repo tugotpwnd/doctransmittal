@@ -229,6 +229,14 @@ class CheckPrintTab(QWidget):
         self._wire_list_common(self.list_pending_sub, editable=False, for_reviewer=False)
         g_pend_layout.addWidget(self.list_pending_sub, 1)
 
+        self.btn_autocad_resubmit_sub = QPushButton("Resubmit Open CAD + Selected")
+        self.btn_autocad_resubmit_sub.setToolTip(
+            "Plots the currently active AutoCAD layout to the selected CheckPrint document filename, "
+            "then immediately resubmits that one selected document."
+        )
+        self.btn_autocad_resubmit_sub.clicked.connect(self._resubmit_open_cad_selected)
+        g_pend_layout.addWidget(self.btn_autocad_resubmit_sub)
+
         self.btn_resubmit_pending_sub = QPushButton("Resubmit All Incoming")
         self.btn_resubmit_pending_sub.clicked.connect(self._resubmit_all_incoming)
         g_pend_layout.addWidget(self.btn_resubmit_pending_sub)
@@ -1282,6 +1290,159 @@ class CheckPrintTab(QWidget):
         self._open_comment_dialog(item, editable=False, for_reviewer=False, for_approver=False)
 
     # ------------------------------------------------------------------ Submitter resubmission
+
+    def _submitter_selected_items(self):
+        return self._selected_from_lists(
+            self.list_pending_sub,
+            self.list_rejected_sub,
+            self.list_accepted_minor_sub,
+            self.list_accepted_sub,
+        )
+
+    def _resubmit_open_cad_selected(self):
+        """Plot the active AutoCAD layout and immediately resubmit one selected item."""
+        if not getattr(self, "db_path", None) or not self.current_batch_id:
+            QMessageBox.information(self, "CheckPrint", "No active CheckPrint batch selected.")
+            return
+
+        batch = get_checkprint_batch(self.db_path, self.current_batch_id)
+        if not batch or batch.get("status") not in {"in_progress", "submitted", "awaiting_review"}:
+            QMessageBox.information(
+                self,
+                "CheckPrint",
+                "This CheckPrint batch is not editable in its current state.",
+            )
+            return
+
+        selected = self._submitter_selected_items()
+        if len(selected) != 1:
+            QMessageBox.information(
+                self,
+                "AutoCAD Resubmit",
+                "Select exactly one CheckPrint document in the Submitter view.\n\n"
+                "The currently active AutoCAD drawing/layout will be plotted against that selected document.",
+            )
+            return
+
+        it = selected[0].data(Qt.UserRole) or {}
+        item_id = int(it.get("id") or 0)
+        doc_id = str(it.get("doc_id") or "").strip()
+        revision = str(it.get("revision") or "").strip()
+        if not item_id or not doc_id:
+            QMessageBox.warning(self, "AutoCAD Resubmit", "Selected item is missing its CheckPrint document data.")
+            return
+
+        try:
+            try:
+                from ..services.autocad_plot_service import checkprint_incoming_dir, plot_active_layout_to_pdf, active_autocad_summary
+            except ImportError:
+                from services.autocad_plot_service import checkprint_incoming_dir, plot_active_layout_to_pdf, active_autocad_summary  # type: ignore
+        except Exception as e:
+            QMessageBox.critical(self, "AutoCAD Resubmit", f"AutoCAD plotting service could not be loaded:\n{e}")
+            return
+
+        incoming_dir = checkprint_incoming_dir(Path(self.db_path))
+        output_name = f"{doc_id}_{revision}.pdf" if revision else f"{doc_id}.pdf"
+        output_pdf = incoming_dir / output_name
+
+        if output_pdf.exists():
+            ans = QMessageBox.question(
+                self,
+                "Overwrite Incoming PDF?",
+                f"The incoming PDF already exists:\n\n{output_pdf}\n\nOverwrite it and continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+            try:
+                output_pdf.unlink()
+            except Exception as e:
+                QMessageBox.critical(self, "AutoCAD Resubmit", f"Could not remove existing incoming PDF:\n{e}")
+                return
+
+        try:
+            summary = active_autocad_summary()
+        except Exception as e:
+            QMessageBox.critical(self, "AutoCAD Resubmit", str(e))
+            return
+
+        actor = SettingsManager().get("user.name", "") or ""
+        old_final = str(it.get("status") or "pending").strip().lower() or "pending"
+        old_reviewer = str(it.get("reviewer_status") or "pending").strip().lower() or "pending"
+        mode = "increment" if old_final != "pending" or old_reviewer != "pending" else "overwrite"
+
+        self._debug_checkprint_log(
+            "AUTOCAD_QUICK_RESUBMIT_START "
+            f"item_id={item_id} doc_id={doc_id!r} revision={revision!r} mode={mode!r} "
+            f"acad_doc={summary.get('document_name')!r} layout={summary.get('layout_name')!r} "
+            f"output={str(output_pdf)!r}"
+        )
+
+        try:
+            from PyQt5.QtWidgets import QApplication
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                plot_result = plot_active_layout_to_pdf(output_pdf, timeout_seconds=120)
+            finally:
+                QApplication.restoreOverrideCursor()
+        except Exception as e:
+            QMessageBox.critical(self, "AutoCAD Resubmit", f"AutoCAD plot failed:\n\n{e}")
+            return
+
+        try:
+            if mode == "overwrite":
+                overwrite_checkprint_items(
+                    self.db_path,
+                    batch_id=int(self.current_batch_id),
+                    item_id_to_new_path={item_id: output_pdf},
+                    submitter=actor,
+                )
+            else:
+                resubmit_checkprint_items(
+                    self.db_path,
+                    batch_id=int(self.current_batch_id),
+                    item_id_to_new_path={item_id: output_pdf},
+                    submitter=actor,
+                )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "AutoCAD Resubmit",
+                "The PDF was plotted, but CheckPrint resubmission failed.\n\n"
+                f"The plotted PDF has been left here:\n{output_pdf}\n\n"
+                f"Error:\n{e}",
+            )
+            return
+
+        try:
+            if output_pdf.exists():
+                output_pdf.unlink()
+        except Exception:
+            pass
+
+        self._debug_checkprint_log(
+            "AUTOCAD_QUICK_RESUBMIT_DONE "
+            f"item_id={item_id} doc_id={doc_id!r} revision={revision!r} mode={mode!r} "
+            f"acad_doc={plot_result.get('document_name')!r} layout={plot_result.get('layout_name')!r}"
+        )
+
+        QMessageBox.information(
+            self,
+            "AutoCAD Resubmit",
+            "Active AutoCAD layout plotted and selected CheckPrint document resubmitted.\n\n"
+            f"Document: {doc_id}\n"
+            f"Revision: {revision or '-'}\n"
+            f"AutoCAD drawing: {plot_result.get('document_name') or summary.get('document_name') or '-'}\n"
+            f"Layout: {plot_result.get('layout_name') or summary.get('layout_name') or '-'}\n"
+            f"Mode: {'New CP iteration' if mode == 'increment' else 'Overwrite pending CP'}",
+        )
+
+        self.registerNeedsRefresh.emit()
+        self._load_items_for_submitter()
+        self._load_items_for_reviewer()
+        self._load_items_for_approver()
+
     def _resubmit_all_incoming(self):
         if not getattr(self, "db_path", None) or not self.current_batch_id:
             QMessageBox.information(self, "CheckPrint", "No active CheckPrint batch selected.")
