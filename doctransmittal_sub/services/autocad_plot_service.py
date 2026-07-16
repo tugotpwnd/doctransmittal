@@ -80,9 +80,13 @@ def plot_active_layout_to_pdf(
     drawing/layout active.
 
     The AutoCAD command expects an existing LISP command named PLOTCURRENTLAYOUT
-    that accepts:
-        1. output PDF path
-        2. CTB/STB plot style table
+    matching the user's AutoLISP definition:
+        1. CTB/STB plot style table
+        2. output PDF path
+
+    The previous patch sent these arguments in the opposite order, which caused
+    AutoCAD to use the PDF path as the plot style table and the CTB as the PDF
+    filename.
     """
     output_pdf = Path(output_pdf)
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
@@ -128,7 +132,7 @@ def plot_active_layout_to_pdf(
     out_arg = str(output_pdf).replace("\\", "/")
     ps_arg = str(plot_style or "")
 
-    command = f'PLOTCURRENTLAYOUT\n"{out_arg}"\n"{ps_arg}"\n'
+    command = f'PLOTCURRENTLAYOUT\n"{ps_arg}"\n"{out_arg}"\n'
 
     try:
         doc.SendCommand(command)
