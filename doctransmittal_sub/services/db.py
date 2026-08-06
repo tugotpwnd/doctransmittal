@@ -271,12 +271,12 @@ DDL = [
 ]
 
 def init_db(db_path: Path) -> None:
+    if _edit_lock_is_read_only_context(db_path):
+        return
     try:
         _ensure_edit_lock_schema(db_path)
     except Exception:
         pass
-    if _edit_lock_is_read_only_context(db_path):
-        return
     con = _connect(db_path); cur = con.cursor()
     for ddl in DDL:
         cur.execute(ddl)

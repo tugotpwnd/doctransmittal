@@ -14,9 +14,13 @@ from typing import Any, Dict, Iterator, List, Optional
 
 HEARTBEAT_SECONDS = 15
 STALE_TIMEOUT_SECONDS = 15 * 60
-LOCK_SCHEMA_VERSION = 3
+LOCK_SCHEMA_VERSION = 4
 LOCK_FOLDER_NAME = "DB-Lock"
 REQUEST_STALE_DAYS = 7
+# Live edit-lock ownership and handover are JSON-only.
+# This deliberately prevents read-only/requesting sessions from writing to the shared SQLite DB.
+USE_DATABASE_LOCK_TABLE = False
+
 
 
 class ReadOnlyLockError(RuntimeError):
@@ -91,6 +95,20 @@ def request_file_path(db_path: Path | str, requester_token: str) -> Path:
 def request_file_glob(db_path: Path | str) -> str:
     p = Path(db_path).expanduser().resolve()
     return f"{p.stem}.request.*.json"
+
+def event_file_glob(db_path: Path | str) -> str:
+    p = Path(db_path).expanduser().resolve()
+    return f"{p.stem}.events.*.jsonl"
+
+
+def _safe_token(value: str) -> str:
+    return "".join(ch for ch in (value or "") if ch.isalnum() or ch in "-_") or "session"
+
+
+def event_log_file_path(db_path: Path | str, actor_token: str = "") -> Path:
+    p = Path(db_path).expanduser().resolve()
+    safe = _safe_token(actor_token or f"{socket.gethostname()}-{os.getpid()}")
+    return lock_dir_path(p) / f"{p.stem}.events.{safe}.jsonl"
 
 
 def initials_for(name: str) -> str:
@@ -264,6 +282,8 @@ def ensure_lock_schema(db_path: Path | str) -> None:
     p = Path(db_path).expanduser().resolve()
     p.parent.mkdir(parents=True, exist_ok=True)
     lock_dir_path(p).mkdir(parents=True, exist_ok=True)
+    if not USE_DATABASE_LOCK_TABLE:
+        return
     with sqlite3.connect(str(p), timeout=10.0) as con:
         con.execute("PRAGMA busy_timeout = 5000;")
         con.execute(
@@ -377,10 +397,23 @@ def _purge_lock_artifacts(db_path: Path | str, include_requests: bool = False) -
             pass
 
 def _read_db_lock(db_path: Path | str) -> Dict[str, Any]:
+    """Compatibility hook.
+
+    Earlier lock patches mirrored live lock ownership into the SQLite database.
+    That caused SharePoint conflicts because read-only/requesting sessions could
+    touch the DB while the editor heartbeated. Live lock state is now JSON-only.
+    """
+    if not USE_DATABASE_LOCK_TABLE:
+        return {}
     try:
-        ensure_lock_schema(db_path)
+        # Do not create/migrate lock tables from a status read. This must remain read-only.
         with sqlite3.connect(str(Path(db_path).expanduser().resolve()), timeout=10.0) as con:
             con.row_factory = sqlite3.Row
+            exists = con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='edit_lock'"
+            ).fetchone()
+            if not exists:
+                return {}
             row = con.execute("SELECT * FROM edit_lock WHERE id=1").fetchone()
             if not row:
                 return {}
@@ -392,6 +425,8 @@ def _read_db_lock(db_path: Path | str) -> Dict[str, Any]:
 
 
 def _write_db_lock(db_path: Path | str, record: Dict[str, Any]) -> None:
+    if not USE_DATABASE_LOCK_TABLE:
+        return
     ensure_lock_schema(db_path)
     with sqlite3.connect(str(Path(db_path).expanduser().resolve()), timeout=10.0) as con:
         con.execute("PRAGMA busy_timeout = 5000;")
@@ -457,8 +492,9 @@ def _read_request_file(path: Path) -> Dict[str, Any]:
 
 
 def list_handover_requests(db_path: Path | str, include_completed: bool = False) -> List[Dict[str, Any]]:
-    ensure_lock_schema(db_path)
     folder = lock_dir_path(db_path)
+    if not folder.exists():
+        return []
     requests: List[Dict[str, Any]] = []
     cutoff = utc_now() - _dt.timedelta(days=REQUEST_STALE_DAYS)
     for path in folder.glob(request_file_glob(db_path)):
@@ -514,7 +550,7 @@ def get_handover_request_status(db_path: Path | str, requester_token: str) -> Di
 
 
 def get_lock_status(db_path: Path | str) -> Dict[str, Any]:
-    ensure_lock_schema(db_path)
+    # Must remain read-only: requesters poll this without touching SQLite.
     now = utc_now()
     records = []
     for raw in (_read_json_lock(db_path), _read_db_lock(db_path)):
@@ -599,17 +635,24 @@ def _make_owner_record(owner_name: str, owner_token: Optional[str] = None) -> Di
 
 
 def log_lock_event(db_path: Path | str, event: str, actor_name: str = "", actor_token: str = "", details: str = "") -> None:
+    """Record lock diagnostics without writing to the shared SQLite database.
+
+    Each session writes to its own JSONL event file so SharePoint is not asked to
+    reconcile two PCs writing the same file.
+    """
     try:
-        ensure_lock_schema(db_path)
-        with sqlite3.connect(str(Path(db_path).expanduser().resolve()), timeout=10.0) as con:
-            con.execute(
-                """
-                INSERT INTO edit_lock_events(happened_utc, actor_name, actor_token, machine_name, event, details)
-                VALUES(?,?,?,?,?,?)
-                """,
-                (utc_iso(), actor_name or "", actor_token or "", socket.gethostname() or "", event or "", details or ""),
-            )
-            con.commit()
+        path = event_log_file_path(db_path, actor_token or "")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rec = {
+            "happened_utc": utc_iso(),
+            "actor_name": actor_name or "",
+            "actor_token": actor_token or "",
+            "machine_name": socket.gethostname() or "",
+            "event": event or "",
+            "details": details or "",
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
     except Exception:
         pass
 
@@ -794,6 +837,8 @@ def record_db_write(db_path: Path | str, writer_name: str = "", writer_token: st
     try:
         ctx = get_lock_context(db_path)
         writer_token = writer_token or ctx.get("owner_token") or ""
+        if not writer_token or ctx.get("read_only"):
+            return
         status = get_lock_status(db_path) if writer_token else {}
         writer_name = writer_name or status.get("owner_name") or ""
         with sqlite3.connect(str(Path(db_path).expanduser().resolve()), timeout=10.0) as con:
@@ -842,16 +887,34 @@ def require_write_access(db_path: Path | str, operation: str = "database write")
 
 
 def get_lock_events(db_path: Path | str, limit: int = 80) -> List[Dict[str, Any]]:
-    ensure_lock_schema(db_path)
-    with sqlite3.connect(str(Path(db_path).expanduser().resolve()), timeout=10.0) as con:
-        con.row_factory = sqlite3.Row
-        rows = con.execute(
-            """
-            SELECT happened_utc, actor_name, machine_name, event, details
-            FROM edit_lock_events
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (int(limit or 80),),
-        ).fetchall()
-    return [dict(r) for r in rows]
+    """Return lock diagnostics from per-session JSONL event files.
+
+    This deliberately avoids the SQLite database so read-only users can view
+    lock history without generating a SharePoint database write.
+    """
+    folder = lock_dir_path(db_path)
+    rows: List[Dict[str, Any]] = []
+    if folder.exists():
+        for path in folder.glob(event_file_glob(db_path)):
+            try:
+                for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    if isinstance(rec, dict):
+                        rows.append(rec)
+            except Exception:
+                continue
+        # Include request files as diagnostic entries.
+        for req in list_handover_requests(db_path, include_completed=True):
+            rows.append({
+                "happened_utc": req.get("requested_utc") or req.get("created_utc") or "",
+                "actor_name": req.get("requester_name") or req.get("requested_by_name") or "",
+                "machine_name": req.get("requester_machine") or req.get("requested_by_machine") or "",
+                "event": f"request_{req.get('state') or 'requested'}",
+                "details": req.get("message") or req.get("response_message") or "",
+            })
+    rows.sort(key=lambda r: parse_utc(r.get("happened_utc")) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc), reverse=True)
+    return rows[: int(limit or 80)]
+
