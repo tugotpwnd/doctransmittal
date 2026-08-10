@@ -16,6 +16,8 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 
+from ..core.settings import SettingsManager
+
 # --- Autofind helpers ---
 try:
     from ..services.autofind import suggest_mapping, find_docid_rev_matches, find_docid_rev_candidates  # type: ignore
@@ -145,8 +147,6 @@ class _MapHighlightDelegate(QStyledItemDelegate):
     def __init__(self, files_tab: 'FilesTab', parent=None):
         super().__init__(parent)
         self._tab = files_tab
-        self._green = QColor(46, 160, 67)
-        self._amber = QColor(210, 130, 10)
 
     def paint(self, painter, option, index):
         try:
@@ -162,14 +162,14 @@ class _MapHighlightDelegate(QStyledItemDelegate):
                         opt = QStyleOptionViewItem(option)
                         opt.palette.setColor(
                             QPalette.Text,
-                            getattr(self._tab, "_green_manual", QColor(38, 185, 110)),
+                            self._tab._green_manual,
                         )
                         return super().paint(painter, opt, index)
 
                     # Duplicate (amber)
                     if name in self._tab._cache_dup_names:
                         opt = QStyleOptionViewItem(option)
-                        opt.palette.setColor(QPalette.Text, self._amber)
+                        opt.palette.setColor(QPalette.Text, self._tab._amber)
                         return super().paint(painter, opt, index)
 
                     # Auto-mapped
@@ -177,7 +177,7 @@ class _MapHighlightDelegate(QStyledItemDelegate):
                         opt = QStyleOptionViewItem(option)
                         opt.palette.setColor(
                             QPalette.Text,
-                            getattr(self._tab, "_green_auto", QColor(46, 160, 67)),
+                            self._tab._green_auto,
                         )
                         return super().paint(painter, opt, index)
         except Exception:
@@ -220,9 +220,8 @@ class FilesTab(QWidget):
         self._cache_used_paths: set[str] = set()
         self._cache_manual_paths: set[str] = set()
         self._cache_dup_names: set[str] = set()
-        # --- NEW: greens ---
-        self._green_auto = QColor(46, 160, 67)  # existing
-        self._green_manual = QColor(38, 185, 110)  # slightly different shade
+
+        self._refresh_color_cache()
 
         # ===== UI =====
         root = QVBoxLayout(self)
@@ -572,22 +571,34 @@ class FilesTab(QWidget):
             it = QListWidgetItem(self._display_path(p))
             if p:
                 if self._is_manual_mapped_path(p):
-                    it.setForeground(QBrush(getattr(self, "_green_manual", QColor(38, 185, 110))))
+                    it.setForeground(QBrush(self._green_manual))
                 elif self._is_duplicate_basename(p):
-                    it.setForeground(QBrush(QColor(210, 130, 10)))  # amber
+                    it.setForeground(QBrush(self._amber))
                 else:
-                    it.setForeground(QBrush(getattr(self, "_green_auto", QColor(46, 160, 67))))
+                    it.setForeground(QBrush(self._green_auto))
             else:
-                it.setForeground(QBrush(QColor(200, 60, 60)))  # red
+                it.setForeground(QBrush(self._red))
             self.list_map.addItem(it)
         # Keep doc list in sync
         self._apply_colors()
 
+    def _refresh_color_cache(self):
+        sm = SettingsManager()
+        c = sm.get("ui.colors.matching", {})
+        self._green_auto = QColor(c.get("match", "#2EA043"))
+        self._green_manual = QColor(c.get("manual", "#26B96E"))
+        self._amber = QColor(c.get("duplicate", "#D2820A"))
+        self._red = QColor(c.get("not_found", "#C83C3C"))
+
+    def refresh_ui_colors(self):
+        self._refresh_color_cache()
+        self._refresh_map_list()
+
     def _apply_colors(self):
-        green_auto = QBrush(getattr(self, "_green_auto", QColor(46, 160, 67)))
-        green_manual = QBrush(getattr(self, "_green_manual", QColor(38, 185, 110)))
-        red = QBrush(QColor(200, 60, 60))
-        amber = QBrush(QColor(210, 130, 10))
+        green_auto = QBrush(self._green_auto)
+        green_manual = QBrush(self._green_manual)
+        red = QBrush(self._red)
+        amber = QBrush(self._amber)
 
         for i, d in enumerate(self.doc_ids):
             mapped_path = self.mapping.get(d)

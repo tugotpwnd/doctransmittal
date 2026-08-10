@@ -19,6 +19,7 @@ from ..models.document import DocumentRow
 from .widgets.sidebar import SidebarWidget
 from .project_settings_dialog import ProjectSettingsDialog
 from .templates_dialog import TemplatesDialog
+from .color_settings_dialog import ColorSettingsDialog
 from ..services.db import list_transmittals
 from PyQt5.QtGui import QIcon, QPixmap, QFont
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel, QHBoxLayout
@@ -659,6 +660,10 @@ class MainWindow(QMainWindow):
         act_appearance.triggered.connect(self._open_appearance_dialog)
         m_view.addAction(act_appearance)
 
+        act_colors = QAction("Colours…", self)
+        act_colors.triggered.connect(self._open_colors_dialog)
+        m_view.addAction(act_colors)
+
         # Listen for project info from the Register tab
         self.register_tab.projectInfoReady.connect(self._on_project_info_ready)
 
@@ -1119,6 +1124,15 @@ class MainWindow(QMainWindow):
         if dlg.exec_() == dlg.Accepted:
             theme, delta = dlg.values()
             self._apply_appearance_values(theme, delta)
+
+    def _open_colors_dialog(self):
+        d = ColorSettingsDialog(self.settings, self)
+        if d.exec_():
+            # Refresh all tabs that use colors
+            if hasattr(self, "checkprint_tab"):
+                self.checkprint_tab.refresh_ui_colors()
+            if hasattr(self, "files_tab"):
+                self.files_tab.refresh_ui_colors()
 
     def _apply_appearance_values(self, theme: str, delta: int):
         # Persist and re-skin; this is also used by the dialog's Apply button

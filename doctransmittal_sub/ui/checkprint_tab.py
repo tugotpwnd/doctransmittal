@@ -137,6 +137,10 @@ class CheckPrintTab(QWidget):
         self._batch_rows = []
         self._active_role: str | None = None  # "submitter" | "reviewer" | "approver" | None
 
+        # Color caching
+        self._colors: dict[str, QColor] = {}
+        self._refresh_color_cache()
+
         self.setObjectName("CheckPrintTab")
         self._build_ui()
     # ------------------------------------------------------------------ UI
@@ -690,6 +694,30 @@ class CheckPrintTab(QWidget):
         elif role == "approver":
             self.btn_as_approver.setStyleSheet(style)
 
+    def _refresh_color_cache(self):
+        sm = SettingsManager()
+        c = sm.get("ui.colors.checkprint", {})
+        self._colors = {
+            "pending": QColor(c.get("pending", "#D2820A")),
+            "rejected": QColor(c.get("rejected", "#C83C3C")),
+            "accepted_minor": QColor(c.get("accepted_minor", "#B48C14")),
+            "accepted": QColor(c.get("accepted", "#26B96E")),
+            "approved": QColor(c.get("approved", "#199650")),
+        }
+
+    def refresh_ui_colors(self):
+        self._refresh_color_cache()
+        if self._active_role == "submitter":
+            self._load_items_for_submitter()
+        elif self._active_role == "reviewer":
+            self._load_items_for_reviewer()
+        elif self._active_role == "approver":
+            self._load_items_for_approver()
+        
+        # Also reload history if visible
+        if self.box_history.isVisible():
+            self._load_history_view()
+
     # ------------------------------------------------------------------ History mode
 
     def _load_history_view(self):
@@ -716,11 +744,11 @@ class CheckPrintTab(QWidget):
             row.setData(Qt.UserRole, it)
 
             if st == "accepted_minor":
-                row.setForeground(QColor(180, 140, 20))
+                row.setForeground(self._colors["accepted_minor"])
             elif st == "approved":
-                row.setForeground(QColor(25, 150, 80))
+                row.setForeground(self._colors["approved"])
             else:
-                row.setForeground(QColor(38, 185, 110))
+                row.setForeground(self._colors["accepted"])
 
             self.list_history.addItem(row)
 
@@ -1055,16 +1083,16 @@ class CheckPrintTab(QWidget):
             st = (it.get("status") or "pending").lower()
             row = self._make_item_row(it, status_key="status", show_approver=(st != "pending"))
             if st == "rejected":
-                row.setForeground(Qt.red)
+                row.setForeground(self._colors["rejected"])
                 self.list_rejected_sub.addItem(row)
             elif st == "accepted_minor":
-                row.setForeground(QColor(180, 140, 20))
+                row.setForeground(self._colors["accepted_minor"])
                 self.list_accepted_minor_sub.addItem(row)
             elif st in {"accepted", "approved"}:
-                row.setForeground(QColor(38, 185, 110))
+                row.setForeground(self._colors["accepted"])
                 self.list_accepted_sub.addItem(row)
             else:
-                row.setForeground(QColor(210, 130, 10))
+                row.setForeground(self._colors["pending"])
                 self.list_pending_sub.addItem(row)
 
     def _populate_reviewer_lists(self, items):
@@ -1089,16 +1117,16 @@ class CheckPrintTab(QWidget):
             self._apply_approver_divergence_cue(row, it)
 
             if st == "rejected":
-                row.setForeground(Qt.red)
+                row.setForeground(self._colors["rejected"])
                 self.list_rejected_rev.addItem(row)
             elif st == "accepted_minor":
-                row.setForeground(QColor(180, 140, 20))
+                row.setForeground(self._colors["accepted_minor"])
                 self.list_accepted_minor_rev.addItem(row)
             elif st == "accepted":
-                row.setForeground(QColor(38, 185, 110))
+                row.setForeground(self._colors["accepted"])
                 self.list_accepted_rev.addItem(row)
             else:
-                row.setForeground(QColor(210, 130, 10))
+                row.setForeground(self._colors["pending"])
                 self.list_pending_rev.addItem(row)
 
     def _populate_approver_lists(self, items):
@@ -1114,24 +1142,24 @@ class CheckPrintTab(QWidget):
             )
 
             if st == "rejected":
-                row.setForeground(Qt.red)
+                row.setForeground(self._colors["rejected"])
                 self.list_rejected_app.addItem(row)
             elif st == "accepted_minor":
-                row.setForeground(QColor(180, 140, 20))
+                row.setForeground(self._colors["accepted_minor"])
                 self.list_accepted_minor_app.addItem(row)
             elif st in {"accepted", "approved"}:
                 # Legacy `accepted` items from earlier testing are shown under Approved
                 # because the Approver role no longer has a separate Accept outcome.
-                row.setForeground(QColor(25, 150, 80))
+                row.setForeground(self._colors["approved"])
                 self.list_approved_app.addItem(row)
             else:
                 # Pending approver items are colour-coded by reviewer recommendation.
                 if rv == "rejected":
-                    row.setForeground(Qt.red)
+                    row.setForeground(self._colors["rejected"])
                 elif rv == "accepted_minor":
-                    row.setForeground(QColor(180, 140, 20))
+                    row.setForeground(self._colors["accepted_minor"])
                 elif rv == "accepted":
-                    row.setForeground(QColor(38, 185, 110))
+                    row.setForeground(self._colors["accepted"])
                 else:
                     # No reviewer action yet: leave neutral / uncoloured.
                     pass

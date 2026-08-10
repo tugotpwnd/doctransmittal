@@ -20,6 +20,22 @@ class SettingsManager:
             "tables": {
                 # Register tab column widths (by logical column index)
                 "register": {"widths": {}}
+            },
+            # NEW: custom colors
+            "colors": {
+                "checkprint": {
+                    "pending": "#D2820A",
+                    "rejected": "#C83C3C",
+                    "accepted_minor": "#B48C14",
+                    "accepted": "#26B96E",
+                    "approved": "#199650"
+                },
+                "matching": {
+                    "match": "#2EA043",
+                    "manual": "#26B96E",
+                    "duplicate": "#D2820A",
+                    "not_found": "#C83C3C"
+                }
             }
         },
 
