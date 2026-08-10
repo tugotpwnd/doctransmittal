@@ -1685,12 +1685,12 @@ def update_checkprint_item_status(
         final_status, reviewer_status, doc_id, project_id = row
         event_old_status = reviewer_status if role == "reviewer" else final_status
 
-        _checkprint_debug_write(
-            db_path,
-            f"DB_UPDATE_REQUEST role={role} item_id={int(item_id)} doc_id={doc_id!r} "
-            f"actor={actor_name!r} requested_status={status!r} "
-            f"old_final={final_status!r} old_reviewer={reviewer_status!r}",
-        )
+        # _checkprint_debug_write(
+        #     db_path,
+        #     f"DB_UPDATE_REQUEST role={role} item_id={int(item_id)} doc_id={doc_id!r} "
+        #     f"actor={actor_name!r} requested_status={status!r} "
+        #     f"old_final={final_status!r} old_reviewer={reviewer_status!r}",
+        # )
 
         sets: list[str] = []
         vals: list[Any] = []
@@ -1750,13 +1750,13 @@ def update_checkprint_item_status(
         con.commit()
         con.close()
 
-        if new_row:
-            _checkprint_debug_write(
-                db_path,
-                f"DB_UPDATE_COMMIT role={role} item_id={int(item_id)} doc_id={doc_id!r} "
-                f"requested_status={status!r} new_final={new_row[0]!r} "
-                f"new_reviewer={new_row[1]!r} reviewer={new_row[2]!r} approver={new_row[3]!r}",
-            )
+        # if new_row:
+        #     _checkprint_debug_write(
+        #         db_path,
+        #         f"DB_UPDATE_COMMIT role={role} item_id={int(item_id)} doc_id={doc_id!r} "
+        #         f"requested_status={status!r} new_final={new_row[0]!r} "
+        #         f"new_reviewer={new_row[1]!r} reviewer={new_row[2]!r} approver={new_row[3]!r}",
+        #     )
 
     _retry_write(_do)
 

@@ -1904,3 +1904,313 @@ class CheckPrintTab(QWidget):
         self.box_reviewer.setVisible(False)
         self.box_approver.setVisible(False)
         self._reload_batches()
+# BEGIN CHECKPRINT REVISION MANAGEMENT UI PATCH V1
+# Submitter revision context menu and revision-aware Resubmit All confirmation.
+
+
+def _cp_revision_patch_format_service_error(result: dict) -> str:
+    error = str(result.get("error") or "unknown_error")
+    labels = {
+        "batch_not_found": "The selected CheckPrint batch could not be found.",
+        "batch_not_editable": "This CheckPrint batch is completed or cancelled and cannot be changed.",
+        "items_not_found": "The selected CheckPrint document could not be found.",
+        "source_file_missing": "The active source PDF could not be found.",
+        "checkprint_file_missing": "The active CheckPrint PDF could not be found.",
+        "revision_target_exists": "A file already exists with the requested revision filename.",
+        "revision_target_collision": "Two revision rename operations resolve to the same target filename.",
+        "preflight_failed": "A file rename was blocked during preflight.",
+        "file_ops_failed": "A required file rename failed.",
+        "database_update_failed": "The files were processed, but the database update failed.",
+        "multiple_revision_candidates": "More than one incoming revision was found for the same CheckPrint document.",
+    }
+    message = labels.get(error, f"CheckPrint operation failed ({error}).")
+    path = result.get("path")
+    reason = result.get("reason")
+    if path:
+        message += f"\n\nFile:\n{path}"
+    if reason:
+        message += f"\n\nReason:\n{reason}"
+    failures = result.get("rollback_failures") or []
+    if failures:
+        message += "\n\nManual file cleanup may be required:\n" + "\n".join(f"  - {x}" for x in failures[:8])
+    return message
+
+
+def _cp_revision_patch_change_revision(self, item: QListWidgetItem) -> None:
+    if not item or not getattr(self, "db_path", None) or not self.current_batch_id:
+        return
+    data = item.data(Qt.UserRole) or {}
+    item_id = int(data.get("id") or 0)
+    doc_id = str(data.get("doc_id") or "").strip()
+    old_revision = str(data.get("revision") or "").strip()
+    if not item_id or not doc_id:
+        QMessageBox.warning(self, "Change Revision", "The selected CheckPrint row is missing its document details.")
+        return
+
+    new_revision, accepted = QInputDialog.getText(
+        self,
+        "Change CheckPrint Revision",
+        f"Document: {doc_id}\nCurrent revision: {old_revision or '-'}\n\nNew revision:",
+        QLineEdit.Normal,
+        old_revision,
+    )
+    if not accepted:
+        return
+    new_revision = str(new_revision or "").strip()
+    if new_revision == old_revision:
+        return
+
+    confirm = QMessageBox.question(
+        self,
+        "Confirm Revision Change",
+        "This will update the selected CheckPrint item and the document register.\n\n"
+        f"Document: {doc_id}\n"
+        f"Revision: {old_revision or '-'} -> {new_revision or '-'}\n\n"
+        "The active source PDF and all related CheckPrint CP-version PDFs will be renamed. "
+        "Continue?",
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.No,
+    )
+    if confirm != QMessageBox.Yes:
+        return
+
+    try:
+        try:
+            from ..services.checkprint_service import change_checkprint_item_revision
+        except ImportError:
+            from services.checkprint_service import change_checkprint_item_revision  # type: ignore
+        result = change_checkprint_item_revision(
+            Path(self.db_path),
+            batch_id=int(self.current_batch_id),
+            item_id=item_id,
+            new_revision=new_revision,
+            actor=SettingsManager().get("user.name", "") or "",
+        )
+    except Exception as exc:
+        QMessageBox.critical(self, "Change Revision", f"Revision change failed:\n\n{exc}")
+        return
+
+    if not result.get("ok"):
+        QMessageBox.critical(self, "Change Revision", _cp_revision_patch_format_service_error(result))
+        return
+
+    changed = result.get("changes") or []
+    if not changed:
+        return
+    QMessageBox.information(
+        self,
+        "Revision Updated",
+        f"{doc_id} was updated from revision {old_revision or '-'} to {new_revision}.\n\n"
+        "The CheckPrint record, register revision and related PDF filenames were updated.",
+    )
+    self.registerNeedsRefresh.emit()
+    self._load_items_for_submitter()
+    self._load_items_for_reviewer()
+    self._load_items_for_approver()
+
+
+def _cp_revision_patch_show_comment_menu(
+    self,
+    lw: QListWidget,
+    pos: QPoint,
+    editable: bool,
+    for_reviewer: bool,
+    for_approver: bool = False,
+):
+    item = lw.itemAt(pos)
+    if not item:
+        return
+
+    data = item.data(Qt.UserRole) or {}
+    rel_cp = data.get("cp_path")
+    cp_version = int(data.get("cp_version") or 1)
+    menu = QMenu(self)
+
+    if editable:
+        act_comment = menu.addAction("View/Edit Comment...")
+    else:
+        act_comment = menu.addAction("View Comment...")
+
+    submitter_lists = tuple(
+        widget for widget in (
+            getattr(self, "list_pending_sub", None),
+            getattr(self, "list_rejected_sub", None),
+            getattr(self, "list_accepted_minor_sub", None),
+            getattr(self, "list_accepted_sub", None),
+        ) if widget is not None
+    )
+    act_revision = None
+    if lw in submitter_lists and getattr(self, "_active_role", None) == "submitter":
+        batch = get_checkprint_batch(self.db_path, self.current_batch_id) if self.db_path and self.current_batch_id else None
+        if batch and str(batch.get("status") or "").lower() not in {"completed", "cancelled"}:
+            menu.addSeparator()
+            act_revision = menu.addAction("Change Revision...")
+
+    submenu = menu.addMenu("Show Previous Versions")
+    try:
+        project_root = self.db_path.parent.parent
+        absolute_cp = project_root / rel_cp
+        folder = absolute_cp.parent
+        filename = absolute_cp.name
+        stem = filename.rsplit("_CP_", 1)[0]
+        extension = absolute_cp.suffix
+        if cp_version > 1:
+            for version in range(1, cp_version):
+                action = submenu.addAction(f"Open CP_{version}")
+                action.triggered.connect(
+                    lambda _, base=stem, ver=version, ext=extension, fld=folder:
+                    self._open_specific_cp_version(base, fld, ver, ext)
+                )
+        else:
+            submenu.setEnabled(False)
+    except Exception:
+        submenu.setEnabled(False)
+
+    chosen = menu.exec_(lw.mapToGlobal(pos))
+    if act_revision is not None and chosen == act_revision:
+        self._change_checkprint_revision(item)
+        return
+    if chosen == act_comment:
+        self._open_comment_dialog(
+            item,
+            editable=editable,
+            for_reviewer=for_reviewer,
+            for_approver=for_approver,
+        )
+
+
+def _cp_revision_patch_resubmit_all_incoming(self) -> None:
+    if not getattr(self, "db_path", None) or not self.current_batch_id:
+        QMessageBox.information(self, "CheckPrint", "No active CheckPrint batch selected.")
+        return
+
+    actor = SettingsManager().get("user.name", "") or ""
+
+    def _run(accepted_revision_changes=None):
+        return resubmit_all_incoming(
+            self.db_path,
+            batch_id=int(self.current_batch_id),
+            actor=actor,
+            accepted_revision_changes=accepted_revision_changes,
+        )
+
+    try:
+        result = _run()
+    except Exception as exc:
+        QMessageBox.critical(self, "Error", f"Resubmit failed:\n{exc}")
+        return
+
+    if result.get("error") == "revision_confirmation_required":
+        accepted_changes = {}
+        mismatches = result.get("revision_mismatches") or []
+        for mismatch in mismatches:
+            answer = QMessageBox.question(
+                self,
+                "Incoming Revision Changed",
+                "An incoming PDF matches a CheckPrint document number but uses a different revision.\n\n"
+                f"Document: {mismatch.get('doc_id')}\n"
+                f"Current CheckPrint revision: {mismatch.get('current_revision') or '-'}\n"
+                f"Incoming revision: {mismatch.get('detected_revision') or '-'}\n"
+                f"Incoming file: {mismatch.get('file')}\n\n"
+                "Accepting will rename the related source/CheckPrint PDFs and update both the "
+                "CheckPrint item and document register before resubmitting.\n\n"
+                "Accept this revision change?",
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.No,
+            )
+            if answer == QMessageBox.Cancel:
+                return
+            if answer != QMessageBox.Yes:
+                QMessageBox.information(
+                    self,
+                    "Resubmission Cancelled",
+                    "No CheckPrint files or database records were changed.\n\n"
+                    "The incoming PDF has been left in _CheckPrintIncoming so it can be corrected or removed.",
+                )
+                return
+            accepted_changes[int(mismatch.get("item_id"))] = str(mismatch.get("detected_revision") or "")
+
+        try:
+            result = _run(accepted_changes)
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Resubmit failed:\n{exc}")
+            return
+
+    if not result.get("ok"):
+        if result.get("error") in {
+            "source_file_missing", "checkprint_file_missing", "revision_target_exists",
+            "revision_target_collision", "preflight_failed", "file_ops_failed",
+            "database_update_failed", "multiple_revision_candidates", "batch_not_editable",
+        }:
+            QMessageBox.critical(self, "CheckPrint - Resubmit failed", _cp_revision_patch_format_service_error(result))
+            return
+
+        errors = dict(result.get("errors") or {})
+        details = result.get("details") or []
+        for detail in details:
+            code = detail.get("error")
+            if code == "no_match":
+                errors.setdefault("unmatched", []).append(detail.get("file"))
+            elif code == "bad_name":
+                errors.setdefault("bad_format", []).append(detail.get("file"))
+            elif code in {"duplicate_match", "duplicate_item_key_in_batch"}:
+                errors.setdefault("duplicate", []).append(detail.get("file") or detail.get("doc_id"))
+
+        incoming_dir = result.get("incoming_dir", "CheckPrint/_CheckPrintIncoming")
+        register_examples = result.get("register_examples") or []
+        message = "Resubmission failed.\n\n" f"Incoming folder:\n{incoming_dir}\n\n"
+
+        def _sample(title, values, limit=5):
+            values = [str(v) for v in (values or []) if v]
+            if not values:
+                return ""
+            shown = "\n".join(f"  - {value}" for value in values[:limit])
+            more = f"\n  ... and {len(values) - limit} more" if len(values) > limit else ""
+            return f"{title} ({len(values)}):\n{shown}{more}\n"
+
+        message += _sample("Files not matching any CheckPrint document", errors.get("unmatched"))
+        message += _sample("Files with invalid naming (expected DOCID_REV.pdf)", errors.get("bad_format"))
+        message += _sample("Duplicate submissions", errors.get("duplicate"))
+        if register_examples:
+            message += "Register expects filenames similar to:\n" + "\n".join(
+                f"  - {value}" for value in register_examples[:5]
+            ) + "\n"
+        if not any(errors.values()) and result.get("reason"):
+            message += f"Reason:\n{result.get('reason')}\n"
+        message += "\nCorrect the incoming files and try again."
+        QMessageBox.critical(self, "CheckPrint - Resubmit failed", message)
+        return
+
+    revision_changes = result.get("revision_changes") or []
+    message = (
+        "Resubmitted from _CheckPrintIncoming.\n\n"
+        f"Updated: {result.get('updated', 0)}\n"
+        f"Overwritten (pending): {result.get('overwritten', 0)}\n"
+        f"Incremented (reviewed): {result.get('incremented', 0)}\n"
+        f"Incoming cleaned: {result.get('deleted_incoming', 0)} file(s)"
+    )
+    if revision_changes:
+        message += f"\nRevision changes accepted: {len(revision_changes)}"
+        for change in revision_changes[:8]:
+            message += (
+                f"\n  - {change.get('doc_id')}: "
+                f"{change.get('old_revision') or '-'} -> {change.get('new_revision') or '-'}"
+            )
+        if len(revision_changes) > 8:
+            message += f"\n  ... and {len(revision_changes) - 8} more"
+    warning = result.get("cleanup_warning")
+    if warning:
+        message += f"\n\nCleanup warning:\n{warning}"
+
+    QMessageBox.information(self, "CheckPrint", message)
+    self.registerNeedsRefresh.emit()
+    self._load_items_for_submitter()
+    self._load_items_for_reviewer()
+    self._load_items_for_approver()
+
+
+CheckPrintTab._change_checkprint_revision = _cp_revision_patch_change_revision
+CheckPrintTab._show_comment_menu = _cp_revision_patch_show_comment_menu
+CheckPrintTab._resubmit_all_incoming = _cp_revision_patch_resubmit_all_incoming
+
+# END CHECKPRINT REVISION MANAGEMENT UI PATCH V1

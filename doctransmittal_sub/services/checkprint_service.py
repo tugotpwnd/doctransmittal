@@ -1728,3 +1728,483 @@ def _propagate_register_status(
         doc_id=doc_id,
         status=new_status,
     )
+# BEGIN CHECKPRINT REVISION MANAGEMENT PATCH V1
+# Adds revision-aware incoming resubmission and controlled CheckPrint revision changes.
+
+_cp_revision_patch_legacy_resubmit_all_incoming = resubmit_all_incoming
+
+
+def _validate_checkprint_revision_value(value: object) -> str:
+    """Return a safe revision token suitable for DOCID_REV filenames."""
+    revision = str(value or "").strip()
+    if not revision:
+        raise ValueError("Revision cannot be blank.")
+    if len(revision) > 40:
+        raise ValueError("Revision is too long (maximum 40 characters).")
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", revision):
+        raise ValueError(
+            "Revision may contain letters, numbers, full stops and hyphens only. "
+            "Underscores are not supported because CheckPrint filenames use an underscore before the revision."
+        )
+    return revision
+
+
+def _revision_filename_prefix(doc_id: str, revision: str) -> str:
+    doc_id = str(doc_id or "").strip()
+    revision = str(revision or "").strip()
+    return f"{doc_id}_{revision}" if revision else doc_id
+
+
+def _replace_revision_prefix(name: str, old_prefix: str, new_prefix: str) -> str:
+    if name.lower().startswith((old_prefix + "_CP_").lower()):
+        return new_prefix + name[len(old_prefix):]
+    return name
+
+
+def _rollback_revision_renames(rename_pairs: List[tuple[Path, Path]]) -> List[str]:
+    failures: List[str] = []
+    for old_path, new_path in reversed(rename_pairs):
+        try:
+            if new_path.exists() and not old_path.exists():
+                new_path.rename(old_path)
+        except Exception as exc:
+            failures.append(f"{new_path} -> {old_path}: {exc}")
+    return failures
+
+
+def change_checkprint_item_revisions(
+    db_path: Path,
+    *,
+    batch_id: int,
+    item_id_to_revision: Dict[int, str],
+    actor: str,
+) -> Dict[str, Any]:
+    """
+    Change one or more active CheckPrint item revisions as one controlled operation.
+
+    The operation:
+      * preflights and renames the active source PDF;
+      * renames all related CP_N files, including superseded copies;
+      * updates checkprint_items revision/base/path fields;
+      * adds the new revision to the document register so it becomes latest;
+      * writes a CheckPrint audit event.
+
+    File operations happen before the DB transaction. If the DB transaction fails,
+    rename operations are rolled back on a best-effort basis.
+    """
+    db_path = Path(db_path)
+    init_db(db_path)
+    batch_id = int(batch_id)
+
+    requested: Dict[int, str] = {}
+    for raw_id, raw_revision in (item_id_to_revision or {}).items():
+        requested[int(raw_id)] = _validate_checkprint_revision_value(raw_revision)
+    if not requested:
+        return {"ok": True, "changed": 0, "changes": []}
+
+    batch = get_checkprint_batch(db_path, batch_id)
+    if not batch:
+        return {"ok": False, "error": "batch_not_found"}
+    if str(batch.get("status") or "").lower() in {"completed", "cancelled"}:
+        return {"ok": False, "error": "batch_not_editable", "status": batch.get("status")}
+
+    all_items = get_checkprint_items(db_path, batch_id)
+    items_by_id = {int(it["id"]): it for it in all_items if it.get("state", "active") == "active"}
+
+    missing = [item_id for item_id in requested if item_id not in items_by_id]
+    if missing:
+        return {"ok": False, "error": "items_not_found", "item_ids": missing}
+
+    con = _connect(db_path)
+    project_row = con.execute(
+        "SELECT project_id FROM checkprint_batches WHERE id=?",
+        (batch_id,),
+    ).fetchone()
+    con.close()
+    if not project_row:
+        return {"ok": False, "error": "batch_project_not_found"}
+    project_id = int(project_row[0])
+
+    project_root = _project_root(db_path)
+    rename_ops: List[Any] = []
+    rename_pairs: List[tuple[Path, Path]] = []
+    target_paths: Dict[str, Path] = {}
+    db_rows: List[Dict[str, Any]] = []
+
+    for item_id, new_revision in requested.items():
+        item = items_by_id[item_id]
+        old_revision = str(item.get("revision") or "").strip()
+        if old_revision == new_revision:
+            continue
+
+        doc_id = str(item.get("doc_id") or "").strip()
+        if not doc_id:
+            return {"ok": False, "error": "missing_doc_id", "item_id": item_id}
+
+        new_prefix = _revision_filename_prefix(doc_id, new_revision)
+
+        source_abs = project_root / str(item.get("source_path") or "")
+        cp_abs = project_root / str(item.get("cp_path") or "")
+        cp_name_lower = cp_abs.name.lower()
+        cp_marker_index = cp_name_lower.rfind("_cp_")
+        old_prefix = cp_abs.name[:cp_marker_index] if cp_marker_index >= 0 else _revision_filename_prefix(doc_id, old_revision)
+        if not source_abs.is_file():
+            return {
+                "ok": False,
+                "error": "source_file_missing",
+                "item_id": item_id,
+                "path": str(source_abs),
+            }
+        if not cp_abs.is_file():
+            return {
+                "ok": False,
+                "error": "checkprint_file_missing",
+                "item_id": item_id,
+                "path": str(cp_abs),
+            }
+
+        candidates: List[Path] = [source_abs]
+        cp_folder = cp_abs.parent
+        if cp_folder.exists():
+            try:
+                for path in cp_folder.rglob("*"):
+                    if not path.is_file():
+                        continue
+                    if path.name.lower().startswith((old_prefix + "_CP_").lower()):
+                        candidates.append(path)
+            except OSError as exc:
+                return {
+                    "ok": False,
+                    "error": "checkprint_scan_failed",
+                    "item_id": item_id,
+                    "path": str(cp_folder),
+                    "reason": str(exc),
+                }
+
+        # De-duplicate paths while retaining order.
+        unique_candidates: List[Path] = []
+        seen_paths: set[str] = set()
+        for path in candidates:
+            key = str(path.resolve()).lower()
+            if key not in seen_paths:
+                seen_paths.add(key)
+                unique_candidates.append(path)
+
+        current_source_new = source_abs
+        current_cp_new = cp_abs
+        local_pairs: List[tuple[Path, Path]] = []
+
+        for old_path in unique_candidates:
+            new_name = _replace_revision_prefix(old_path.name, old_prefix, new_prefix)
+            if new_name == old_path.name:
+                # The stored path may be legacy/non-standard. The active source and
+                # current CP file are still renamed using their CP suffix.
+                if old_path in {source_abs, cp_abs} and "_CP_" in old_path.name:
+                    suffix = old_path.name[old_path.name.lower().rfind("_cp_"):]
+                    new_name = new_prefix + suffix
+                else:
+                    continue
+            new_path = old_path.with_name(new_name)
+            if new_path == old_path:
+                continue
+
+            target_key = str(new_path.resolve()).lower()
+            existing_owner = target_paths.get(target_key)
+            if existing_owner is not None and existing_owner != old_path:
+                return {
+                    "ok": False,
+                    "error": "revision_target_collision",
+                    "item_id": item_id,
+                    "path": str(new_path),
+                }
+            if new_path.exists() and new_path.resolve() != old_path.resolve():
+                return {
+                    "ok": False,
+                    "error": "revision_target_exists",
+                    "item_id": item_id,
+                    "path": str(new_path),
+                }
+
+            target_paths[target_key] = old_path
+            rename_ops.append(plan_rename(old_path, new_path))
+            rename_pairs.append((old_path, new_path))
+            local_pairs.append((old_path, new_path))
+            if old_path.resolve() == source_abs.resolve():
+                current_source_new = new_path
+            if old_path.resolve() == cp_abs.resolve():
+                current_cp_new = new_path
+
+        # Ensure the active files actually received a new revision filename.
+        if current_source_new == source_abs:
+            suffix = source_abs.name[source_abs.name.lower().rfind("_cp_"):] if "_cp_" in source_abs.name.lower() else source_abs.suffix
+            current_source_new = source_abs.with_name(new_prefix + suffix)
+            if current_source_new.exists():
+                return {"ok": False, "error": "revision_target_exists", "item_id": item_id, "path": str(current_source_new)}
+            rename_ops.append(plan_rename(source_abs, current_source_new))
+            rename_pairs.append((source_abs, current_source_new))
+
+        if current_cp_new == cp_abs:
+            suffix = cp_abs.name[cp_abs.name.lower().rfind("_cp_"):] if "_cp_" in cp_abs.name.lower() else cp_abs.suffix
+            current_cp_new = cp_abs.with_name(new_prefix + suffix)
+            if current_cp_new.exists():
+                return {"ok": False, "error": "revision_target_exists", "item_id": item_id, "path": str(current_cp_new)}
+            rename_ops.append(plan_rename(cp_abs, current_cp_new))
+            rename_pairs.append((cp_abs, current_cp_new))
+
+        base_name = str(item.get("base_name") or "").strip()
+        base_ext = Path(base_name).suffix or current_source_new.suffix or ".pdf"
+        new_base_name = f"{new_prefix}{base_ext}"
+
+        try:
+            rel_source = str(current_source_new.relative_to(project_root))
+            rel_cp = str(current_cp_new.relative_to(project_root))
+        except ValueError:
+            return {"ok": False, "error": "path_outside_project", "item_id": item_id}
+
+        db_rows.append({
+            "item_id": item_id,
+            "doc_id": doc_id,
+            "old_revision": old_revision,
+            "new_revision": new_revision,
+            "source_path": rel_source,
+            "cp_path": rel_cp,
+            "base_name": new_base_name,
+        })
+
+    if not db_rows:
+        return {"ok": True, "changed": 0, "changes": []}
+
+    ok, bad_path, reason = preflight_ops(rename_ops)
+    if not ok:
+        return {
+            "ok": False,
+            "error": "preflight_failed",
+            "path": str(bad_path) if bad_path else "",
+            "reason": reason or "",
+        }
+
+    try:
+        execute_ops(rename_ops)
+    except Exception as exc:
+        return {"ok": False, "error": "file_ops_failed", "reason": str(exc)}
+
+    try:
+        def _write_revision_changes() -> None:
+            con2 = _connect(db_path)
+            cur = con2.cursor()
+            try:
+                for row in db_rows:
+                    cur.execute(
+                        """
+                        UPDATE checkprint_items
+                           SET revision=?, base_name=?, source_path=?, cp_path=?
+                         WHERE id=? AND batch_id=?
+                        """,
+                        (
+                            row["new_revision"],
+                            row["base_name"],
+                            row["source_path"],
+                            row["cp_path"],
+                            row["item_id"],
+                            batch_id,
+                        ),
+                    )
+                    doc_row = cur.execute(
+                        "SELECT id FROM documents WHERE project_id=? AND doc_id=?",
+                        (project_id, row["doc_id"]),
+                    ).fetchone()
+                    if not doc_row:
+                        raise RuntimeError(f"Register document not found: {row['doc_id']}")
+                    document_id = int(doc_row[0])
+                    cur.execute(
+                        """
+                        INSERT OR REPLACE INTO revisions(document_id, rev, notes, created_on)
+                        VALUES (?, ?, ?, date('now'))
+                        """,
+                        (
+                            document_id,
+                            row["new_revision"],
+                            f"Revision changed during CheckPrint by {actor or 'submitter'}",
+                        ),
+                    )
+                    cur.execute(
+                        "UPDATE documents SET updated_on=datetime('now') WHERE id=?",
+                        (document_id,),
+                    )
+                    cur.execute(
+                        """
+                        INSERT INTO checkprint_events(
+                            item_id, happened_on, actor, event, from_status, to_status, note
+                        ) VALUES (?, datetime('now'), ?, 'revision_changed', ?, ?, ?)
+                        """,
+                        (
+                            row["item_id"],
+                            actor or "",
+                            row["old_revision"],
+                            row["new_revision"],
+                            "CheckPrint and register revision updated; related source/CP filenames renamed.",
+                        ),
+                    )
+                con2.commit()
+            except Exception:
+                con2.rollback()
+                raise
+            finally:
+                con2.close()
+
+        _retry_write(_write_revision_changes)
+    except Exception as exc:
+        rollback_failures = _rollback_revision_renames(rename_pairs)
+        result: Dict[str, Any] = {
+            "ok": False,
+            "error": "database_update_failed",
+            "reason": str(exc),
+        }
+        if rollback_failures:
+            result["rollback_failures"] = rollback_failures
+        return result
+
+    return {"ok": True, "changed": len(db_rows), "changes": db_rows}
+
+
+def change_checkprint_item_revision(
+    db_path: Path,
+    *,
+    batch_id: int,
+    item_id: int,
+    new_revision: str,
+    actor: str,
+) -> Dict[str, Any]:
+    """Single-item convenience wrapper used by the Submitter context menu."""
+    return change_checkprint_item_revisions(
+        db_path,
+        batch_id=batch_id,
+        item_id_to_revision={int(item_id): new_revision},
+        actor=actor,
+    )
+
+
+def _inspect_incoming_revision_mismatches(db_path: Path, batch_id: int) -> Dict[str, Any]:
+    incoming_dir = _checkprint_incoming_dir(db_path)
+    incoming_files = sorted(
+        [p for p in incoming_dir.iterdir() if p.is_file() and p.suffix.lower() == ".pdf"],
+        key=lambda p: p.name.lower(),
+    )
+    items = get_checkprint_items(db_path, int(batch_id))
+    by_exact: Dict[tuple[str, str], Dict[str, Any]] = {}
+    by_doc: Dict[str, List[Dict[str, Any]]] = {}
+    for item in items:
+        doc_id = str(item.get("doc_id") or "").strip()
+        revision = str(item.get("revision") or "").strip()
+        if not doc_id:
+            continue
+        by_exact[(doc_id, revision)] = item
+        by_doc.setdefault(doc_id, []).append(item)
+
+    mismatches: List[Dict[str, Any]] = []
+    candidate_count_by_item: Dict[int, int] = {}
+    for path in incoming_files:
+        stem = path.stem
+        if "_" not in stem:
+            continue
+        doc_id, detected_revision = stem.rsplit("_", 1)
+        doc_id = doc_id.strip()
+        detected_revision = detected_revision.strip()
+        if not doc_id or not detected_revision:
+            continue
+        if (doc_id, detected_revision) in by_exact:
+            continue
+        candidates = by_doc.get(doc_id) or []
+        if len(candidates) != 1:
+            continue
+        item = candidates[0]
+        item_id = int(item["id"])
+        candidate_count_by_item[item_id] = candidate_count_by_item.get(item_id, 0) + 1
+        mismatches.append({
+            "file": path.name,
+            "path": str(path),
+            "item_id": item_id,
+            "doc_id": doc_id,
+            "current_revision": str(item.get("revision") or ""),
+            "detected_revision": detected_revision,
+        })
+
+    duplicates = [item_id for item_id, count in candidate_count_by_item.items() if count > 1]
+    if duplicates:
+        return {
+            "ok": False,
+            "error": "multiple_revision_candidates",
+            "incoming_dir": str(incoming_dir),
+            "item_ids": duplicates,
+            "details": [m for m in mismatches if int(m["item_id"]) in duplicates],
+        }
+    return {"ok": True, "incoming_dir": str(incoming_dir), "mismatches": mismatches}
+
+
+def resubmit_all_incoming(
+    db_path: Path,
+    *,
+    batch_id: int,
+    actor: str,
+    accepted_revision_changes: Optional[Dict[int, str]] = None,
+) -> Dict[str, Any]:
+    """
+    Revision-aware wrapper around the established atomic incoming resubmission.
+
+    On the first call, a DOCID_NEWREV.pdf file that matches one batch document by
+    DOCID but not by revision returns `revision_confirmation_required`. The UI can
+    then ask the submitter to confirm. A second call supplies every accepted
+    item/revision in `accepted_revision_changes`; the filenames, CheckPrint item,
+    register revision and related PDFs are updated before the established
+    resubmission path runs.
+    """
+    db_path = Path(db_path)
+    batch_id = int(batch_id)
+    inspection = _inspect_incoming_revision_mismatches(db_path, batch_id)
+    if not inspection.get("ok"):
+        return inspection
+
+    mismatches = inspection.get("mismatches") or []
+    accepted = {int(k): str(v or "").strip() for k, v in (accepted_revision_changes or {}).items()}
+
+    if mismatches:
+        unresolved: List[Dict[str, Any]] = []
+        for mismatch in mismatches:
+            item_id = int(mismatch["item_id"])
+            detected = str(mismatch["detected_revision"])
+            if accepted.get(item_id) != detected:
+                unresolved.append(mismatch)
+        if unresolved:
+            return {
+                "ok": False,
+                "error": "revision_confirmation_required",
+                "incoming_dir": inspection.get("incoming_dir"),
+                "revision_mismatches": unresolved,
+            }
+
+    revision_result: Dict[str, Any] = {"ok": True, "changed": 0, "changes": []}
+    if mismatches:
+        revision_result = change_checkprint_item_revisions(
+            db_path,
+            batch_id=batch_id,
+            item_id_to_revision={
+                int(mismatch["item_id"]): str(mismatch["detected_revision"])
+                for mismatch in mismatches
+            },
+            actor=actor,
+        )
+        if not revision_result.get("ok"):
+            return revision_result
+
+    result = _cp_revision_patch_legacy_resubmit_all_incoming(
+        db_path,
+        batch_id=batch_id,
+        actor=actor,
+    )
+    if revision_result.get("changed"):
+        result = dict(result or {})
+        result["revision_changes"] = revision_result.get("changes") or []
+        result["revision_changed"] = int(revision_result.get("changed") or 0)
+    return result
+
+# END CHECKPRINT REVISION MANAGEMENT PATCH V1
