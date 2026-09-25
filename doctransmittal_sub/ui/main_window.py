@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import QMainWindow, QTabWidget, QAction, QMessageBox, QInpu
     QApplication, QActionGroup, QFileDialog, QDialog
 from PyQt5.QtCore import Qt, QTimer
 from doctransmittal_sub.core.settings import SettingsManager
+from doctransmittal_sub.core.version import APP_VERSION
 from doctransmittal_sub.core.excepthook import install_excepthook
 from .register_tab import RegisterTab
 from .transmittal_tab import TransmittalTab
@@ -509,7 +510,7 @@ class MainWindow(QMainWindow):
             logo.setText(" ")  # fallback
         lay.addWidget(logo)
 
-        self._brand_title = QLabel("Document Manager", bar)
+        self._brand_title = QLabel(f"Document Manager - V{APP_VERSION}", bar)
         self._brand_title.setStyleSheet("font-size:16px; font-weight:700; color:#E7ECF4;")
         lay.addWidget(self._brand_title)
 
@@ -548,7 +549,7 @@ class MainWindow(QMainWindow):
         self._remap_active = False
 
         self.settings = settings
-        self.setWindowTitle("DocumentManager"); self.resize(1400, 800)
+        self.setWindowTitle(f"Document Manager - V{APP_VERSION}"); self.resize(1400, 800)
         # ---- Lock window size (prevent annoying jumps) ----
         start = self.size()
         self.setMinimumSize(start)
@@ -1594,4 +1595,3 @@ def main_window_entry():
 
     # Start event loop
     sys.exit(app.exec_())
-

@@ -159,6 +159,11 @@ class CheckPrintTab(QWidget):
         self.combo_batches.currentIndexChanged.connect(self._on_batch_selected)
         hb.addWidget(self.combo_batches, 1)
 
+        self.btn_open_qa_check_guide = QPushButton("Open QA Drawing Check Guide")
+        self.btn_open_qa_check_guide.setFixedWidth(220)
+        self.btn_open_qa_check_guide.clicked.connect(self._open_qa_drawing_check_guide)
+        hb.addWidget(self.btn_open_qa_check_guide)
+
         self.btn_print_qa = QPushButton("Print QA Summary…")
         self.btn_print_qa.setFixedWidth(180)
         self.btn_print_qa.clicked.connect(self._print_qa_summary)
@@ -623,6 +628,31 @@ class CheckPrintTab(QWidget):
             self.box_submitter.setVisible(False)
             self.box_reviewer.setVisible(False)
             self.box_approver.setVisible(False)
+
+    def _open_qa_drawing_check_guide(self):
+        """Open the bundled QA drawing-check guide in the default PDF application."""
+        guide_path = Path(__file__).resolve().parents[1] / "resources" / "MC-PR-PJ-009_1.0.pdf"
+        if not guide_path.exists():
+            QMessageBox.warning(
+                self,
+                "QA Drawing Check Guide",
+                f"Guide PDF not found:\n{guide_path}",
+            )
+            return
+
+        try:
+            if sys.platform.startswith("darwin"):
+                os.system(f"open '{guide_path}'")
+            elif os.name == "nt":
+                os.startfile(str(guide_path))
+            else:
+                os.system(f"xdg-open '{guide_path}'")
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "QA Drawing Check Guide",
+                f"Failed to open guide PDF:\n{e}",
+            )
 
     # ------------------------------------------------------------------ QA PDF
     def _print_qa_summary(self):

@@ -353,6 +353,8 @@ class FilesTab(QWidget):
                 QMessageBox.No,
             )
             if r == QMessageBox.Yes:
+                if not self._run_markup_scan_preflight():
+                    return
                 self._proceed_build_transmittal()
 
         self.btn_build_trans.clicked.connect(_confirm_build_transmittal)
@@ -966,6 +968,36 @@ class FilesTab(QWidget):
                 "file_path": p or "",   # <— key expected by the service
             })
         return snap
+
+    def _run_markup_scan_preflight(self) -> bool:
+        """Optionally scan the mapped PDF drawings before they are transmittalised."""
+        pdf_paths = []
+        for item in self._build_snapshot_items():
+            file_path = item.get("file_path") or ""
+            path = Path(file_path)
+            if file_path and path.suffix.casefold() == ".pdf":
+                pdf_paths.append(path)
+
+        if not pdf_paths:
+            return True
+
+        answer = QMessageBox.question(
+            self,
+            "Scan drawings for markups?",
+            "Would you like to scan the mapped PDF drawings for annotations and markups before "
+            "building this transmittal?\n\nThis helps prevent marked-up drawings being included.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return True
+
+        try:
+            from .markup_scan_dialog import MarkupScanDialog
+        except ImportError:
+            from doctransmittal_sub.ui.markup_scan_dialog import MarkupScanDialog
+
+        return MarkupScanDialog(pdf_paths, self).exec_() == MarkupScanDialog.Accepted
 
     def _proceed_build_transmittal(self):
         if not self.db_path:
